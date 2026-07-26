@@ -33,9 +33,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match &app.overlay {
         Some(Overlay::Help) => draw_help(frame, frame.area()),
         Some(Overlay::Confirm { prompt, .. }) => draw_confirm(frame, prompt, frame.area()),
-        Some(Overlay::Input { prompt, value, kind }) => {
-            draw_input(frame, prompt, value, kind, frame.area())
-        }
+        Some(Overlay::Input {
+            prompt,
+            value,
+            kind,
+        }) => draw_input(frame, prompt, value, kind, frame.area()),
         None => {}
     }
 }
@@ -44,7 +46,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let current = app.stack.last().cloned().unwrap_or(Screen::Folders);
     let active = current.tab_index();
 
-    let mut spans = vec![Span::styled(" bizik ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))];
+    let mut spans = vec![Span::styled(
+        " bizik ",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
     for (i, tab) in Screen::TABS.iter().enumerate() {
         let selected = active == Some(i);
         let style = if selected {
@@ -116,7 +121,9 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
             } else if *attention > 0 {
                 spans.push(Span::styled(
                     format!("◆ {attention} waiting  "),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ));
             } else if *running > 0 {
                 spans.push(Span::styled(
@@ -169,7 +176,10 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
                     status_style(*status),
                 ),
                 Span::styled(format!("{:<9}", trunc(host, 9)), Style::default().fg(DIM)),
-                Span::styled(format!("{:<7}", session.agent.as_str()), Style::default().fg(DIM)),
+                Span::styled(
+                    format!("{:<7}", session.agent.as_str()),
+                    Style::default().fg(DIM),
+                ),
                 Span::raw(trunc(&session.title, 34)),
             ];
             if let Some(p) = preview {
@@ -185,7 +195,10 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
             let when = ago(chat.last_active);
             ListItem::new(Line::from(vec![
                 Span::styled("  ↺ ", Style::default().fg(DIM)),
-                Span::styled(format!("{:<7}", chat.agent.as_str()), Style::default().fg(DIM)),
+                Span::styled(
+                    format!("{:<7}", chat.agent.as_str()),
+                    Style::default().fg(DIM),
+                ),
                 Span::raw(trunc(&chat.display_title(), 46)),
                 Span::styled(format!("  {when}"), Style::default().fg(DIM)),
             ]))
@@ -201,7 +214,10 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
                 format!("{:<24}", host.ssh.as_deref().unwrap_or("(this machine)")),
                 Style::default().fg(DIM),
             ),
-            Span::styled(trunc(detail, width.saturating_sub(44)), Style::default().fg(DIM)),
+            Span::styled(
+                trunc(detail, width.saturating_sub(44)),
+                Style::default().fg(DIM),
+            ),
         ])),
 
         Row::LayoutEntry { layout, missing } => {
@@ -232,7 +248,9 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
 fn status_style(status: Status) -> Style {
     match status {
         Status::NeedsYou => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        Status::Done => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Status::Done => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
         Status::Working => Style::default().fg(Color::Yellow),
         Status::YourTurn => Style::default().fg(Color::Green),
         Status::Up => Style::default().fg(Color::Blue),
@@ -344,7 +362,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "from a pane back to here: tmux prefix, then w or 0",
             Style::default().fg(DIM),
         )),
-        Line::from(Span::styled("any key closes this", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            "any key closes this",
+            Style::default().fg(DIM),
+        )),
     ];
 
     let popup = centered(74, lines.len() as u16 + 2, area);
@@ -437,7 +458,10 @@ fn trunc(s: &str, max: usize) -> String {
     if max <= 1 {
         return "…".into();
     }
-    s.chars().take(max - 1).chain(std::iter::once('…')).collect()
+    s.chars()
+        .take(max - 1)
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
 /// Coarse relative time. Precision beyond this is noise in a list.
@@ -479,7 +503,12 @@ mod tests {
 
     #[test]
     fn centered_popup_fits_inside_a_small_terminal() {
-        let area = Rect { x: 0, y: 0, width: 40, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 5,
+        };
         let popup = centered(64, 20, area);
         assert!(popup.height <= area.height);
         assert!(popup.x + popup.width <= area.width);

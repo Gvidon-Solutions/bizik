@@ -229,10 +229,7 @@ pub fn folders(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
                 sessions: sessions.len(),
                 running: statuses.iter().filter(|s| **s != Status::Down).count(),
                 attention: statuses.iter().filter(|s| s.wants_you()).count(),
-                blocked: statuses
-                    .iter()
-                    .filter(|s| **s == Status::NeedsYou)
-                    .count(),
+                blocked: statuses.iter().filter(|s| **s == Status::NeedsYou).count(),
             });
         }
     }
@@ -468,7 +465,8 @@ mod tests {
     fn probe_with(session: &Session, live: Vec<LiveAgent>, up: bool) -> Probe {
         Probe {
             sessions: vec![session.clone()],
-            tmux: if up { {
+            tmux: if up {
+                {
                     vec![TmuxSession {
                         name: session.tmux_name(),
                         created: 0,
@@ -476,7 +474,10 @@ mod tests {
                         windows: 1,
                         preview: None,
                     }]
-                } } else { Default::default() },
+                }
+            } else {
+                Default::default()
+            },
             live,
             ..Default::default()
         }
@@ -511,10 +512,18 @@ mod tests {
         let mut s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
         s.agent_session_id = Some("abc".into());
 
-        let busy = probe_with(&s, vec![live(AgentKind::Claude, "/repo", Some("abc"), "busy")], true);
+        let busy = probe_with(
+            &s,
+            vec![live(AgentKind::Claude, "/repo", Some("abc"), "busy")],
+            true,
+        );
         assert_eq!(session_status(&busy, &s, "/repo"), Status::Working);
 
-        let idle = probe_with(&s, vec![live(AgentKind::Claude, "/repo", Some("abc"), "idle")], true);
+        let idle = probe_with(
+            &s,
+            vec![live(AgentKind::Claude, "/repo", Some("abc"), "idle")],
+            true,
+        );
         assert_eq!(session_status(&idle, &s, "/repo"), Status::YourTurn);
     }
 
@@ -586,14 +595,22 @@ mod tests {
     #[test]
     fn a_lone_agent_in_the_folder_is_matched_by_directory() {
         let s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
-        let p = probe_with(&s, vec![live(AgentKind::Claude, "/repo", None, "busy")], true);
+        let p = probe_with(
+            &s,
+            vec![live(AgentKind::Claude, "/repo", None, "busy")],
+            true,
+        );
         assert_eq!(session_status(&p, &s, "/repo"), Status::Working);
     }
 
     #[test]
     fn codex_without_a_status_reports_running_not_a_guess() {
         let s = Session::new(Uuid::new_v4(), AgentKind::Codex, "t".into());
-        let p = probe_with(&s, vec![live(AgentKind::Codex, "/repo", None, "unknown")], true);
+        let p = probe_with(
+            &s,
+            vec![live(AgentKind::Codex, "/repo", None, "unknown")],
+            true,
+        );
         assert_eq!(session_status(&p, &s, "/repo"), Status::Up);
     }
 

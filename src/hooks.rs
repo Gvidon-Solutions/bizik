@@ -46,8 +46,8 @@ fn read_settings(path: &Path) -> Result<Map<String, Value>> {
     if !path.exists() {
         return Ok(Map::new());
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(Map::new());
     }
@@ -268,7 +268,11 @@ mod tests {
             "somebody else's hook must survive"
         );
         let stop = hooks.get("Stop").unwrap().as_array().unwrap();
-        assert_eq!(stop.len(), 2, "the user's own Stop hook is kept alongside ours");
+        assert_eq!(
+            stop.len(),
+            2,
+            "the user's own Stop hook is kept alongside ours"
+        );
         assert!(stop.iter().any(|g| !is_ours(g)));
         assert!(stop.iter().any(is_ours));
 
@@ -281,7 +285,13 @@ mod tests {
         install_at(&path).unwrap();
         install_at(&path).unwrap();
         let after = read_settings(&path).unwrap();
-        let stop = after.get("hooks").unwrap().get("Stop").unwrap().as_array().unwrap();
+        let stop = after
+            .get("hooks")
+            .unwrap()
+            .get("Stop")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(stop.len(), 1);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

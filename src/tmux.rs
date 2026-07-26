@@ -112,7 +112,13 @@ pub fn capture_preview(session: &str) -> Option<String> {
         // about what the session is doing.
         .filter(|l| l.chars().any(char::is_alphanumeric))
         .collect();
-    let tail = lines.iter().rev().take(3).rev().copied().collect::<Vec<_>>();
+    let tail = lines
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
     (!tail.is_empty()).then(|| tail.join(" ⏎ "))
 }
 
@@ -233,7 +239,6 @@ pub fn new_window_in(session: &str, name: &str, cmd: &str) -> Result<String> {
     Ok(out.trim().to_string())
 }
 
-
 /// Split `window` and return the new pane id.
 pub fn split_window(window: &str, cmd: &str) -> Result<String> {
     let out = tmux(&["split-window", "-t", window, "-P", "-F", "#{pane_id}", cmd])?;
@@ -254,9 +259,11 @@ pub fn select_layout(window: &str, layout: &str) -> Result<()> {
 
 /// The window's geometry as a string that `select-layout` can replay verbatim.
 pub fn capture_layout(window: &str) -> Result<String> {
-    Ok(tmux(&["display-message", "-p", "-t", window, "#{window_layout}"])?
-        .trim()
-        .to_string())
+    Ok(
+        tmux(&["display-message", "-p", "-t", window, "#{window_layout}"])?
+            .trim()
+            .to_string(),
+    )
 }
 
 /// Commands running in each pane of a window, paired with the pane id. Used to
@@ -311,7 +318,10 @@ mod tests {
         let w = wrap_command("claude", "claude --resume x", "/repo");
         assert!(w.starts_with("exec /bin/sh -lc "), "login shell for PATH");
         assert!(w.contains("exited"), "exit reason must stay on screen");
-        assert!(w.contains("SHELL:-/bin/bash"), "falls back to a shell, never dies");
+        assert!(
+            w.contains("SHELL:-/bin/bash"),
+            "falls back to a shell, never dies"
+        );
         assert!(!w.contains("while"), "no automatic restart loop");
     }
 

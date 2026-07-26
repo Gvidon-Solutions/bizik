@@ -19,7 +19,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
 
-use super::{Agent, Caps, ChatIndex, HEAD_BYTES, TAIL_BYTES, extract_text, looks_synthetic, parse_lines};
+use super::{
+    Agent, Caps, ChatIndex, HEAD_BYTES, TAIL_BYTES, extract_text, looks_synthetic, parse_lines,
+};
 use crate::model::{AgentKind, Chat, LiveAgent};
 use crate::util::{file_size, home, mtime_ms, one_line, proc_matches, read_head, read_tail};
 
@@ -184,12 +186,16 @@ fn parse_transcript(path: &std::path::Path, mtime: u64, size: u64) -> Result<Opt
                         .map(str::to_string);
                 }
                 // Subagent traffic shares the file; it is not the conversation.
-                if first_prompt.is_none() && v.get("isSidechain") != Some(&Value::Bool(true))
-                    && let Some(text) = v.get("message").and_then(|m| m.get("content")).and_then(extract_text)
-                        && !looks_synthetic(&text)
-                    {
-                        first_prompt = Some(one_line(&text, 160));
-                    }
+                if first_prompt.is_none()
+                    && v.get("isSidechain") != Some(&Value::Bool(true))
+                    && let Some(text) = v
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(extract_text)
+                    && !looks_synthetic(&text)
+                {
+                    first_prompt = Some(one_line(&text, 160));
+                }
             }
             _ => {
                 if cwd.is_none() {
@@ -214,7 +220,10 @@ fn parse_transcript(path: &std::path::Path, mtime: u64, size: u64) -> Result<Opt
                     }
                 }
                 Some("user") if v.get("isSidechain") != Some(&Value::Bool(true)) => {
-                    if let Some(text) = v.get("message").and_then(|m| m.get("content")).and_then(extract_text)
+                    if let Some(text) = v
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(extract_text)
                         && !looks_synthetic(&text)
                     {
                         last_prompt = Some(one_line(&text, 160));
@@ -280,7 +289,10 @@ mod tests {
     fn transcript_without_cwd_is_rejected() {
         let dir = std::env::temp_dir().join(format!("bzk-claude-nocwd-{}", std::process::id()));
         let p = write_transcript(&dir, "x.jsonl", &[r#"{"type":"mode","mode":"normal"}"#]);
-        assert!(parse_transcript(&p, 1, file_size(&p)).unwrap().is_none(), "a stub is skipped, not an error");
+        assert!(
+            parse_transcript(&p, 1, file_size(&p)).unwrap().is_none(),
+            "a stub is skipped, not an error"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -290,7 +302,9 @@ mod tests {
         let p = write_transcript(
             &dir,
             "y.jsonl",
-            &[r#"{"type":"user","isSidechain":false,"cwd":"/r","message":{"role":"user","content":"only prompt"}}"#],
+            &[
+                r#"{"type":"user","isSidechain":false,"cwd":"/r","message":{"role":"user","content":"only prompt"}}"#,
+            ],
         );
         let chat = parse_transcript(&p, 1, file_size(&p)).unwrap().unwrap();
         assert_eq!(chat.last_prompt.as_deref(), Some("only prompt"));

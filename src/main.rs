@@ -378,7 +378,12 @@ fn cmd_marks(json: bool) -> Result<()> {
 
 /// Run a git query, returning `None` for anything that is not a clean success.
 fn git(dir: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -402,7 +407,11 @@ fn cmd_probe(json: bool, preview: bool) -> Result<()> {
         if p.agents.is_empty() {
             "none installed".to_string()
         } else {
-            p.agents.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+            p.agents
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     );
     println!("folders: {}", p.folders.len());
@@ -476,7 +485,11 @@ fn cmd_host(cmd: HostCmd) -> Result<()> {
             store.ensure_local_host();
             store.save()?;
             for h in store.live_hosts() {
-                println!("{:<16} {}", h.name, h.ssh.as_deref().unwrap_or("(this machine)"));
+                println!(
+                    "{:<16} {}",
+                    h.name,
+                    h.ssh.as_deref().unwrap_or("(this machine)")
+                );
             }
         }
     }
@@ -716,7 +729,11 @@ fn cmd_doctor() -> Result<()> {
                 let agents = if p.agents.is_empty() {
                     "no agents".to_string()
                 } else {
-                    p.agents.iter().map(|a| a.to_string()).collect::<Vec<_>>().join("+")
+                    p.agents
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join("+")
                 };
                 println!(
                     "  {:<16} ok · bizik {} · {} folders · {} · hooks {}",

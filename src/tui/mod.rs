@@ -73,8 +73,15 @@ impl Screen {
 
 pub enum Overlay {
     Help,
-    Confirm { prompt: String, action: Confirm },
-    Input { prompt: String, value: String, kind: InputKind },
+    Confirm {
+        prompt: String,
+        action: Confirm,
+    },
+    Input {
+        prompt: String,
+        value: String,
+        kind: InputKind,
+    },
 }
 
 pub enum Confirm {
@@ -379,18 +386,36 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.overlay = Some(Overlay::Confirm { prompt, action }),
             },
-            Some(Overlay::Input { prompt, mut value, kind }) => match key.code {
+            Some(Overlay::Input {
+                prompt,
+                mut value,
+                kind,
+            }) => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Enter => self.run_input(kind, value.trim().to_string()),
                 KeyCode::Backspace => {
                     value.pop();
-                    self.overlay = Some(Overlay::Input { prompt, value, kind });
+                    self.overlay = Some(Overlay::Input {
+                        prompt,
+                        value,
+                        kind,
+                    });
                 }
                 KeyCode::Char(c) => {
                     value.push(c);
-                    self.overlay = Some(Overlay::Input { prompt, value, kind });
+                    self.overlay = Some(Overlay::Input {
+                        prompt,
+                        value,
+                        kind,
+                    });
                 }
-                _ => self.overlay = Some(Overlay::Input { prompt, value, kind }),
+                _ => {
+                    self.overlay = Some(Overlay::Input {
+                        prompt,
+                        value,
+                        kind,
+                    })
+                }
             },
             None => {}
         }
@@ -491,14 +516,22 @@ impl App {
                     self.list.select(None);
                 }
             }
-            Row::NewSession { host, folder, agent } => {
-                self.start_new(&host, folder, agent, None, background)
-            }
+            Row::NewSession {
+                host,
+                folder,
+                agent,
+            } => self.start_new(&host, folder, agent, None, background),
             Row::Chat { host, folder, chat } => {
                 // Adopting a conversation records it, then resumes it — the
                 // history stays exactly where the agent put it.
                 let title = crate::util::one_line(&chat.display_title(), 60);
-                self.start_new(&host, folder, chat.agent, Some((chat.id, title)), background)
+                self.start_new(
+                    &host,
+                    folder,
+                    chat.agent,
+                    Some((chat.id, title)),
+                    background,
+                )
             }
             Row::Session { host, session, .. } => self.launch_one(&host, session.id, background),
             Row::LayoutEntry { layout, .. } => self.restore_layout(&layout),
@@ -640,13 +673,8 @@ impl App {
             Some((id, title)) => (Some(id), Some(title)),
             None => (None, None),
         };
-        match actions::create_session(
-            &host,
-            folder,
-            agent,
-            title.as_deref(),
-            resume_id.as_deref(),
-        ) {
+        match actions::create_session(&host, folder, agent, title.as_deref(), resume_id.as_deref())
+        {
             Ok(session) => self.launch_one(host_name, session.id, background),
             Err(e) => self.error(format!("{e:#}")),
         }
@@ -836,7 +864,13 @@ impl App {
                     .map_err(|e| format!("{e:#}"))
             }
             Confirm::RestoreLayout { id, close } => {
-                match self.local.live_layouts().into_iter().find(|l| l.id == id).cloned() {
+                match self
+                    .local
+                    .live_layouts()
+                    .into_iter()
+                    .find(|l| l.id == id)
+                    .cloned()
+                {
                     Some(layout) => {
                         self.do_restore(&layout, &close);
                         return;

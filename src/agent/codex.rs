@@ -14,7 +14,9 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use super::{Agent, Caps, ChatIndex, HEAD_BYTES, TAIL_BYTES, extract_text, looks_synthetic, parse_lines};
+use super::{
+    Agent, Caps, ChatIndex, HEAD_BYTES, TAIL_BYTES, extract_text, looks_synthetic, parse_lines,
+};
 use crate::model::{AgentKind, Chat, LiveAgent};
 use crate::util::{
     file_size, home, mtime_ms, one_line, pids_by_comm, proc_cwd, read_head, read_tail,
@@ -232,7 +234,10 @@ mod tests {
     fn rollout_without_meta_is_rejected() {
         let dir = std::env::temp_dir().join(format!("bzk-codex-bad-{}", std::process::id()));
         let p = write(&dir, "rollout-x.jsonl", &[r#"{"type":"event_msg"}"#]);
-        assert!(parse_rollout(&p, 1, file_size(&p)).unwrap().is_none(), "skipped, not reported as damaged");
+        assert!(
+            parse_rollout(&p, 1, file_size(&p)).unwrap().is_none(),
+            "skipped, not reported as damaged"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -28,10 +28,14 @@ pub fn collect(with_preview: bool) -> Probe {
 
     // A probe is the natural moment to reattach session records to the
     // conversation ids their agents ended up creating.
-    if tmux::installed() && crate::hostops::relink_sessions(&mut store) > 0
-        && let Err(e) = store.save() {
-            warnings.push(format!("could not record resumable conversation ids: {e:#}"));
-        }
+    if tmux::installed()
+        && crate::hostops::relink_sessions(&mut store) > 0
+        && let Err(e) = store.save()
+    {
+        warnings.push(format!(
+            "could not record resumable conversation ids: {e:#}"
+        ));
+    }
 
     let folders: Vec<_> = store.live_folders().into_iter().cloned().collect();
     let sessions: Vec<_> = store.live_sessions().into_iter().cloned().collect();
@@ -123,7 +127,10 @@ fn select_chats(
 
     let mut out: Vec<Chat> = Vec::new();
     for folder in folders {
-        let matching: Vec<&Chat> = chats.iter().filter(|c| under(&c.cwd, &folder.path)).collect();
+        let matching: Vec<&Chat> = chats
+            .iter()
+            .filter(|c| under(&c.cwd, &folder.path))
+            .collect();
         if matching.len() > MAX_CHATS_PER_FOLDER {
             warnings.push(format!(
                 "{}: showing the {} most recent of {} conversations",
@@ -226,7 +233,11 @@ mod tests {
         chats.extend((0..10).map(|i| chat("/repo/sub", &format!("c{i}"), 100 + i as u64)));
         let mut w = Vec::new();
         let got = select_chats(&folders, chats, &mut w);
-        assert_eq!(got.len(), MAX_CHATS_PER_FOLDER, "a full cap, not a short one");
+        assert_eq!(
+            got.len(),
+            MAX_CHATS_PER_FOLDER,
+            "a full cap, not a short one"
+        );
         assert!(w.is_empty(), "nothing was actually dropped");
     }
 }

@@ -42,25 +42,47 @@ a folder and cannot be told apart, the status stays vague on purpose.
 
 Needs Rust, tmux, and ssh.
 
-**Build against musl.** `bzk install` copies the binary you are running to each
-server, and a default build links against your laptop's glibc — which is
-routinely newer than the server's. The musl target produces a genuinely static
-binary that runs on any Linux, and needs no C toolchain:
+Write your servers into an untracked `hosts.mk`:
+
+```make
+HOSTS = back=168.119.201.8 front=example.com
+```
+
+Then:
+
+```sh
+make setup
+```
+
+That builds a static binary, installs it to `~/.local/bin`, registers the
+hosts, copies the binary to each of them, installs the status hooks, and
+finishes with `make doctor`. `make` on its own lists everything else.
+
+After changing the code, `make deploy` rebuilds and pushes to every host —
+`make doctor` says which hosts are still on an older binary.
+
+<details>
+<summary>The same thing by hand</summary>
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 install -m755 target/x86_64-unknown-linux-musl/release/bzk ~/.local/bin/bzk
-```
 
-Then register your servers and push the binary to them:
-
-```sh
 bzk host add back  168.119.201.8
-bzk host add front gvidon.ai
+bzk host add front example.com
 bzk install                 # scp's this binary to every host
+bzk hooks install back front
 bzk doctor                  # checks tmux, ssh, agents, and every host
 ```
+
+**Build against musl.** `bzk install` copies the binary you are running to each
+server, and a default build links against your laptop's glibc — which is
+routinely newer than the server's, so the copy refuses to start. The musl
+target produces a genuinely static binary that runs on any Linux, and needs no
+C toolchain.
+
+</details>
 
 `bzk install` puts the binary at `~/.local/bin/bzk` on each host. It is the same
 binary on both sides, so the two can never disagree about the data format. If
@@ -68,7 +90,8 @@ the copy will not run there, install says so and repeats the musl command.
 
 Each server needs tmux, and whichever agents you intend to run.
 
-Then turn on the status hooks, which is what makes `▲ needs you` possible:
+The status hooks — what makes `▲ needs you` possible — are part of `make setup`.
+By hand:
 
 ```sh
 bzk hooks install back front   # or with no names, for this machine

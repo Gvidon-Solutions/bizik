@@ -27,7 +27,13 @@ pub fn create_session(
     resume: Option<&str>,
 ) -> Result<Session> {
     let folder = folder.to_string();
-    let mut args: Vec<&str> = vec!["new-session", "--folder", &folder, "--agent", agent.as_str()];
+    let mut args: Vec<&str> = vec![
+        "new-session",
+        "--folder",
+        &folder,
+        "--agent",
+        agent.as_str(),
+    ];
     if let Some(t) = title {
         args.extend(["--title", t]);
     }
@@ -169,7 +175,9 @@ mod tests {
         // The real pane command, so the test breaks if its shape changes.
         let cmd = crate::remote::attach_command(&host, &s.tmux_name());
         let candidates = [("back".to_string(), s.clone())];
-        let hit = candidates.iter().find(|(_, c)| cmd.contains(&c.tmux_name()));
+        let hit = candidates
+            .iter()
+            .find(|(_, c)| cmd.contains(&c.tmux_name()));
         assert_eq!(hit.map(|(h, _)| h.as_str()), Some("back"));
     }
 

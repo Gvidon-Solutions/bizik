@@ -250,11 +250,7 @@ pub fn extract_text(v: &Value) -> Option<String> {
         Value::Array(items) => {
             let joined: Vec<String> = items
                 .iter()
-                .filter_map(|item| {
-                    item.get("text")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
+                .filter_map(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
                 .collect();
             if joined.is_empty() {
                 None
@@ -299,7 +295,8 @@ mod tests {
     #[test]
     fn extract_text_handles_both_shapes() {
         assert_eq!(extract_text(&json!("hi")).as_deref(), Some("hi"));
-        let blocks = json!([{"type":"text","text":"a"},{"type":"image"},{"type":"text","text":"b"}]);
+        let blocks =
+            json!([{"type":"text","text":"a"},{"type":"image"},{"type":"text","text":"b"}]);
         assert_eq!(extract_text(&blocks).as_deref(), Some("a b"));
         assert_eq!(extract_text(&json!([{"type":"image"}])), None);
         assert_eq!(extract_text(&json!(7)), None);

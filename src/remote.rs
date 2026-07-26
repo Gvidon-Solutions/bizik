@@ -117,7 +117,10 @@ pub fn run_bzk(host: &Host, args: &[&str]) -> Result<String> {
     match &host.ssh {
         None => {
             let exe = std::env::current_exe().context("locating own binary")?;
-            let out = Command::new(exe).args(args).output().context("running bzk locally")?;
+            let out = Command::new(exe)
+                .args(args)
+                .output()
+                .context("running bzk locally")?;
             if !out.status.success() {
                 bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
             }
@@ -138,7 +141,10 @@ pub fn run_bzk(host: &Host, args: &[&str]) -> Result<String> {
                 let err = String::from_utf8_lossy(&out.stderr);
                 let err = err.trim();
                 if err.contains("not found") || err.contains("No such file") {
-                    bail!("bzk is not installed on this host — run: bzk install {}", host.name);
+                    bail!(
+                        "bzk is not installed on this host — run: bzk install {}",
+                        host.name
+                    );
                 }
                 bail!("{}", if err.is_empty() { "ssh failed" } else { err });
             }
@@ -303,7 +309,10 @@ mod tests {
         let h = Host::new("back".into(), Some("root@1.2.3.4".into()));
         let cmd = attach_command(&h, "bzk-a1");
         assert!(cmd.contains("-t root@1.2.3.4"), "a TUI needs a tty");
-        assert!(cmd.contains("ControlMaster=auto"), "six panes, one handshake");
+        assert!(
+            cmd.contains("ControlMaster=auto"),
+            "six panes, one handshake"
+        );
         assert!(cmd.contains("'=bzk-a1'"), "exact session match");
     }
 

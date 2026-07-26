@@ -111,13 +111,20 @@ impl HostStore {
 
     /// Live folders, newest activity first.
     pub fn live_folders(&self) -> Vec<&Folder> {
-        let mut v: Vec<&Folder> = self.folders.iter().filter(|f| f.deleted_at.is_none()).collect();
+        let mut v: Vec<&Folder> = self
+            .folders
+            .iter()
+            .filter(|f| f.deleted_at.is_none())
+            .collect();
         v.sort_by_key(|f| std::cmp::Reverse(f.last_visit.unwrap_or(f.created_at)));
         v
     }
 
     pub fn live_sessions(&self) -> Vec<&Session> {
-        self.sessions.iter().filter(|s| s.deleted_at.is_none()).collect()
+        self.sessions
+            .iter()
+            .filter(|s| s.deleted_at.is_none())
+            .collect()
     }
 
     pub fn folder_by_path(&self, path: &str) -> Option<&Folder> {
@@ -230,11 +237,17 @@ impl LocalStore {
     }
 
     pub fn live_hosts(&self) -> Vec<&Host> {
-        self.hosts.iter().filter(|h| h.deleted_at.is_none()).collect()
+        self.hosts
+            .iter()
+            .filter(|h| h.deleted_at.is_none())
+            .collect()
     }
 
     pub fn live_layouts(&self) -> Vec<&Layout> {
-        self.layouts.iter().filter(|l| l.deleted_at.is_none()).collect()
+        self.layouts
+            .iter()
+            .filter(|l| l.deleted_at.is_none())
+            .collect()
     }
 
     pub fn host_by_name(&self, name: &str) -> Option<&Host> {
@@ -283,7 +296,11 @@ impl LocalStore {
     /// Ensure a `local` host exists, so a fresh install can drive the machine
     /// it is installed on without any setup.
     pub fn ensure_local_host(&mut self) -> bool {
-        if self.hosts.iter().any(|h| h.is_local() && h.deleted_at.is_none()) {
+        if self
+            .hosts
+            .iter()
+            .any(|h| h.is_local() && h.deleted_at.is_none())
+        {
             return false;
         }
         self.hosts.push(Host::new("local".to_string(), None));
@@ -337,7 +354,10 @@ mod tests {
         let first = s.upsert_folder("/x");
         s.remove_folder(first);
         let second = s.upsert_folder("/x");
-        assert_eq!(first, second, "layouts referencing this folder must survive");
+        assert_eq!(
+            first, second,
+            "layouts referencing this folder must survive"
+        );
         assert!(s.live_folders().len() == 1);
     }
 
@@ -345,7 +365,8 @@ mod tests {
     fn removing_a_folder_buries_its_sessions() {
         let mut s = HostStore::default();
         let f = s.upsert_folder("/x");
-        s.sessions.push(Session::new(f, AgentKind::Claude, "t".into()));
+        s.sessions
+            .push(Session::new(f, AgentKind::Claude, "t".into()));
         s.remove_folder(f);
         assert!(s.live_sessions().is_empty());
     }
