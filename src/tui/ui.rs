@@ -64,7 +64,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    if app.refreshing {
+    // Starting happens off the drawing thread, so say it is happening —
+    // otherwise a slow ssh looks like a key that did nothing.
+    if app.starting > 0 {
+        spans.push(Span::styled(
+            format!("  starting {}…", app.starting),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    } else if app.refreshing {
         spans.push(Span::styled("  refreshing…", Style::default().fg(DIM)));
     }
 
@@ -95,12 +102,18 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
             sessions,
             running,
             attention,
+            blocked,
         } => {
             let mut spans = vec![
                 Span::styled(format!("{:<10}", trunc(host, 10)), Style::default().fg(DIM)),
                 Span::raw(format!("{:<24}", trunc(&folder.display_name(), 24))),
             ];
-            if *attention > 0 {
+            if *blocked > 0 {
+                spans.push(Span::styled(
+                    format!("▲ {blocked} blocked  "),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            } else if *attention > 0 {
                 spans.push(Span::styled(
                     format!("◆ {attention} waiting  "),
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -218,8 +231,10 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
 
 fn status_style(status: Status) -> Style {
     match status {
-        Status::YourTurn => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Status::NeedsYou => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Status::Done => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         Status::Working => Style::default().fg(Color::Yellow),
+        Status::YourTurn => Style::default().fg(Color::Green),
         Status::Up => Style::default().fg(Color::Blue),
         Status::Down => Style::default().fg(DIM),
     }
@@ -313,11 +328,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  r             refresh now"),
         Line::from(""),
         Line::from(Span::styled(
-            "status  ◆ your turn   ● working   ○ running   · stopped",
+            "status  ▲ needs you   ◆ done   ● working   ◇ your turn   ○ running   · stopped",
             Style::default().fg(DIM),
         )),
         Line::from(Span::styled(
-            "◆ means the agent stopped and is waiting on you.",
+            "▲ is blocked on a question and will wait forever. ◇ means idle with",
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            "no detail — run `bzk hooks install` on a host to get ▲ and ◆ there.",
             Style::default().fg(DIM),
         )),
         Line::from(""),

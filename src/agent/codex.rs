@@ -83,6 +83,8 @@ impl Agent for CodexAgent {
                     cwd: proc_cwd(pid)?,
                     agent_session_id: None,
                     status: "unknown".into(),
+                    status_at: 0,
+                    attention: None,
                 })
             })
             .collect()

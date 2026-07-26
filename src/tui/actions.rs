@@ -104,25 +104,17 @@ pub fn focus_work() -> Result<()> {
     tmux::select_window(&window)
 }
 
-/// Start a session and, unless `background`, show it.
-pub fn launch(host: &Host, session: Uuid, background: bool) -> Result<String> {
-    let spawned = start(host, session)?;
-    if background {
-        return Ok(format!(
-            "{} {} in background",
-            if spawned.started { "started" } else { "already running:" },
-            spawned.session.title
-        ));
-    }
-    open_pane(host, &spawned.tmux_name)?;
-    focus_work()?;
-    Ok(format!("attached to {}", spawned.session.title))
-}
-
 /// Geometry of the pane window, for saving a layout.
 pub fn work_layout() -> Option<String> {
     let window = tmux::find_window(WORK_WINDOW)?;
     tmux::capture_layout(&window).ok()
+}
+
+/// One open pane and the session it is showing.
+pub struct OpenPane {
+    pub pane: String,
+    pub host: String,
+    pub session: Uuid,
 }
 
 /// Work out which session each open pane is showing.
@@ -131,7 +123,7 @@ pub fn work_layout() -> Option<String> {
 /// to, so the mapping can be recovered by inspection rather than remembered.
 /// That means a layout can be saved from panes opened before this dashboard
 /// started — after a restart, or from a pane opened by hand.
-pub fn panes_in_work(candidates: &[(String, Session)]) -> Vec<(String, Uuid)> {
+pub fn panes_in_work(candidates: &[(String, Session)]) -> Vec<OpenPane> {
     let Some(window) = tmux::find_window(WORK_WINDOW) else {
         return Vec::new();
     };
@@ -141,26 +133,34 @@ pub fn panes_in_work(candidates: &[(String, Session)]) -> Vec<(String, Uuid)> {
 
     panes
         .iter()
-        .filter_map(|(_, cmd)| {
+        .filter_map(|(pane, cmd)| {
             candidates
                 .iter()
                 .find(|(_, s)| cmd.contains(&s.tmux_name()))
-                .map(|(host, s)| (host.clone(), s.id))
+                .map(|(host, s)| OpenPane {
+                    pane: pane.clone(),
+                    host: host.clone(),
+                    session: s.id,
+                })
         })
         .collect()
+}
+
+/// Apply a saved geometry to the pane window.
+pub fn apply_geometry(geometry: &str) -> Result<()> {
+    let window = tmux::find_window(WORK_WINDOW).context("the pane window is gone")?;
+    tmux::select_layout(&window, geometry)
+}
+
+pub fn tile() {
+    if let Some(window) = tmux::find_window(WORK_WINDOW) {
+        let _ = tmux::select_layout(&window, "tiled");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn background_launch_reports_without_claiming_an_attach() {
-        // Wording matters here: a background start that said "attached" would
-        // send the user looking for a pane that does not exist.
-        let spawned = "started";
-        assert!(format!("{spawned} x in background").contains("background"));
-    }
 
     #[test]
     fn pane_mapping_matches_on_tmux_session_name() {

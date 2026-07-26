@@ -13,9 +13,16 @@ use crate::remote::HostProbe;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
+    /// Blocked on you — a permission prompt or a question. Known only when the
+    /// agent's hooks are installed, and the single most useful thing this tool
+    /// can tell you: a background session in this state will wait forever.
+    NeedsYou,
+    /// A turn ended and there is something to look at.
+    Done,
     /// The agent is processing right now.
     Working,
-    /// The agent stopped processing: it either finished or is waiting on you.
+    /// Idle, but without hooks there is no telling whether that means finished
+    /// or blocked. Deliberately vaguer than the two above.
     YourTurn,
     /// The session is up but the agent exposes no status, or which process
     /// belongs to it is ambiguous.
@@ -27,6 +34,8 @@ pub enum Status {
 impl Status {
     pub fn label(self) -> &'static str {
         match self {
+            Status::NeedsYou => "needs you",
+            Status::Done => "done",
             Status::Working => "working",
             Status::YourTurn => "your turn",
             Status::Up => "running",
@@ -36,15 +45,30 @@ impl Status {
 
     pub fn glyph(self) -> &'static str {
         match self {
+            Status::NeedsYou => "▲",
+            Status::Done => "◆",
             Status::Working => "●",
-            Status::YourTurn => "◆",
+            Status::YourTurn => "◇",
             Status::Up => "○",
             Status::Down => "·",
         }
     }
 
+    /// The ball is in your court.
     pub fn wants_you(self) -> bool {
-        self == Status::YourTurn
+        matches!(self, Status::NeedsYou | Status::Done | Status::YourTurn)
+    }
+
+    /// Sort key for the mission-control list: whatever is blocked comes first.
+    pub fn urgency(self) -> u8 {
+        match self {
+            Status::NeedsYou => 0,
+            Status::Done => 1,
+            Status::YourTurn => 2,
+            Status::Working => 3,
+            Status::Up => 4,
+            Status::Down => 5,
+        }
     }
 }
 
@@ -55,7 +79,10 @@ pub enum Row {
         folder: Folder,
         sessions: usize,
         running: usize,
+        /// Sessions whose turn it is yours to take.
         attention: usize,
+        /// Of those, the ones known to be blocked on you.
+        blocked: usize,
     },
     /// The "start something new here" entry at the top of a folder.
     NewSession {
@@ -154,10 +181,17 @@ pub fn session_status(probe: &Probe, session: &Session, folder_path: &str) -> St
         }
     });
 
-    match live.map(|l| l.status.as_str()) {
-        Some("busy") => Status::Working,
-        Some("idle") => Status::YourTurn,
-        _ => Status::Up,
+    // `attention` is only present when a hook report was newer than the agent's
+    // own status line, so where it exists it is the better account.
+    match live {
+        None => Status::Up,
+        Some(l) => match (l.attention.as_deref(), l.status.as_str()) {
+            (Some("waiting"), _) => Status::NeedsYou,
+            (_, "busy") => Status::Working,
+            (Some("done"), "idle") => Status::Done,
+            (_, "idle") => Status::YourTurn,
+            _ => Status::Up,
+        },
     }
 }
 
@@ -195,6 +229,10 @@ pub fn folders(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
                 sessions: sessions.len(),
                 running: statuses.iter().filter(|s| **s != Status::Down).count(),
                 attention: statuses.iter().filter(|s| s.wants_you()).count(),
+                blocked: statuses
+                    .iter()
+                    .filter(|s| **s == Status::NeedsYou)
+                    .count(),
             });
         }
     }
@@ -322,12 +360,8 @@ pub fn running(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
 
     // Whatever wants you first; that is the only ordering that matters here.
     rows.sort_by_key(|r| match r {
-        Row::Session { status, .. } => match status {
-            Status::YourTurn => 0,
-            Status::Working => 1,
-            _ => 2,
-        },
-        _ => 3,
+        Row::Session { status, .. } => status.urgency(),
+        _ => u8::MAX,
     });
 
     if rows.is_empty() {
@@ -360,14 +394,23 @@ pub fn hosts_screen(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
                             .collect::<Vec<_>>()
                             .join("+")
                     };
+                    let mut detail = format!(
+                        "bizik {} · {} folders · {}",
+                        probe.bzk_version,
+                        probe.folders.len(),
+                        agents
+                    );
+                    // Say what is missing right where the host is listed, so a
+                    // stale binary or absent hooks are not silent.
+                    if probe.bzk_version != env!("CARGO_PKG_VERSION") {
+                        detail.push_str(" · stale, press i");
+                    }
+                    if !probe.hooks_installed && !probe.agents.is_empty() {
+                        detail.push_str(" · no hooks");
+                    }
                     Row::HostEntry {
                         host: host.clone(),
-                        detail: format!(
-                            "bizik {} · {} folders · {}",
-                            probe.bzk_version,
-                            probe.folders.len(),
-                            agents
-                        ),
+                        detail,
                         ok: true,
                     }
                 }
@@ -446,7 +489,14 @@ mod tests {
             cwd: cwd.into(),
             agent_session_id: id.map(str::to_string),
             status: status.into(),
+            status_at: 0,
+            attention: None,
         }
+    }
+
+    fn with_attention(mut l: LiveAgent, state: &str) -> LiveAgent {
+        l.attention = Some(state.into());
+        l
     }
 
     #[test]
@@ -466,6 +516,55 @@ mod tests {
 
         let idle = probe_with(&s, vec![live(AgentKind::Claude, "/repo", Some("abc"), "idle")], true);
         assert_eq!(session_status(&idle, &s, "/repo"), Status::YourTurn);
+    }
+
+    #[test]
+    fn hooks_split_idle_into_blocked_and_finished() {
+        // Without hooks, idle is ambiguous and stays vague. With them, the two
+        // cases separate — which is the difference between a background session
+        // you can leave alone and one that will wait forever.
+        let mut s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
+        s.agent_session_id = Some("abc".into());
+        let base = live(AgentKind::Claude, "/repo", Some("abc"), "idle");
+
+        let vague = probe_with(&s, vec![base.clone()], true);
+        assert_eq!(session_status(&vague, &s, "/repo"), Status::YourTurn);
+
+        let blocked = probe_with(&s, vec![with_attention(base.clone(), "waiting")], true);
+        assert_eq!(session_status(&blocked, &s, "/repo"), Status::NeedsYou);
+
+        let finished = probe_with(&s, vec![with_attention(base, "done")], true);
+        assert_eq!(session_status(&finished, &s, "/repo"), Status::Done);
+    }
+
+    #[test]
+    fn a_blocked_agent_outranks_a_busy_status_line() {
+        // An agent showing a permission prompt can still call itself busy. The
+        // probe only attaches `waiting` when the hook was the fresher report,
+        // so by the time it gets here it is the one to believe.
+        let mut s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
+        s.agent_session_id = Some("abc".into());
+        let busy = live(AgentKind::Claude, "/repo", Some("abc"), "busy");
+        let p = probe_with(&s, vec![with_attention(busy, "waiting")], true);
+        assert_eq!(session_status(&p, &s, "/repo"), Status::NeedsYou);
+    }
+
+    #[test]
+    fn blocked_sorts_above_everything_else() {
+        let order = [
+            Status::NeedsYou,
+            Status::Done,
+            Status::YourTurn,
+            Status::Working,
+            Status::Up,
+            Status::Down,
+        ];
+        let mut urgencies: Vec<u8> = order.iter().map(|s| s.urgency()).collect();
+        let sorted = urgencies.clone();
+        urgencies.sort();
+        assert_eq!(urgencies, sorted, "urgency must already be in listed order");
+        assert!(Status::NeedsYou.wants_you() && Status::Done.wants_you());
+        assert!(!Status::Working.wants_you() && !Status::Down.wants_you());
     }
 
     #[test]

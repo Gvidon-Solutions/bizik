@@ -6,11 +6,16 @@ waiting on you.
 
 ```
  bizik  folders  running  layouts  hosts
-▌◆ your turn   gvidon   claude   payments API        Should I drop the old column?
- ● working     hetzner  claude   frontend rewrite    Editing src/App.tsx…
+▌▲ needs you   gvidon   claude   payments API        Should I drop the old column?
+ ◆ done        hetzner  claude   frontend rewrite    All 48 tests pass.
+ ● working     hetzner  claude   docs sweep          Editing src/App.tsx…
  ○ running     hetzner  codex    migration script    running tests…
  · stopped     local    claude   notes
 ```
+
+`▲` is the one that matters: that session is blocked on a question and will wait
+forever. Without it, launching things in the background is a way of quietly
+accumulating stuck work.
 
 ## Why it is built this way
 
@@ -28,10 +33,10 @@ terminal.
 machine holds what is marked there. The laptop stores only its host list and its
 layouts. That is why a second laptop needs no synchronisation to see everything.
 
-**Status is never invented.** Claude Code publishes a busy/idle status, so bizik
-shows *working* or *your turn*. Codex publishes nothing, so its sessions show
-*running* and nothing more. Where two agents share a folder and cannot be told
-apart, the status stays vague on purpose.
+**Status is never invented.** Claude Code publishes a busy/idle status; its
+hooks say whether idle means *blocked on you* or *finished*. Codex publishes
+nothing, so its sessions show *running* and nothing more. Where two agents share
+a folder and cannot be told apart, the status stays vague on purpose.
 
 ## Install
 
@@ -62,6 +67,24 @@ binary on both sides, so the two can never disagree about the data format. If
 the copy will not run there, install says so and repeats the musl command.
 
 Each server needs tmux, and whichever agents you intend to run.
+
+Then turn on the status hooks, which is what makes `▲ needs you` possible:
+
+```sh
+bzk hooks install back front   # or with no names, for this machine
+bzk hooks status               # where they are installed
+bzk hooks uninstall back       # removes exactly what was added
+```
+
+This edits `~/.claude/settings.json` on that machine. It merges — every hook and
+setting already there is kept — and the original is copied to
+`settings.json.bzk-backup` the first time. Four events are added
+(`Notification`, `Stop`, `UserPromptSubmit`, `SessionEnd`), each running a
+fire-and-forget command that writes one small file. A session picks the hooks up
+when it next starts.
+
+`bzk doctor` reports which hosts have them, and flags a host still running an
+older binary after you rebuild.
 
 ## Use
 
@@ -110,6 +133,13 @@ terminal and you land back where you were.
 | `i` | install bizik on the selected host |
 | `r` | refresh now |
 | `?` | this list |
+
+Starting happens off the drawing thread — the header shows `starting N…` and the
+list stays responsive while ssh does its work.
+
+Restoring a layout wants the pane window to itself: if panes are open that the
+layout does not know about, it offers to close them and replay the saved
+geometry exactly, rather than silently tiling everything together.
 
 Panes open in a window called `bzk-work`. To get from a pane back to the
 dashboard, use tmux: prefix then `w`, or prefix then `0`.
@@ -186,6 +216,7 @@ bzk marks [--json]      list this machine's marks
 bzk probe [--json]      what this machine has: folders, sessions, chats, status
 bzk host add|rm|ls      manage the hosts this laptop drives
 bzk install [host]      copy this binary to a host
+bzk hooks install|uninstall|status [hosts...]
 bzk export|import       move a configuration between machines
 bzk doctor              check the local setup and every host
 ```

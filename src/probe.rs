@@ -69,6 +69,23 @@ pub fn collect(with_preview: bool) -> Probe {
         }
     }
 
+    // Join in what the hooks reported. Doing it here rather than inside each
+    // adapter keeps the adapters to one job — reading their agent's own files.
+    //
+    // A hook report is only used when it is *newer* than the agent's own status
+    // line. The two can disagree — an agent showing a permission prompt is
+    // arguably still mid-turn — and rather than pick a winner by rule, the
+    // fresher of the two accounts is taken.
+    let marks = crate::attention::read_all();
+    for l in &mut live {
+        if let Some(id) = &l.agent_session_id
+            && let Some(mark) = marks.get(id)
+            && mark.at >= l.status_at
+        {
+            l.attention = Some(mark.state.as_str().to_string());
+        }
+    }
+
     let tmux_sessions = if tmux::installed() {
         tmux::list_sessions(with_preview)
     } else {
@@ -84,6 +101,7 @@ pub fn collect(with_preview: bool) -> Probe {
         live,
         tmux: tmux_sessions,
         agents: installed,
+        hooks_installed: crate::hooks::all_installed(),
         warnings,
     }
 }

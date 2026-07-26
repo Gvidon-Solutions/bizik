@@ -240,6 +240,10 @@ pub fn split_window(window: &str, cmd: &str) -> Result<String> {
     Ok(out.trim().to_string())
 }
 
+pub fn kill_pane(pane: &str) -> Result<()> {
+    tmux(&["kill-pane", "-t", pane]).map(|_| ())
+}
+
 pub fn select_pane(pane: &str) -> Result<()> {
     tmux(&["select-pane", "-t", pane]).map(|_| ())
 }

@@ -7,6 +7,8 @@
 //! two sides to disagree about the data format.
 
 mod agent;
+mod attention;
+mod hooks;
 mod hostops;
 mod model;
 mod probe;
@@ -106,6 +108,17 @@ enum Cmd {
         host: Option<String>,
     },
 
+    /// Record an agent hook firing. Called by the agent; reads JSON on stdin.
+    #[command(hide = true)]
+    Hook {
+        /// notification, permission, stop, prompt or end
+        event: String,
+    },
+
+    /// Install, remove or inspect the hooks that report "waiting on you"
+    #[command(subcommand)]
+    Hooks(HooksCmd),
+
     /// Print this machine's configuration as JSON
     Export {
         /// Export this machine's folders and sessions instead of hosts and layouts
@@ -136,6 +149,25 @@ struct MarkArgs {
     /// Mark the enclosing git repository instead of this directory
     #[arg(long, short)]
     repo: bool,
+}
+
+#[derive(Subcommand)]
+enum HooksCmd {
+    /// Add the hooks to a machine's Claude Code settings
+    Install {
+        /// Host names; omit for this machine
+        hosts: Vec<String>,
+    },
+    /// Remove only the hooks bizik added
+    Uninstall {
+        /// Host names; omit for this machine
+        hosts: Vec<String>,
+    },
+    /// Show where the hooks are installed
+    Status {
+        /// Host names; omit for every configured host
+        hosts: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -180,6 +212,8 @@ fn run() -> Result<()> {
         Some(Cmd::RmSession { session }) => cmd_rm_session(session),
         Some(Cmd::Host(c)) => cmd_host(c),
         Some(Cmd::Install { host }) => cmd_install(host),
+        Some(Cmd::Hook { event }) => cmd_hook(&event),
+        Some(Cmd::Hooks(c)) => cmd_hooks(c),
         Some(Cmd::Export { folders }) => cmd_export(folders),
         Some(Cmd::Import { file, folders }) => cmd_import(&file, folders),
         Some(Cmd::Doctor) => cmd_doctor(),
@@ -480,6 +514,108 @@ fn cmd_install(host: Option<String>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Hooks
+// ---------------------------------------------------------------------------
+
+/// Called by the agent itself, many times a session.
+///
+/// It must never fail in a way the agent notices: a hook that exits non-zero
+/// can interrupt the very work it is reporting on. Problems go to stderr and
+/// the exit status stays zero.
+fn cmd_hook(event: &str) -> Result<()> {
+    let payload = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
+    let outcome = if event == "end" {
+        attention::clear(&payload)
+    } else {
+        attention::record(event, &payload)
+    };
+    if let Err(e) = outcome {
+        eprintln!("bzk hook: {e:#}");
+    }
+    Ok(())
+}
+
+fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
+    match cmd {
+        HooksCmd::Install { hosts } if hosts.is_empty() => {
+            let report = hooks::install()?;
+            println!("installed on this machine: {}", report.added.join(", "));
+            println!("settings: {}", hooks::settings_path().display());
+            println!("a running session picks these up on its next start");
+        }
+        HooksCmd::Uninstall { hosts } if hosts.is_empty() => {
+            let report = hooks::uninstall()?;
+            if report.removed.is_empty() {
+                println!("nothing of ours was installed here");
+            } else {
+                println!("removed: {}", report.removed.join(", "));
+            }
+        }
+        HooksCmd::Install { hosts } => remote_hooks(&hosts, "install")?,
+        HooksCmd::Uninstall { hosts } => remote_hooks(&hosts, "uninstall")?,
+        HooksCmd::Status { hosts } => cmd_hooks_status(&hosts)?,
+    }
+    Ok(())
+}
+
+fn remote_hooks(names: &[String], action: &str) -> Result<()> {
+    let store = LocalStore::load()?;
+    for name in names {
+        let host = store
+            .host_by_name(name)
+            .with_context(|| format!("no host named {name}"))?;
+        print!("{name} ... ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        match remote::run_bzk(host, &["hooks", action]) {
+            Ok(out) => println!("{}", util::one_line(&out, 100)),
+            Err(e) => println!("failed: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_hooks_status(names: &[String]) -> Result<()> {
+    let events = hooks::installed_events();
+    println!(
+        "local            {}",
+        if events.is_empty() {
+            "not installed".to_string()
+        } else {
+            events.join(", ")
+        }
+    );
+
+    let mut store = LocalStore::load()?;
+    if store.ensure_local_host() {
+        store.save()?;
+    }
+    let hosts: Vec<model::Host> = store
+        .live_hosts()
+        .into_iter()
+        .filter(|h| !h.is_local() && (names.is_empty() || names.contains(&h.name)))
+        .cloned()
+        .collect();
+
+    for host in hosts {
+        print!("{:<16} ", host.name);
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        match remote::run_bzk(&host, &["hooks", "status"]) {
+            Ok(out) => println!(
+                "{}",
+                out.lines()
+                    .next()
+                    .map(|l| l.trim_start_matches("local").trim())
+                    .unwrap_or("?")
+            ),
+            Err(e) => println!("{e:#}"),
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Moving a configuration between machines
 // ---------------------------------------------------------------------------
 
@@ -572,6 +708,7 @@ fn cmd_doctor() -> Result<()> {
         store.save()?;
     }
     let hosts: Vec<model::Host> = store.live_hosts().into_iter().cloned().collect();
+    let mine = env!("CARGO_PKG_VERSION");
     println!("\nhosts ({})", hosts.len());
     for probed in remote::probe_all(&hosts) {
         match (&probed.probe, &probed.error) {
@@ -582,12 +719,28 @@ fn cmd_doctor() -> Result<()> {
                     p.agents.iter().map(|a| a.to_string()).collect::<Vec<_>>().join("+")
                 };
                 println!(
-                    "  {:<16} ok · bizik {} · {} folders · {}",
+                    "  {:<16} ok · bizik {} · {} folders · {} · hooks {}",
                     probed.host.name,
                     p.bzk_version,
                     p.folders.len(),
-                    agents
+                    agents,
+                    if p.hooks_installed { "on" } else { "off" }
                 );
+                // A stale binary is invisible until something behaves oddly, and
+                // it is easy to leave behind after a rebuild.
+                if p.bzk_version != mine {
+                    println!(
+                        "  {:<16} running {} but this is {mine} — run: bzk install {}",
+                        "", p.bzk_version, probed.host.name
+                    );
+                }
+                if !p.hooks_installed && !p.agents.is_empty() {
+                    println!(
+                        "  {:<16} no hooks — “needs you” cannot be told from “done” here",
+                        ""
+                    );
+                    println!("  {:<16} run: bzk hooks install {}", "", probed.host.name);
+                }
                 for w in &p.warnings {
                     println!("  {:<16} warning: {w}", "");
                 }

@@ -258,6 +258,15 @@ pub struct LiveAgent {
     pub agent_session_id: Option<String>,
     /// `idle`, `busy`, or `unknown` when the agent exposes no status.
     pub status: String,
+    /// When `status` was last written. Used to decide whether a hook report or
+    /// the agent's own status is the fresher account of what is happening.
+    #[serde(default)]
+    pub status_at: u64,
+    /// What the agent's hooks last reported: `waiting`, `done` or `working`.
+    /// Absent when hooks are not installed, which is why an idle session
+    /// without this stays vaguely "your turn" rather than claiming to know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
 }
 
 /// A tmux session seen on a host.
@@ -289,6 +298,10 @@ pub struct Probe {
     /// Agents whose binary is present on this host.
     #[serde(default)]
     pub agents: Vec<AgentKind>,
+    /// Whether the hooks that distinguish "blocked on you" from "finished" are
+    /// installed here.
+    #[serde(default)]
+    pub hooks_installed: bool,
     /// Non-fatal problems worth surfacing instead of hiding.
     #[serde(default)]
     pub warnings: Vec<String>,

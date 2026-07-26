@@ -82,6 +82,17 @@ pub enum Confirm {
     Forget { host: String, session: Uuid },
     Unmark { host: String, path: String },
     DeleteLayout { id: Uuid },
+    RestoreLayout { id: Uuid, close: Vec<String> },
+}
+
+/// A finished round of session starts, handed back from the worker thread.
+struct LaunchBatch {
+    background: bool,
+    /// Geometry to replay once the panes are open, for a layout restore.
+    geometry: Option<String>,
+    /// Layout name, when this batch came from a restore.
+    label: Option<String>,
+    results: Vec<(Host, Result<crate::hostops::SpawnResult, String>)>,
 }
 
 pub enum InputKind {
@@ -107,10 +118,14 @@ pub struct App {
     pub selected: HashSet<(String, Uuid)>,
     pub toast: Option<(String, ToastKind, Instant)>,
     pub refreshing: bool,
+    /// Sessions currently being started on a worker thread.
+    pub starting: usize,
     last_refresh: Instant,
     quit: bool,
     tx: Sender<Vec<HostProbe>>,
     rx: Receiver<Vec<HostProbe>>,
+    launch_tx: Sender<LaunchBatch>,
+    launch_rx: Receiver<LaunchBatch>,
 }
 
 pub fn run() -> Result<()> {
@@ -129,6 +144,7 @@ impl App {
             local.save()?;
         }
         let (tx, rx) = channel();
+        let (launch_tx, launch_rx) = channel();
         Ok(Self {
             local,
             probes: Vec::new(),
@@ -141,10 +157,13 @@ impl App {
             selected: HashSet::new(),
             toast: None,
             refreshing: false,
+            starting: 0,
             last_refresh: Instant::now() - REFRESH_EVERY,
             quit: false,
             tx,
             rx,
+            launch_tx,
+            launch_rx,
         })
     }
 
@@ -230,6 +249,10 @@ impl App {
             self.probes = probes;
             self.refreshing = false;
             self.last_refresh = Instant::now();
+        }
+
+        while let Ok(batch) = self.launch_rx.try_recv() {
+            self.finish_batch(batch);
         }
 
         if !self.refreshing && self.last_refresh.elapsed() >= REFRESH_EVERY {
@@ -497,13 +520,108 @@ impl App {
             self.error(format!("unknown host {host_name}"));
             return;
         };
-        match actions::launch(&host, session, background) {
-            Ok(msg) => {
-                self.info(msg);
-                self.kick_refresh();
-            }
-            Err(e) => self.error(format!("{e:#}")),
+        self.spawn_batch(vec![(host, session)], background, None, None);
+    }
+
+    /// Start sessions off the drawing thread.
+    ///
+    /// Each start is an ssh round trip. Done inline, a batch of six would freeze
+    /// the dashboard for as long as the slowest one — and on a cold connection
+    /// that is seconds. The starts run concurrently on a worker; the panes are
+    /// opened here when the results arrive, in order, so the arrangement stays
+    /// predictable.
+    fn spawn_batch(
+        &mut self,
+        jobs: Vec<(Host, Uuid)>,
+        background: bool,
+        geometry: Option<String>,
+        label: Option<String>,
+    ) {
+        if jobs.is_empty() {
+            return;
         }
+        self.starting += jobs.len();
+        let tx = self.launch_tx.clone();
+
+        std::thread::spawn(move || {
+            let results: Vec<(Host, Result<crate::hostops::SpawnResult, String>)> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = jobs
+                        .iter()
+                        .map(|(host, id)| scope.spawn(move || actions::start(host, *id)))
+                        .collect();
+                    jobs.iter()
+                        .cloned()
+                        .zip(handles)
+                        .map(|((host, _), h)| {
+                            let outcome = match h.join() {
+                                Ok(Ok(r)) => Ok(r),
+                                Ok(Err(e)) => Err(format!("{e:#}")),
+                                Err(_) => Err("start panicked".into()),
+                            };
+                            (host, outcome)
+                        })
+                        .collect()
+                });
+            let _ = tx.send(LaunchBatch {
+                background,
+                geometry,
+                label,
+                results,
+            });
+        });
+    }
+
+    /// Open panes for a finished batch. Runs on the drawing thread, where every
+    /// call is a local tmux command and therefore fast.
+    fn finish_batch(&mut self, batch: LaunchBatch) {
+        self.starting = self.starting.saturating_sub(batch.results.len());
+
+        let mut opened = 0;
+        let mut failed = 0;
+        for (host, result) in &batch.results {
+            match result {
+                Ok(spawned) => {
+                    if batch.background {
+                        opened += 1;
+                    } else if let Err(e) = actions::open_pane(host, &spawned.tmux_name) {
+                        failed += 1;
+                        self.error(format!("{e:#}"));
+                    } else {
+                        opened += 1;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    self.error(e.clone());
+                }
+            }
+        }
+
+        if !batch.background && opened > 0 {
+            match &batch.geometry {
+                Some(geometry) => {
+                    if actions::apply_geometry(geometry).is_err() {
+                        actions::tile();
+                    }
+                }
+                None => actions::tile(),
+            }
+            let _ = actions::focus_work();
+        }
+
+        if failed > 0 {
+            self.error(format!("{opened} started, {failed} failed"));
+        } else if let Some(name) = batch.label {
+            self.info(format!("restored {name}"));
+        } else {
+            self.info(format!(
+                "{opened} session{} {}",
+                if opened == 1 { "" } else { "s" },
+                if batch.background { "started" } else { "open" }
+            ));
+        }
+        self.kick_refresh();
     }
 
     fn start_new(
@@ -534,11 +652,6 @@ impl App {
         }
     }
 
-    /// Start everything that is selected, then show them together.
-    ///
-    /// The starts run concurrently because each is an independent ssh round
-    /// trip; the panes are then opened locally, in order, so the arrangement is
-    /// predictable.
     fn launch_selected(&mut self, background: bool) {
         let picked: Vec<(String, Uuid)> = self.selected.iter().cloned().collect();
         let mut jobs: Vec<(Host, Uuid)> = Vec::new();
@@ -548,99 +661,70 @@ impl App {
                 None => self.error(format!("unknown host {host_name}")),
             }
         }
-
-        let started: Vec<Result<crate::hostops::SpawnResult, String>> =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = jobs
-                    .iter()
-                    .map(|(host, id)| scope.spawn(move || actions::start(host, *id)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| match h.join() {
-                        Ok(Ok(r)) => Ok(r),
-                        Ok(Err(e)) => Err(format!("{e:#}")),
-                        Err(_) => Err("start panicked".into()),
-                    })
-                    .collect()
-            });
-
-        let mut opened = 0;
-        let mut failed = 0;
-        for ((host, _), result) in jobs.iter().zip(started) {
-            match result {
-                Ok(spawned) => {
-                    if background {
-                        opened += 1;
-                    } else if let Err(e) = actions::open_pane(host, &spawned.tmux_name) {
-                        failed += 1;
-                        self.error(format!("{e:#}"));
-                    } else {
-                        opened += 1;
-                    }
-                }
-                Err(e) => {
-                    failed += 1;
-                    self.error(e);
-                }
-            }
-        }
-
-        if !background && opened > 0 {
-            let _ = actions::focus_work();
-        }
         self.selected.clear();
-        if failed == 0 {
-            self.info(format!(
-                "{opened} session{} {}",
-                if opened == 1 { "" } else { "s" },
-                if background { "started" } else { "open" }
-            ));
-        } else {
-            self.error(format!("{opened} started, {failed} failed"));
-        }
-        self.kick_refresh();
+        self.spawn_batch(jobs, background, None, None);
     }
 
+    /// Restore a saved arrangement.
+    ///
+    /// A saved geometry describes that layout's panes and no others, so
+    /// replaying it over unrelated panes would rearrange work the layout knows
+    /// nothing about. Rather than silently tile instead, the panes that do not
+    /// belong are named and closing them is offered as a choice.
     fn restore_layout(&mut self, layout: &Layout) {
-        let existing = tmux::find_window(actions::WORK_WINDOW).is_some();
-        let mut opened = 0;
+        let sessions = self.all_sessions();
+        let open = actions::panes_in_work(&sessions);
+        let wanted: HashSet<(String, Uuid)> = layout
+            .panes
+            .iter()
+            .map(|p| (p.host.clone(), p.session))
+            .collect();
 
-        for pane in &layout.panes {
-            let Some(host) = self.host(&pane.host) else {
-                self.error(format!("layout needs host “{}”, which is not configured", pane.host));
-                continue;
-            };
-            match actions::start(&host, pane.session) {
-                Ok(spawned) => match actions::open_pane(&host, &spawned.tmux_name) {
-                    Ok(_) => opened += 1,
-                    Err(e) => self.error(format!("{e:#}")),
-                },
-                Err(e) => self.error(format!("{e:#}")),
-            }
-        }
+        let strangers: Vec<String> = open
+            .iter()
+            .filter(|p| !wanted.contains(&(p.host.clone(), p.session)))
+            .map(|p| p.pane.clone())
+            .collect();
 
-        if opened == 0 {
+        if strangers.is_empty() {
+            self.do_restore(layout, &[]);
             return;
         }
-        // The saved geometry only describes this layout's panes. If panes were
-        // already open, replaying it would rearrange somebody else's work, so
-        // fall back to tiling and say so.
-        match (&layout.tmux_layout, existing) {
-            (Some(geometry), false) => {
-                if let Some(window) = tmux::find_window(actions::WORK_WINDOW) {
-                    let _ = tmux::select_layout(&window, geometry);
-                }
-                self.info(format!("restored {}", layout.name));
-            }
-            (Some(_), true) => self.info(format!(
-                "added {} to the panes already open — tiled instead of the saved arrangement",
-                layout.name
-            )),
-            (None, _) => self.info(format!("restored {}", layout.name)),
+        self.overlay = Some(Overlay::Confirm {
+            prompt: format!(
+                "“{}” needs the pane window to itself. Close {} other pane{} and restore its exact arrangement?",
+                layout.name,
+                strangers.len(),
+                if strangers.len() == 1 { "" } else { "s" }
+            ),
+            action: Confirm::RestoreLayout {
+                id: layout.id,
+                close: strangers,
+            },
+        });
+    }
+
+    fn do_restore(&mut self, layout: &Layout, close: &[String]) {
+        for pane in close {
+            let _ = tmux::kill_pane(pane);
         }
-        let _ = actions::focus_work();
-        self.kick_refresh();
+
+        let mut jobs: Vec<(Host, Uuid)> = Vec::new();
+        for pane in &layout.panes {
+            match self.host(&pane.host) {
+                Some(h) => jobs.push((h, pane.session)),
+                None => self.error(format!(
+                    "layout needs host “{}”, which is not configured",
+                    pane.host
+                )),
+            }
+        }
+        self.spawn_batch(
+            jobs,
+            false,
+            layout.tmux_layout.clone(),
+            Some(layout.name.clone()),
+        );
     }
 
     fn begin_relabel(&mut self) {
@@ -751,6 +835,15 @@ impl App {
                     .map(|_| "layout deleted".to_string())
                     .map_err(|e| format!("{e:#}"))
             }
+            Confirm::RestoreLayout { id, close } => {
+                match self.local.live_layouts().into_iter().find(|l| l.id == id).cloned() {
+                    Some(layout) => {
+                        self.do_restore(&layout, &close);
+                        return;
+                    }
+                    None => Err("that layout is gone".to_string()),
+                }
+            }
         };
         match outcome {
             Ok(msg) => {
@@ -793,7 +886,10 @@ impl App {
         }
         let refs: Vec<PaneRef> = panes
             .into_iter()
-            .map(|(host, session)| PaneRef { host, session })
+            .map(|p| PaneRef {
+                host: p.host,
+                session: p.session,
+            })
             .collect();
         let count = refs.len();
 
@@ -844,6 +940,7 @@ mod tests {
             sessions: 0,
             running: 0,
             attention: 0,
+            blocked: 0,
         }
     }
 

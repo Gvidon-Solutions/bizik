@@ -42,6 +42,11 @@ struct RegistryEntry {
     cwd: String,
     #[serde(default)]
     status: Option<String>,
+    /// When the status was last written; falls back to the record's own stamp.
+    #[serde(default)]
+    status_updated_at: Option<u64>,
+    #[serde(default)]
+    updated_at: Option<u64>,
     /// Process start time in clock ticks; guards against pid reuse.
     #[serde(default)]
     proc_start: Option<String>,
@@ -125,6 +130,8 @@ impl Agent for ClaudeAgent {
                 cwd: reg.cwd,
                 agent_session_id: Some(reg.session_id),
                 status: reg.status.unwrap_or_else(|| "unknown".into()),
+                status_at: reg.status_updated_at.or(reg.updated_at).unwrap_or(0),
+                attention: None,
             });
         }
         out
