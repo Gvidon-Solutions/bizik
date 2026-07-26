@@ -1,0 +1,211 @@
+# bizik
+
+Mark folders on the machines you work on. From one screen, launch Claude Code or
+Codex sessions in any of them, watch several at once, and see which one is
+waiting on you.
+
+```
+ bizik  folders  running  layouts  hosts
+▌◆ your turn   gvidon   claude   payments API        Should I drop the old column?
+ ● working     hetzner  claude   frontend rewrite    Editing src/App.tsx…
+ ○ running     hetzner  codex    migration script    running tests…
+ · stopped     local    claude   notes
+```
+
+## Why it is built this way
+
+**Agents run on their host, not on your laptop.** Each session is a detached
+tmux session on the machine that owns the code. Your laptop only ever runs a
+viewer. Close the lid, lose the wifi, reboot — the work carries on, and a second
+laptop is just another viewer.
+
+**tmux does the multiplexing.** bizik decides what to start and where to put it;
+tmux draws the panes. An agent's own full-screen interface keeps working
+properly — scrollback, mouse, resize, copy mode — because nothing reimplements a
+terminal.
+
+**Folders and sessions live on their host.** `~/.config/bizik/host.json` on each
+machine holds what is marked there. The laptop stores only its host list and its
+layouts. That is why a second laptop needs no synchronisation to see everything.
+
+**Status is never invented.** Claude Code publishes a busy/idle status, so bizik
+shows *working* or *your turn*. Codex publishes nothing, so its sessions show
+*running* and nothing more. Where two agents share a folder and cannot be told
+apart, the status stays vague on purpose.
+
+## Install
+
+Needs Rust, tmux, and ssh.
+
+**Build against musl.** `bzk install` copies the binary you are running to each
+server, and a default build links against your laptop's glibc — which is
+routinely newer than the server's. The musl target produces a genuinely static
+binary that runs on any Linux, and needs no C toolchain:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+install -m755 target/x86_64-unknown-linux-musl/release/bzk ~/.local/bin/bzk
+```
+
+Then register your servers and push the binary to them:
+
+```sh
+bzk host add back  168.119.201.8
+bzk host add front gvidon.ai
+bzk install                 # scp's this binary to every host
+bzk doctor                  # checks tmux, ssh, agents, and every host
+```
+
+`bzk install` puts the binary at `~/.local/bin/bzk` on each host. It is the same
+binary on both sides, so the two can never disagree about the data format. If
+the copy will not run there, install says so and repeats the musl command.
+
+Each server needs tmux, and whichever agents you intend to run.
+
+## Use
+
+On any machine, inside a directory you work in:
+
+```sh
+bzk mark                    # this directory
+bzk mark -r                 # the enclosing git repository (or: --repo, or mark-repo)
+bzk mark -l "payments API"  # with a name for the list
+bzk unmark
+```
+
+Add a shortcut to your shell rc so marking is one keystroke:
+
+```sh
+alias m='bzk mark'
+alias mr='bzk mark --repo'
+```
+
+Then, on your laptop:
+
+```sh
+bzk
+```
+
+That opens the dashboard in a tmux session named `bizik`. Run it again from any
+terminal and you land back where you were.
+
+### Keys
+
+| | |
+|---|---|
+| `↑ ↓` / `j k`, `g` `G` | move |
+| `tab` / `⇧tab` | switch screen |
+| `/` | fuzzy filter |
+| `esc` | back — always, at every depth |
+| `q` | quit (sessions keep running) |
+| `enter` | start a session and open a pane |
+| `b` | start it in the background and stay here |
+| `space` | select · then `enter` opens them all at once |
+| `x` | stop a session (its conversation is kept) |
+| `d` | forget a session · unmark a folder |
+| `e` | rename a folder |
+| `w` | jump to the pane window |
+| `S` | save the open panes as a layout |
+| `i` | install bizik on the selected host |
+| `r` | refresh now |
+| `?` | this list |
+
+Panes open in a window called `bzk-work`. To get from a pane back to the
+dashboard, use tmux: prefix then `w`, or prefix then `0`.
+
+If you want one key for it, add this to `~/.tmux.conf`:
+
+```tmux
+bind -n F12 select-window -t bzk-dash
+```
+
+### Nesting
+
+Your laptop's tmux and each server's tmux both want a prefix key. Leave the
+servers on the default `C-b` so hand-rolled ssh sessions keep working as before,
+and give the laptop a different one:
+
+```tmux
+# ~/.tmux.conf on the laptop only
+unbind C-b
+set -g prefix C-a
+bind C-a send-prefix
+```
+
+Then `C-a` is "my pane manager" and `C-b` is "inside that machine".
+
+## Sessions and conversations
+
+A **session** is a long-lived, named thing you come back to: one agent, one
+folder, one conversation. Several per folder is normal — one doing the work,
+one for questions.
+
+Opening a folder shows what you can start, the sessions bizik already tracks,
+and the agent's own past conversations in that directory. Picking one of those
+adopts it: the record is created and the conversation resumed, with its history
+left exactly where the agent put it.
+
+bizik stores a *pointer* to the agent's conversation id, never treats it as an
+identity, and repairs it after each run by matching the running process back to
+the pane tmux started for it. That is what makes resuming after a reboot land in
+the same conversation rather than an empty one.
+
+## When something breaks
+
+* **An agent exits** — the pane stays, prints the exit code, and drops you into a
+  shell in the same directory. Nothing restarts by itself: a background agent
+  silently re-running could repeat work that already had effects.
+* **A host goes away** — its row says so, and the other hosts carry on. Probes
+  run in parallel with a short timeout.
+* **tmux or the server restarts** — the sessions are gone but the records are
+  not. Restore a layout and everything is started and resumed in one step.
+* **Quitting the dashboard** — stops nothing. The sessions are on their hosts.
+
+## More than one laptop, or sharing
+
+Layouts refer to hosts by name, not by address, so they survive a server moving
+and can be handed to someone else who has a host of that name.
+
+```sh
+bzk export > bizik.json          # hosts and layouts
+bzk import bizik.json            # merge them in on the other laptop
+bzk export --folders > srv.json  # a machine's own folders and sessions
+```
+
+Merging is last-write-wins per record and respects deletions, so importing twice
+is harmless and a delete made on one machine is not resurrected by the other.
+
+## Commands
+
+```
+bzk                     open the dashboard
+bzk mark [--repo] [-l]  mark a directory here
+bzk unmark [path]       unmark it
+bzk marks [--json]      list this machine's marks
+bzk probe [--json]      what this machine has: folders, sessions, chats, status
+bzk host add|rm|ls      manage the hosts this laptop drives
+bzk install [host]      copy this binary to a host
+bzk export|import       move a configuration between machines
+bzk doctor              check the local setup and every host
+```
+
+`bzk new-session`, `bzk spawn`, `bzk stop` and `bzk rm-session` also exist; the
+dashboard calls them over ssh, and they are useful by hand or from a script.
+
+`BIZIK_CONFIG_DIR` and `BIZIK_CACHE_DIR` override where state is kept, which is
+handy for keeping two independent profiles on one machine.
+
+## Notes on the agents
+
+Claude Code keeps transcripts in `~/.claude/projects/<escaped-cwd>/<id>.jsonl`
+and a live registry in `~/.claude/sessions/<pid>.json`. Both are internal
+formats with no compatibility promise, so bizik parses them defensively: reads
+are bounded (transcripts reach tens of megabytes), results are cached by mtime
+and size, and anything unparseable degrades to a path and a timestamp rather
+than an error. Registry entries outlive crashed processes, so every pid is
+checked against `/proc` — including its start time, to catch a recycled pid.
+
+Codex keeps `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, whose first record
+carries the working directory and session id. It has no live registry, so
+liveness comes from walking `/proc`.
