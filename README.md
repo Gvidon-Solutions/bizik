@@ -174,6 +174,18 @@ passes straight through to whatever is running, so nothing else is affected.
 `BIZIK_RETURN_KEY=F9 bzk` picks a different one; tmux prefix then `0` always
 works too.
 
+Between panes: click one, or tmux prefix and an arrow key. `prefix z` zooms the
+current pane to the whole window and back — with four panes open that is the one
+worth remembering. From the dashboard, `enter` on a session that is already open
+jumps to its pane rather than opening a second copy of it.
+
+The mouse is enabled for bizik's own tmux session only — clicking a pane selects
+it and the wheel scrolls its history, while every other session on your tmux
+server keeps whatever you had. Two things follow from it: dragging selects into
+tmux's buffer instead of the terminal's, so hold `Shift` for the terminal's own
+selection; and a mouse-aware program inside a pane no longer sees the wheel,
+since the outer tmux takes it first. `BIZIK_MOUSE=off bzk` turns it back off.
+
 ### Nesting
 
 Your laptop's tmux and each server's tmux both want a prefix key. Leave the

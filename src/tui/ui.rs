@@ -366,6 +366,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Style::default().fg(ACCENT),
         )),
         Line::from(Span::styled(
+            "between panes: click, or tmux prefix then arrows · z zooms one full screen",
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
             "any key closes this",
             Style::default().fg(DIM),
         )),

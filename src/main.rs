@@ -248,36 +248,33 @@ fn cmd_tui() -> Result<()> {
     let exe = std::env::current_exe().context("locating own binary")?;
     let dash = format!("{}{} tui", config_env(), exe.display());
 
-    // Re-applied on every launch: bindings live on the tmux server, which may
-    // have restarted since last time.
-    let _ = tmux::bind_return_key(SESSION, DASH_WINDOW);
+    // The session is created detached and attached separately, so options and
+    // bindings can be applied to a session that exists but nobody is looking at
+    // yet — the same path whether this is a first run or a reattach.
+    if !tmux::has_session(SESSION) {
+        tmux::new_detached_session(SESSION, DASH_WINDOW, &dash)?;
+    }
 
     // Reattaching must always land on a live dashboard. A previous run may have
     // been quit while its panes stayed open, leaving the session alive but with
     // no dashboard window in it — so recreate the window rather than attaching
     // into a session where nothing responds to keys.
-    if tmux::has_session(SESSION) {
-        match tmux::find_window_in(Some(SESSION), DASH_WINDOW) {
-            Some(w) => tmux::select_window(&w)?,
-            None => {
-                tmux::new_window_in(SESSION, DASH_WINDOW, &dash)?;
-            }
+    match tmux::find_window_in(Some(SESSION), DASH_WINDOW) {
+        Some(w) => tmux::select_window(&w)?,
+        None => {
+            tmux::new_window_in(SESSION, DASH_WINDOW, &dash)?;
         }
-        let status = Command::new("tmux")
-            .args(["attach", "-t", &format!("={SESSION}")])
-            .status()
-            .context("attaching to tmux")?;
-        if !status.success() {
-            bail!("tmux exited with {status}");
-        }
-        return Ok(());
     }
 
+    // Both re-applied every launch: bindings live on the tmux server and
+    // options on the session, either of which may have gone away since.
+    let _ = tmux::bind_return_key(SESSION, DASH_WINDOW);
+    tmux::apply_session_options(SESSION);
+
     let status = Command::new("tmux")
-        .args(["new-session", "-A", "-s", SESSION, "-n", DASH_WINDOW])
-        .arg(&dash)
+        .args(["attach", "-t", &format!("={SESSION}")])
         .status()
-        .context("starting tmux")?;
+        .context("attaching to tmux")?;
     if !status.success() {
         bail!("tmux exited with {status}");
     }

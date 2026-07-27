@@ -277,6 +277,38 @@ pub fn bind_return_key(session: &str, window: &str) -> Result<()> {
     .map(|_| ())
 }
 
+/// Create a detached session running `cmd` in a window called `window`.
+///
+/// Detached first, then attached separately, so session options can be set
+/// while the session exists but nothing is looking at it yet.
+pub fn new_detached_session(session: &str, window: &str, cmd: &str) -> Result<()> {
+    tmux(&["new-session", "-d", "-s", session, "-n", window, cmd]).map(|_| ())
+}
+
+/// Set an option on one session only.
+///
+/// Unlike key bindings, session options really are scoped: other sessions on
+/// the same server and the global defaults are untouched. Note the target takes
+/// no `=` anchor — `set-option` rejects one, unlike most other commands.
+pub fn set_session_option(session: &str, name: &str, value: &str) -> Result<()> {
+    tmux(&["set-option", "-t", session, name, value]).map(|_| ())
+}
+
+/// Whether the mouse should be on. `BIZIK_MOUSE=off` turns it off.
+pub fn mouse_wanted() -> bool {
+    !matches!(
+        std::env::var("BIZIK_MOUSE").as_deref(),
+        Ok("off") | Ok("0") | Ok("false")
+    )
+}
+
+/// Options applied to bizik's own session, and to no other.
+pub fn apply_session_options(session: &str) {
+    if mouse_wanted() {
+        let _ = set_session_option(session, "mouse", "on");
+    }
+}
+
 pub fn kill_pane(pane: &str) -> Result<()> {
     tmux(&["kill-pane", "-t", pane]).map(|_| ())
 }
