@@ -279,6 +279,21 @@ struct Envelope {
     protocol: u32,
 }
 
+/// What to say when the two ends disagree about the protocol.
+///
+/// Which side is behind decides the advice. Telling someone to reinstall the
+/// host when it is their own laptop that is stale sends them round a loop that
+/// cannot help — and a laptop left running through an upgrade is the more
+/// likely of the two.
+fn skew_advice(theirs: u32, ours: u32, host: &str) -> String {
+    let fix = if theirs < ours {
+        format!("run: bzk install {host}")
+    } else {
+        "this bizik is the old one — rebuild and reinstall it here".to_string()
+    };
+    format!("speaks protocol {theirs} but this bizik is {ours} — {fix}")
+}
+
 pub fn probe_one(host: &Host) -> HostProbe {
     let fail = |error: String| HostProbe {
         host: host.clone(),
@@ -295,11 +310,10 @@ pub fn probe_one(host: &Host) -> HostProbe {
 
     match serde_json::from_str::<Envelope>(&raw) {
         Ok(envelope) if envelope.protocol != crate::model::PROTOCOL => {
-            return fail(format!(
-                "speaks protocol {} but this bizik is {} — run: bzk install {}",
+            return fail(skew_advice(
                 envelope.protocol,
                 crate::model::PROTOCOL,
-                host.name
+                &host.name,
             ));
         }
         Ok(_) => {}
@@ -330,6 +344,22 @@ pub fn probe_one(host: &Host) -> HostProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_protocol_skew_names_the_side_that_is_behind() {
+        let older_host = skew_advice(0, 1, "anogem");
+        assert!(older_host.contains("bzk install anogem"), "{older_host}");
+
+        let older_laptop = skew_advice(2, 1, "anogem");
+        assert!(
+            older_laptop.contains("this bizik is the old one"),
+            "{older_laptop}"
+        );
+        assert!(
+            !older_laptop.contains("bzk install anogem"),
+            "reinstalling the host cannot fix a stale laptop: {older_laptop}"
+        );
+    }
 
     #[test]
     fn local_attach_clears_tmux_so_nesting_is_allowed() {
