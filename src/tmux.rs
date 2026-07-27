@@ -99,8 +99,12 @@ pub fn socket() -> Option<String> {
 
 /// The tmux invocation as it must appear inside a shell command string.
 pub fn cli() -> String {
-    match socket() {
-        Some(s) => format!("tmux -L {}", shell_quote(&s)),
+    cli_on(socket().as_deref())
+}
+
+fn cli_on(socket: Option<&str>) -> String {
+    match socket {
+        Some(s) => format!("tmux -L {}", shell_quote(s)),
         None => "tmux".to_string(),
     }
 }
@@ -588,10 +592,8 @@ mod tests {
     fn a_socket_makes_every_invocation_private() {
         // Guards the property the test suite depends on: with a socket set,
         // nothing can reach the server the user is working on.
-        unsafe { std::env::set_var("BIZIK_TMUX_SOCKET", "bzk-unit") };
-        assert_eq!(cli(), "tmux -L 'bzk-unit'");
-        unsafe { std::env::remove_var("BIZIK_TMUX_SOCKET") };
-        assert_eq!(cli(), "tmux");
+        assert_eq!(cli_on(Some("bzk-unit")), "tmux -L 'bzk-unit'");
+        assert_eq!(cli_on(None), "tmux");
     }
 
     #[test]

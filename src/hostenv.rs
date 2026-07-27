@@ -91,14 +91,24 @@ pub fn effective_path() -> String {
 /// Returned as a prefix rather than applied to a `Command` because the launch
 /// travels as a shell string through tmux.
 pub fn path_prefix(extra: Option<&str>) -> String {
-    let base = effective_path();
-    let joined = match extra {
+    format!(
+        "PATH={}",
+        crate::util::shell_quote(&join_path(&effective_path(), extra))
+    )
+}
+
+/// Put `extra` at the front of `base`, unless it is already somewhere in it.
+///
+/// Split out so it can be tested without swapping environment variables under
+/// a process whose other tests are reading them — a source of failures that
+/// appear only when the suite runs in parallel.
+fn join_path(base: &str, extra: Option<&str>) -> String {
+    match extra {
         Some(dir) if !dir.is_empty() && !base.split(':').any(|p| p == dir) => {
             format!("{dir}:{base}")
         }
-        _ => base,
-    };
-    format!("PATH={}", crate::util::shell_quote(&joined))
+        _ => base.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -107,31 +117,27 @@ mod tests {
 
     #[test]
     fn the_tools_own_directory_goes_first() {
-        // SAFETY: no other thread reads PATH during this test.
-        unsafe { std::env::set_var("BIZIK_CONFIG_DIR", "/nonexistent-for-test") };
-        unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
-
-        let prefix = path_prefix(Some("/home/me/.nvm/versions/node/v25/bin"));
-        assert!(prefix.starts_with("PATH="));
-        assert!(
-            prefix.contains("'/home/me/.nvm/versions/node/v25/bin:/usr/bin:/bin'"),
-            "got: {prefix}"
+        assert_eq!(
+            join_path("/usr/bin:/bin", Some("/home/me/.nvm/versions/node/v25/bin")),
+            "/home/me/.nvm/versions/node/v25/bin:/usr/bin:/bin"
         );
     }
 
     #[test]
     fn a_directory_already_present_is_not_added_twice() {
-        unsafe { std::env::set_var("BIZIK_CONFIG_DIR", "/nonexistent-for-test") };
-        unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
-
-        let prefix = path_prefix(Some("/usr/bin"));
-        assert_eq!(prefix, "PATH='/usr/bin:/bin'");
+        assert_eq!(
+            join_path("/usr/bin:/bin", Some("/usr/bin")),
+            "/usr/bin:/bin"
+        );
+        assert_eq!(join_path("/usr/bin:/bin", None), "/usr/bin:/bin");
+        assert_eq!(join_path("/usr/bin", Some("")), "/usr/bin");
     }
 
     #[test]
     fn a_path_with_a_quote_in_it_cannot_break_out_of_the_assignment() {
-        unsafe { std::env::set_var("BIZIK_CONFIG_DIR", "/nonexistent-for-test") };
-        unsafe { std::env::set_var("PATH", "/od'd/bin") };
-        assert_eq!(path_prefix(None), r"PATH='/od'\''d/bin'");
+        assert_eq!(
+            crate::util::shell_quote(&join_path("/od'd/bin", None)),
+            r"'/od'\''d/bin'"
+        );
     }
 }
