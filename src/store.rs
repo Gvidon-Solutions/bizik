@@ -137,12 +137,23 @@ impl HostStore {
         self.folders.iter_mut().find(|f| f.id == id)
     }
 
+    /// A session that has not been forgotten.
+    ///
+    /// Tombstones must not be visible here. Returning one let `spawn` start a
+    /// session that had been deleted: the tmux session came back and its panes
+    /// worked, but nothing that reports live sessions would ever mention it —
+    /// so it showed up as a layout with missing panes that nevertheless opened
+    /// fine, and as a session no dashboard could stop.
     pub fn session(&self, id: Uuid) -> Option<&Session> {
-        self.sessions.iter().find(|s| s.id == id)
+        self.sessions
+            .iter()
+            .find(|s| s.id == id && s.deleted_at.is_none())
     }
 
     pub fn session_mut(&mut self, id: Uuid) -> Option<&mut Session> {
-        self.sessions.iter_mut().find(|s| s.id == id)
+        self.sessions
+            .iter_mut()
+            .find(|s| s.id == id && s.deleted_at.is_none())
     }
 
     /// Mark a path, or revive its tombstone if it was marked before — so
@@ -359,6 +370,20 @@ mod tests {
             "layouts referencing this folder must survive"
         );
         assert!(s.live_folders().len() == 1);
+    }
+
+    #[test]
+    fn a_forgotten_session_cannot_be_looked_up_and_started_again() {
+        let mut s = HostStore::default();
+        let f = s.upsert_folder("/x");
+        let session = Session::new(f, AgentKind::Claude, "t".into());
+        let id = session.id;
+        s.sessions.push(session);
+        assert!(s.session(id).is_some());
+
+        s.remove_session(id);
+        assert!(s.session(id).is_none(), "a tombstone is not a session");
+        assert!(s.session_mut(id).is_none());
     }
 
     #[test]

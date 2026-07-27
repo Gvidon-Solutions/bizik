@@ -97,6 +97,23 @@ pub fn collect(with_preview: bool) -> Probe {
         Vec::new()
     };
 
+    // A bizik-named tmux session with no record behind it is invisible to every
+    // screen — it cannot be attached, stopped or reasoned about, and it keeps
+    // running. Saying so is the difference between a leak and a chore.
+    let tracked: Vec<String> = sessions.iter().map(|s| s.tmux_name()).collect();
+    let orphans: Vec<&str> = tmux_sessions
+        .iter()
+        .map(|t| t.name.as_str())
+        .filter(|name| name.starts_with("bzk-") && !tracked.iter().any(|t| t == name))
+        .collect();
+    if !orphans.is_empty() {
+        warnings.push(format!(
+            "{} tmux session(s) bizik no longer tracks: {} — close with: tmux kill-session -t <name>",
+            orphans.len(),
+            orphans.join(", ")
+        ));
+    }
+
     Probe {
         bzk_version: env!("CARGO_PKG_VERSION").to_string(),
         folders,
