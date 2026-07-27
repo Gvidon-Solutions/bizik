@@ -535,24 +535,45 @@ pub struct PaneInfo {
     pub start_command: String,
 }
 
-pub fn window_panes(window: &str) -> Result<Vec<PaneInfo>> {
-    let fmt = format!("#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{pane_start_command}}");
-    let raw = tmux(&["list-panes", "-t", window, "-F", &fmt])?;
+/// Every pane of every window with this name, on any session of this server.
+///
+/// `window_panes` resolves the *current* session, which needs a `TMUX` in the
+/// environment. This one does not, so the pane mapping can be inspected from an
+/// ordinary shell — which is the difference between diagnosing a mismatch and
+/// guessing at it.
+pub fn panes_of_window_anywhere(name: &str) -> Result<Vec<PaneInfo>> {
+    let fmt = format!(
+        "#{{window_name}}\t#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{pane_start_command}}"
+    );
+    let raw = tmux(&["list-panes", "-a", "-F", &fmt])?;
     Ok(raw
         .lines()
         .filter_map(|l| {
-            let mut parts = l.split('\t');
-            let pane = parts.next()?.to_string();
-            let clean =
-                |s: Option<&str>| s.map(str::to_string).filter(|v| !v.is_empty() && v != "0");
-            Some(PaneInfo {
-                pane,
-                session: clean(parts.next()),
-                host: clean(parts.next()),
-                start_command: parts.next().unwrap_or_default().to_string(),
-            })
+            let mut parts = l.splitn(5, '\t');
+            if parts.next()? != name {
+                return None;
+            }
+            Some(parse_pane(parts))
         })
         .collect())
+}
+
+pub fn window_panes(window: &str) -> Result<Vec<PaneInfo>> {
+    let fmt = format!("#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{pane_start_command}}");
+    let raw = tmux(&["list-panes", "-t", window, "-F", &fmt])?;
+    Ok(raw.lines().map(|l| parse_pane(l.splitn(4, '\t'))).collect())
+}
+
+/// The command is last and taken whole: `splitn` keeps a tab inside it from
+/// being read as another field.
+fn parse_pane<'a>(mut parts: impl Iterator<Item = &'a str>) -> PaneInfo {
+    let clean = |s: Option<&str>| s.map(str::to_string).filter(|v| !v.is_empty() && v != "0");
+    PaneInfo {
+        pane: parts.next().unwrap_or_default().to_string(),
+        session: clean(parts.next()),
+        host: clean(parts.next()),
+        start_command: parts.next().unwrap_or_default().to_string(),
+    }
 }
 
 /// Attach this terminal to a session, blocking until the user detaches.

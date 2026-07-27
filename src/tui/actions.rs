@@ -168,29 +168,39 @@ pub fn panes_in_work(candidates: &[(String, Session)]) -> Vec<OpenPane> {
     panes
         .into_iter()
         .filter_map(|p| {
-            // Tagged panes answer for themselves. An untagged one is from an
-            // older build; it is recovered from its start command and tagged,
-            // so this is the last time it needs recovering.
-            if let (Some(session), Some(host)) = (&p.session, &p.host)
-                && let Ok(id) = session.parse()
-            {
-                return Some(OpenPane {
-                    pane: p.pane,
-                    host: host.clone(),
-                    session: id,
-                });
+            let (host, session) = identify_pane(&p, candidates)?;
+            // Recovered panes are tagged as they are found, so this is the last
+            // time any of them needs recovering.
+            if p.session.is_none() {
+                let _ = tmux::tag_pane(&p.pane, &session.to_string(), &host);
             }
-            let (host, session) = candidates
-                .iter()
-                .find(|(_, s)| p.start_command.contains(&format!("'={}'", s.tmux_name())))?;
-            let _ = tmux::tag_pane(&p.pane, &session.id.to_string(), host);
             Some(OpenPane {
                 pane: p.pane,
-                host: host.clone(),
-                session: session.id,
+                host,
+                session,
             })
         })
         .collect()
+}
+
+/// Which session a pane is showing.
+///
+/// The tag tmux carries answers for itself. A pane opened by an older build has
+/// none, and is recovered from the session name still visible in its start
+/// command.
+pub fn identify_pane(
+    p: &tmux::PaneInfo,
+    candidates: &[(String, Session)],
+) -> Option<(String, Uuid)> {
+    if let (Some(session), Some(host)) = (&p.session, &p.host)
+        && let Ok(id) = session.parse()
+    {
+        return Some((host.clone(), id));
+    }
+    candidates
+        .iter()
+        .find(|(_, s)| p.start_command.contains(&format!("'={}'", s.tmux_name())))
+        .map(|(host, s)| (host.clone(), s.id))
 }
 
 /// Apply a saved geometry to the pane window.

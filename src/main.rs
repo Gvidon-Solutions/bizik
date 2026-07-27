@@ -144,6 +144,9 @@ enum Cmd {
     #[command(subcommand)]
     Env(EnvCmd),
 
+    /// Show which session each open pane is viewing
+    Panes,
+
     /// Check the local setup and every host
     Doctor,
 }
@@ -240,6 +243,7 @@ fn run() -> Result<()> {
         Some(Cmd::Export { folders }) => cmd_export(folders),
         Some(Cmd::Import { file, folders }) => cmd_import(&file, folders),
         Some(Cmd::Env(c)) => cmd_env(c),
+        Some(Cmd::Panes) => cmd_panes(),
         Some(Cmd::Doctor) => cmd_doctor(),
     }
 }
@@ -747,6 +751,91 @@ fn cmd_import(file: &str, folders: bool) -> Result<()> {
             "merged: {} hosts, {} layouts",
             mine.live_hosts().len(),
             mine.live_layouts().len()
+        );
+    }
+    Ok(())
+}
+
+/// What is in the pane window, and what bizik makes of it.
+///
+/// A pane whose session cannot be identified is one a layout restore will
+/// neither reuse nor clean up, so being able to see that directly is worth a
+/// command.
+fn cmd_panes() -> Result<()> {
+    let panes = tmux::panes_of_window_anywhere(tui::actions::WORK_WINDOW)?;
+    if panes.is_empty() {
+        println!("no panes open");
+        return Ok(());
+    }
+
+    let mut store = LocalStore::load()?;
+    if store.ensure_local_host() {
+        store.save()?;
+    }
+    let hosts: Vec<model::Host> = store.live_hosts().into_iter().cloned().collect();
+    let known: Vec<(String, model::Session)> = remote::probe_all(&hosts)
+        .into_iter()
+        .filter_map(|p| p.probe.map(|pr| (p.host.name, pr)))
+        .flat_map(|(host, pr)| {
+            pr.records()
+                .map(|s| (host.clone(), s.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    for p in &panes {
+        let identified = tui::actions::identify_pane(p, &known);
+        match identified {
+            Some((host, session)) => {
+                let title = known
+                    .iter()
+                    .find(|(_, s)| s.id == session)
+                    .map(|(_, s)| s.title.clone())
+                    .unwrap_or_default();
+                println!(
+                    "{:<5} {:<10} {:<28} {}",
+                    p.pane,
+                    host,
+                    title,
+                    if p.session.is_some() {
+                        "tagged"
+                    } else {
+                        "recovered from its command"
+                    }
+                );
+            }
+            None => println!(
+                "{:<5} {:<10} {:<28} {}",
+                p.pane,
+                "?",
+                "unidentified",
+                util::one_line(&p.start_command, 60)
+            ),
+        }
+    }
+
+    // What a restore would do, without doing it. "It does not offer to close
+    // anything" is otherwise impossible to tell apart from "it did not run".
+    let open: Vec<(String, Uuid)> = panes
+        .iter()
+        .filter_map(|p| tui::actions::identify_pane(p, &known))
+        .collect();
+    for layout in store.live_layouts() {
+        let wanted: std::collections::HashSet<(String, Uuid)> = layout
+            .panes
+            .iter()
+            .map(|p| (p.host.clone(), p.session))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let close = open
+            .iter()
+            .filter(|key| !wanted.contains(key) || !seen.insert((*key).clone()))
+            .count();
+        println!(
+            "\nlayout “{}”: {} panes wanted, {} open would be closed on restore",
+            layout.name,
+            layout.panes.len(),
+            close
         );
     }
     Ok(())
