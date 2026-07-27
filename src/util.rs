@@ -163,6 +163,15 @@ pub fn pids_by_comm(comm: &str) -> Vec<u32> {
     out
 }
 
+/// This machine's short hostname, for when nobody supplied a better label.
+pub fn hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "host".to_string())
+}
+
 /// Single-quote a string for POSIX shells.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))

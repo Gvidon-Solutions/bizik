@@ -75,7 +75,11 @@ fn unique_title(store: &HostStore, folder_id: Uuid, base: &str) -> String {
 }
 
 /// Start a session's detached tmux session, if it is not already up.
-pub fn spawn(session_id: Uuid) -> Result<SpawnResult> {
+///
+/// `host_label` is the name the driving laptop knows this machine by. The host
+/// cannot work that out for itself, so it is passed in; without it the label
+/// falls back to the machine's own hostname.
+pub fn spawn(session_id: Uuid, host_label: Option<&str>) -> Result<SpawnResult> {
     let mut store = HostStore::load()?;
 
     let session = store
@@ -105,6 +109,13 @@ pub fn spawn(session_id: Uuid) -> Result<SpawnResult> {
     let wrapped = tmux::wrap_command(session.agent.as_str(), &raw, &folder.path);
     let name = session.tmux_name();
     let started = tmux::spawn_detached(&name, &folder.path, &wrapped)?;
+
+    // Applied every time, not only on creation, so an existing session picks up
+    // a corrected label rather than keeping a stale one forever.
+    let host = host_label
+        .map(str::to_string)
+        .unwrap_or_else(crate::util::hostname);
+    tmux::label_session(&name, &host, &folder.display_name(), session.agent.as_str());
 
     // Bump the folder's recency so the dashboard floats what you actually use.
     let now = now_ms();

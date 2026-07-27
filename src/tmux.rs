@@ -309,6 +309,38 @@ pub fn apply_session_options(session: &str) {
     }
 }
 
+/// Label the status bar a pane's session draws at its own bottom edge.
+///
+/// Each pane is attached to a tmux session on the host, and that tmux paints a
+/// status line inside the pane. Left alone it shows its own session name and
+/// window list — `bzk-6aaaf1:claude*` — which is bizik's bookkeeping, not
+/// anything the reader needs. With six panes open the useful thing to see is
+/// which machine, which directory and which agent, so that is what goes there.
+///
+/// `BIZIK_PANE_STATUS=off` leaves the remote session's status line alone.
+pub fn label_session(session: &str, host: &str, folder: &str, agent: &str) {
+    if matches!(
+        std::env::var("BIZIK_PANE_STATUS").as_deref(),
+        Ok("off") | Ok("0") | Ok("false")
+    ) {
+        return;
+    }
+    let target = session;
+    let left = format!(" #[bold]{host}#[nobold] · {folder} · #[fg=colour109]{agent}#[default] ");
+
+    for (option, value) in [
+        ("status-left", left.as_str()),
+        ("status-left-length", "200"),
+        // The window list and the clock are noise in a pane that only ever has
+        // one window; the label carries everything worth reading.
+        ("status-right", ""),
+        ("window-status-format", ""),
+        ("window-status-current-format", ""),
+    ] {
+        let _ = tmux(&["set-option", "-t", target, option, value]);
+    }
+}
+
 pub fn kill_pane(pane: &str) -> Result<()> {
     tmux(&["kill-pane", "-t", pane]).map(|_| ())
 }

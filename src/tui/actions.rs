@@ -47,7 +47,12 @@ pub fn create_session(
 /// Start a session on its host if it is not already up.
 pub fn start(host: &Host, session: Uuid) -> Result<SpawnResult> {
     let id = session.to_string();
-    let out = remote::run_bzk(host, &["spawn", "--session", &id])?;
+    // The host label travels with the request: a server has no way to know what
+    // this laptop calls it, and that is the name worth showing in the pane.
+    let out = remote::run_bzk(
+        host,
+        &["spawn", "--session", &id, "--host-label", &host.name],
+    )?;
     serde_json::from_str(out.trim()).context("parsing the spawn result")
 }
 

@@ -84,6 +84,9 @@ enum Cmd {
     Spawn {
         #[arg(long)]
         session: Uuid,
+        /// Name the driving laptop knows this host by, shown in the pane's label
+        #[arg(long)]
+        host_label: Option<String>,
     },
 
     /// Stop a session's tmux session, keeping the record
@@ -207,7 +210,10 @@ fn run() -> Result<()> {
             title,
             resume,
         }) => cmd_new_session(folder, &agent, title, resume),
-        Some(Cmd::Spawn { session }) => cmd_spawn(session),
+        Some(Cmd::Spawn {
+            session,
+            host_label,
+        }) => cmd_spawn(session, host_label.as_deref()),
         Some(Cmd::Stop { session }) => cmd_stop(session),
         Some(Cmd::RmSession { session }) => cmd_rm_session(session),
         Some(Cmd::Host(c)) => cmd_host(c),
@@ -445,8 +451,8 @@ fn cmd_new_session(
     Ok(())
 }
 
-fn cmd_spawn(session: Uuid) -> Result<()> {
-    let result = hostops::spawn(session)?;
+fn cmd_spawn(session: Uuid, host_label: Option<&str>) -> Result<()> {
+    let result = hostops::spawn(session, host_label)?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }

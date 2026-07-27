@@ -179,6 +179,12 @@ current pane to the whole window and back — with four panes open that is the o
 worth remembering. From the dashboard, `enter` on a session that is already open
 jumps to its pane rather than opening a second copy of it.
 
+Each pane carries a label along its bottom edge — ` back · anogem · claude ` —
+the machine, the directory and the agent. That is the tmux session on the host
+drawing its own status line inside the pane; left alone it shows bizik's
+bookkeeping (`bzk-6aaaf1:claude*`), which tells the reader nothing.
+`BIZIK_PANE_STATUS=off` leaves that status line as tmux would have drawn it.
+
 The mouse is enabled for bizik's own tmux session only — clicking a pane selects
 it and the wheel scrolls its history, while every other session on your tmux
 server keeps whatever you had. Two things follow from it: dragging selects into
