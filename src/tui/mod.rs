@@ -85,6 +85,7 @@ pub enum Overlay {
 }
 
 pub enum Confirm {
+    CloseViewer,
     Stop { host: String, session: Uuid },
     Forget { host: String, session: Uuid },
     Unmark { host: String, path: String },
@@ -253,7 +254,12 @@ impl App {
             self.finish_batch(batch);
         }
 
-        if !self.refreshing && self.last_refresh.elapsed() >= REFRESH_EVERY {
+        // Polling every host every few seconds for a dashboard nobody is
+        // looking at is pure waste, on this machine and on theirs.
+        if !self.refreshing
+            && self.last_refresh.elapsed() >= REFRESH_EVERY
+            && tmux::current_session_attached()
+        {
             self.kick_refresh();
         }
 
@@ -309,8 +315,16 @@ impl App {
         match key.code {
             // Esc is the single way back, at every depth.
             KeyCode::Esc => self.go_back(),
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('q') => self.detach(),
+            KeyCode::Char('c') if ctrl => self.detach(),
+            KeyCode::Char('Q') => {
+                self.overlay = Some(Overlay::Confirm {
+                    prompt:
+                        "close the panes and this dashboard? sessions keep running on their hosts"
+                            .into(),
+                    action: Confirm::CloseViewer,
+                })
+            }
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Char('r') => self.kick_refresh(),
             KeyCode::Char('/') => self.filtering = true,
@@ -424,7 +438,20 @@ impl App {
             self.filter.clear();
             return;
         }
-        self.quit = true;
+        self.detach();
+    }
+
+    /// Hand the terminal back, leaving everything running.
+    ///
+    /// The dashboard process stays alive in its window, so reattaching is
+    /// instant and the statuses are already there.
+    fn detach(&mut self) {
+        if let Err(e) = tmux::detach_current() {
+            // Nothing to detach from means this is not the session bizik
+            // manages, and quitting outright is the only sensible reading.
+            let _ = e;
+            self.quit = true;
+        }
     }
 
     fn cycle_tab(&mut self, delta: isize) {
@@ -870,6 +897,18 @@ impl App {
                     .save()
                     .map(|_| "layout deleted".to_string())
                     .map_err(|e| format!("{e:#}"))
+            }
+            Confirm::CloseViewer => {
+                // Panes are only viewers; closing them costs nothing that is
+                // not still running on its host.
+                let session = tmux::current_session();
+                self.quit = true;
+                match session {
+                    Some(s) => tmux::kill_session(&s)
+                        .map(|_| String::new())
+                        .map_err(|e| format!("{e:#}")),
+                    None => Ok(String::new()),
+                }
             }
             Confirm::RestoreLayout { id, close } => {
                 match self

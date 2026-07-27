@@ -295,14 +295,7 @@ fn cmd_tui() -> Result<()> {
     let _ = tmux::bind_return_key(&session_ref(), DASH_WINDOW);
     tmux::apply_session_options(&session_ref());
 
-    let status = Command::new("tmux")
-        .args(["attach", "-t", &format!("={SESSION}")])
-        .status()
-        .context("attaching to tmux")?;
-    if !status.success() {
-        bail!("tmux exited with {status}");
-    }
-    Ok(())
+    tmux::attach_interactively(&session_ref())
 }
 
 /// The local tmux session that holds the dashboard and the panes it opens.
@@ -313,25 +306,28 @@ fn session_ref() -> tmux::SessionRef {
     tmux::SessionRef::new(SESSION)
 }
 
-/// An `env …` prefix carrying the directory overrides into the relaunch.
+/// An `env …` prefix carrying this process's settings into the relaunch.
 ///
 /// The dashboard is restarted by the tmux server, which spawns it with *its
 /// own* environment — whatever it inherited whenever it happened to start.
 /// Without this, `BIZIK_CONFIG_DIR=… bzk` would silently read the default
 /// configuration instead of the one that was asked for.
+///
+/// Every `BIZIK_*` variable travels, not a hand-written list. The list was
+/// wrong within a day of being written: `BIZIK_TMUX_SOCKET` was added and not
+/// added here, so a dashboard asked to use a private tmux server quietly drove
+/// the default one instead — which is exactly the isolation the test suite
+/// depends on.
 fn config_env() -> String {
-    let vars: Vec<String> = ["BIZIK_CONFIG_DIR", "BIZIK_CACHE_DIR"]
-        .iter()
-        .filter_map(|name| {
-            let value = std::env::var(name).ok()?;
-            Some(format!("{name}={}", util::shell_quote(&value)))
-        })
+    let mut vars: Vec<String> = std::env::vars()
+        .filter(|(name, _)| name.starts_with("BIZIK_"))
+        .map(|(name, value)| format!("{name}={}", util::shell_quote(&value)))
         .collect();
     if vars.is_empty() {
-        String::new()
-    } else {
-        format!("env {} ", vars.join(" "))
+        return String::new();
     }
+    vars.sort();
+    format!("env {} ", vars.join(" "))
 }
 
 // ---------------------------------------------------------------------------
@@ -865,4 +861,41 @@ fn cmd_doctor() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_bizik_setting_travels_into_the_relaunch() {
+        // The hand-written list was wrong within a day: BIZIK_TMUX_SOCKET was
+        // added to the program and not to the list, so a dashboard told to use
+        // a private tmux server quietly drove the default one instead. Matching
+        // on the prefix means a new knob cannot be forgotten.
+        let rendered = |pairs: &[(&str, &str)]| -> String {
+            let mut vars: Vec<String> = pairs
+                .iter()
+                .filter(|(name, _)| name.starts_with("BIZIK_"))
+                .map(|(name, value)| format!("{name}={}", super::util::shell_quote(value)))
+                .collect();
+            if vars.is_empty() {
+                return String::new();
+            }
+            vars.sort();
+            format!("env {} ", vars.join(" "))
+        };
+
+        let out = rendered(&[
+            ("BIZIK_TMUX_SOCKET", "bzk-test"),
+            ("PATH", "/usr/bin"),
+            ("BIZIK_CONFIG_DIR", "/tmp/cfg"),
+        ]);
+        assert!(out.contains("BIZIK_TMUX_SOCKET='bzk-test'"), "{out}");
+        assert!(out.contains("BIZIK_CONFIG_DIR='/tmp/cfg'"), "{out}");
+        assert!(
+            !out.contains("PATH="),
+            "unrelated variables stay behind: {out}"
+        );
+
+        assert_eq!(rendered(&[("PATH", "/usr/bin")]), "");
+    }
 }

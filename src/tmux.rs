@@ -551,6 +551,45 @@ pub fn window_panes(window: &str) -> Result<Vec<PaneInfo>> {
         .collect())
 }
 
+/// Attach this terminal to a session, blocking until the user detaches.
+///
+/// Goes through the same builder as everything else so the socket travels with
+/// it. A raw `Command::new("tmux")` here quietly attached to the default server
+/// while every other call in the process used the private one — which is the
+/// sort of hole that makes an isolated test suite a comforting lie.
+pub fn attach_interactively(session: &SessionRef) -> Result<()> {
+    let status = command()
+        .args(["attach", "-t", &session.anchored()])
+        .status()
+        .context("attaching to tmux")?;
+    if !status.success() {
+        bail!("tmux exited with {status}");
+    }
+    Ok(())
+}
+
+/// Let go of the terminal without stopping anything.
+///
+/// Quitting the dashboard used to close its window and leave the pane window
+/// behind, still attached — so the user was dropped into somebody else's
+/// arrangement and had to detach by hand. Detaching the whole client is what
+/// "I am done looking" actually means: everything keeps running, and `bzk`
+/// brings it straight back.
+pub fn detach_current() -> Result<()> {
+    let session = current_session().context("not inside a tmux session")?;
+    tmux(&["detach-client", "-s", session.plain()]).map(|_| ())
+}
+
+/// Whether anyone is looking at this session.
+///
+/// Used to stop polling every host every few seconds for a dashboard nobody
+/// has on screen.
+pub fn current_session_attached() -> bool {
+    tmux(&["display-message", "-p", "#{session_attached}"])
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true)
+}
+
 pub fn select_window(window: &str) -> Result<()> {
     tmux(&["select-window", "-t", window]).map(|_| ())
 }

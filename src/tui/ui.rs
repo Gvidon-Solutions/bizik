@@ -286,7 +286,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let keys = match app.stack.last() {
-        Some(Screen::Folders) => "enter open · e rename · d unmark · / filter · w panes · ? keys",
+        Some(Screen::Folders) => {
+            "enter open · e rename · d unmark · / filter · w panes · q detach · ? keys"
+        }
         Some(Screen::Folder { .. }) => {
             "enter start+view · b background · space select · x stop · d forget · esc back"
         }
@@ -324,7 +326,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         )),
         Line::from("  ↑ ↓ / j k     move          g G   first / last"),
         Line::from("  tab / ⇧tab    switch screen  /     filter"),
-        Line::from("  esc           back — always  q     quit (sessions keep running)"),
+        Line::from("  esc           back — always  q     detach (everything keeps running)"),
+        Line::from("  Q             close the panes and the dashboard on this machine"),
         Line::from(""),
         Line::from(Span::styled(
             "sessions",

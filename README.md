@@ -148,7 +148,10 @@ bzk
 ```
 
 That opens the dashboard in a tmux session named `bizik`. Run it again from any
-terminal and you land back where you were.
+terminal and you land back where you were — instantly, because `q` detaches
+rather than shutting anything down, and the dashboard is still there with its
+statuses current. While nobody is attached it stops polling, so an unwatched
+dashboard costs nothing.
 
 ### Keys
 
@@ -158,7 +161,8 @@ terminal and you land back where you were.
 | `tab` / `⇧tab` | switch screen |
 | `/` | fuzzy filter |
 | `esc` | back — always, at every depth |
-| `q` | quit (sessions keep running) |
+| `q` | detach — hands the terminal back, everything keeps running |
+| `Q` | close the panes and the dashboard on this machine |
 | `enter` | start a session and open a pane |
 | `b` | start it in the background and stay here |
 | `space` | select · then `enter` opens them all at once |
