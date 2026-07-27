@@ -22,7 +22,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use crate::model::{AgentKind, Host, Layout, PaneRef, Session};
+use crate::model::{AgentKind, Host, Layout, PaneRef};
 use crate::remote::{self, HostProbe};
 use crate::store::LocalStore;
 use crate::tmux;
@@ -197,15 +197,6 @@ impl App {
 
     fn host(&self, name: &str) -> Option<Host> {
         self.local.host_by_name(name).cloned()
-    }
-
-    /// Every session known across all hosts, for pane and layout lookups.
-    fn all_sessions(&self) -> Vec<(String, Session)> {
-        self.probes
-            .iter()
-            .filter_map(|p| p.probe.as_ref().map(|pr| (p.host.name.clone(), pr)))
-            .flat_map(|(host, pr)| pr.sessions.iter().map(move |s| (host.clone(), s.clone())))
-            .collect()
     }
 
     fn rebuild(&mut self) {
@@ -539,7 +530,7 @@ impl App {
                     background,
                 )
             }
-            Row::Session { host, session, .. } => self.launch_one(&host, session.id, background),
+            Row::Session { host, view } => self.launch_one(&host, view.session.id, background),
             Row::LayoutEntry { layout, .. } => self.restore_layout(&layout),
             Row::HostEntry { host, .. } => {
                 if let Some(p) = self.probes.iter().find(|p| p.host.name == host.name)
@@ -623,7 +614,9 @@ impl App {
                 Ok(spawned) => {
                     if batch.background {
                         opened += 1;
-                    } else if let Err(e) = actions::open_pane(host, &spawned.tmux_name) {
+                    } else if let Err(e) =
+                        actions::open_pane(host, spawned.session.id, &spawned.tmux_name)
+                    {
                         failed += 1;
                         self.error(format!("{e:#}"));
                     } else {
@@ -714,8 +707,7 @@ impl App {
     /// nothing about. Rather than silently tile instead, the panes that do not
     /// belong are named and closing them is offered as a choice.
     fn restore_layout(&mut self, layout: &Layout) {
-        let sessions = self.all_sessions();
-        let open = actions::panes_in_work(&sessions);
+        let open = actions::panes_in_work();
         let wanted: HashSet<(String, Uuid)> = layout
             .panes
             .iter()
@@ -787,7 +779,8 @@ impl App {
 
     fn ask_stop(&mut self) {
         match self.current() {
-            Some(Row::Session { host, session, .. }) => {
+            Some(Row::Session { host, view }) => {
+                let session = view.session;
                 self.overlay = Some(Overlay::Confirm {
                     prompt: format!(
                         "stop “{}” on {host}? the conversation is kept and can be resumed",
@@ -805,7 +798,8 @@ impl App {
 
     fn ask_delete(&mut self) {
         match self.current() {
-            Some(Row::Session { host, session, .. }) => {
+            Some(Row::Session { host, view }) => {
+                let session = view.session;
                 self.overlay = Some(Overlay::Confirm {
                     prompt: format!(
                         "forget “{}”? it stops, and bizik drops its record — the agent's own history stays on disk",
@@ -926,8 +920,7 @@ impl App {
     }
 
     fn save_layout(&mut self, name: String) {
-        let sessions = self.all_sessions();
-        let panes = actions::panes_in_work(&sessions);
+        let panes = actions::panes_in_work();
         if panes.is_empty() {
             self.error("no bizik panes are open — open some first, then save");
             return;

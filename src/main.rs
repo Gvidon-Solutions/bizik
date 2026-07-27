@@ -9,9 +9,11 @@
 mod agent;
 mod attention;
 mod hooks;
+mod hostenv;
 mod hostops;
 mod model;
 mod probe;
+mod reconcile;
 mod remote;
 mod store;
 mod tmux;
@@ -138,6 +140,10 @@ enum Cmd {
         folders: bool,
     },
 
+    /// Capture this machine's real PATH, or a host's
+    #[command(subcommand)]
+    Env(EnvCmd),
+
     /// Check the local setup and every host
     Doctor,
 }
@@ -152,6 +158,17 @@ struct MarkArgs {
     /// Mark the enclosing git repository instead of this directory
     #[arg(long, short)]
     repo: bool,
+}
+
+#[derive(Subcommand)]
+enum EnvCmd {
+    /// Ask the login shell what PATH it really has, and remember the answer
+    Capture {
+        /// Host names; omit for this machine
+        hosts: Vec<String>,
+    },
+    /// Show what was captured, and when
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -222,6 +239,7 @@ fn run() -> Result<()> {
         Some(Cmd::Hooks(c)) => cmd_hooks(c),
         Some(Cmd::Export { folders }) => cmd_export(folders),
         Some(Cmd::Import { file, folders }) => cmd_import(&file, folders),
+        Some(Cmd::Env(c)) => cmd_env(c),
         Some(Cmd::Doctor) => cmd_doctor(),
     }
 }
@@ -257,25 +275,25 @@ fn cmd_tui() -> Result<()> {
     // The session is created detached and attached separately, so options and
     // bindings can be applied to a session that exists but nobody is looking at
     // yet — the same path whether this is a first run or a reattach.
-    if !tmux::has_session(SESSION) {
-        tmux::new_detached_session(SESSION, DASH_WINDOW, &dash)?;
+    if !tmux::has_session(&session_ref()) {
+        tmux::new_detached_session(&session_ref(), DASH_WINDOW, &dash)?;
     }
 
     // Reattaching must always land on a live dashboard. A previous run may have
     // been quit while its panes stayed open, leaving the session alive but with
     // no dashboard window in it — so recreate the window rather than attaching
     // into a session where nothing responds to keys.
-    match tmux::find_window_in(Some(SESSION), DASH_WINDOW) {
+    match tmux::find_window_in(Some(&session_ref()), DASH_WINDOW) {
         Some(w) => tmux::select_window(&w)?,
         None => {
-            tmux::new_window_in(SESSION, DASH_WINDOW, &dash)?;
+            tmux::new_window_in(&session_ref(), DASH_WINDOW, &dash)?;
         }
     }
 
     // Both re-applied every launch: bindings live on the tmux server and
     // options on the session, either of which may have gone away since.
-    let _ = tmux::bind_return_key(SESSION, DASH_WINDOW);
-    tmux::apply_session_options(SESSION);
+    let _ = tmux::bind_return_key(&session_ref(), DASH_WINDOW);
+    tmux::apply_session_options(&session_ref());
 
     let status = Command::new("tmux")
         .args(["attach", "-t", &format!("={SESSION}")])
@@ -290,6 +308,10 @@ fn cmd_tui() -> Result<()> {
 /// The local tmux session that holds the dashboard and the panes it opens.
 const SESSION: &str = "bizik";
 const DASH_WINDOW: &str = "bzk-dash";
+
+fn session_ref() -> tmux::SessionRef {
+    tmux::SessionRef::new(SESSION)
+}
 
 /// An `env …` prefix carrying the directory overrides into the relaunch.
 ///
@@ -431,7 +453,7 @@ fn cmd_probe(json: bool, preview: bool) -> Result<()> {
     println!("folders: {}", p.folders.len());
     println!("sessions: {}", p.sessions.len());
     println!("conversations: {}", p.chats.len());
-    println!("tmux sessions: {}", p.tmux.len());
+    println!("orphaned tmux sessions: {}", p.orphans.len());
     for w in &p.warnings {
         println!("warning: {w}");
     }
@@ -643,6 +665,43 @@ fn cmd_hooks_status(names: &[String]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Host environment
+// ---------------------------------------------------------------------------
+
+fn cmd_env(cmd: EnvCmd) -> Result<()> {
+    match cmd {
+        EnvCmd::Capture { hosts } if hosts.is_empty() => {
+            let env = hostenv::capture()?;
+            println!("captured from {} -i", env.shell);
+            println!("{}", env.path);
+        }
+        EnvCmd::Capture { hosts } => {
+            let store = LocalStore::load()?;
+            for name in hosts {
+                let host = store
+                    .host_by_name(&name)
+                    .with_context(|| format!("no host named {name}"))?;
+                print!("{name} ... ");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                match remote::run_bzk(host, &["env", "capture"]) {
+                    Ok(out) => println!("{}", util::one_line(&out, 100)),
+                    Err(e) => println!("failed: {e:#}"),
+                }
+            }
+        }
+        EnvCmd::Show => match hostenv::load() {
+            Some(e) => {
+                println!("captured from {}", e.shell);
+                println!("{}", e.path);
+            }
+            None => println!("nothing captured — run: bzk env capture"),
+        },
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Moving a configuration between machines
 // ---------------------------------------------------------------------------
 
@@ -701,10 +760,13 @@ fn cmd_doctor() -> Result<()> {
     println!("local");
     println!(
         "  tmux            {}",
-        if tmux::installed() {
-            "ok"
-        } else {
-            "MISSING — the dashboard cannot open panes"
+        match (tmux::installed(), tmux::version()) {
+            (false, _) => "MISSING — the dashboard cannot open panes".to_string(),
+            (true, Some(v)) if tmux::version_supported(&v) => format!("ok ({v})"),
+            // Behaviour genuinely differs between versions, and the way that
+            // shows up is a target syntax quietly doing nothing.
+            (true, Some(v)) => format!("{v} — older than the supported {}", tmux::MIN_VERSION),
+            (true, None) => "ok (version unknown)".to_string(),
         }
     );
     println!(
@@ -728,6 +790,13 @@ fn cmd_doctor() -> Result<()> {
             }
         );
     }
+    println!(
+        "  PATH capture    {}",
+        match hostenv::load() {
+            Some(_) => "ok".to_string(),
+            None => "not captured — run: bzk env capture".to_string(),
+        }
+    );
     println!("  config          {}", util::config_dir().display());
 
     let mut store = LocalStore::load()?;
@@ -763,6 +832,21 @@ fn cmd_doctor() -> Result<()> {
                     println!(
                         "  {:<16} running {} but this is {mine} — run: bzk install {}",
                         "", p.bzk_version, probed.host.name
+                    );
+                }
+                if p.protocol != model::PROTOCOL {
+                    println!(
+                        "  {:<16} speaks protocol {} but this is {} — run: bzk install {}",
+                        "",
+                        p.protocol,
+                        model::PROTOCOL,
+                        probed.host.name
+                    );
+                }
+                if p.env_captured_at.is_none() && !p.agents.is_empty() {
+                    println!(
+                        "  {:<16} PATH never captured — agents may not start: bzk env capture {}",
+                        "", probed.host.name
                     );
                 }
                 if !p.hooks_installed && !p.agents.is_empty() {

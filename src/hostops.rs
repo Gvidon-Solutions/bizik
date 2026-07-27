@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::agent;
 use crate::model::{AgentKind, Session};
 use crate::store::HostStore;
-use crate::tmux;
+use crate::tmux::{self, SessionRef};
 use crate::util::{now_ms, proc_ppid};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -107,8 +107,11 @@ pub fn spawn(session_id: Uuid, host_label: Option<&str>) -> Result<SpawnResult> 
 
     let raw = adapter.launch_cmd(session.agent_session_id.as_deref());
     let wrapped = tmux::wrap_command(session.agent.as_str(), &raw, &folder.path);
-    let name = session.tmux_name();
+    let name = SessionRef::new(session.tmux_name());
     let started = tmux::spawn_detached(&name, &folder.path, &wrapped)?;
+    // Identity goes onto the tmux session itself, so a probe can tell whose it
+    // is without inferring anything from the name it happens to have.
+    let _ = tmux::tag_session(&name, &session.id.to_string());
 
     // Applied every time, not only on creation, so an existing session picks up
     // a corrected label rather than keeping a stale one forever.
@@ -132,7 +135,7 @@ pub fn spawn(session_id: Uuid, host_label: Option<&str>) -> Result<SpawnResult> 
 
     Ok(SpawnResult {
         session,
-        tmux_name: name,
+        tmux_name: name.name().to_string(),
         started,
         cwd: folder.path,
     })
@@ -145,7 +148,7 @@ pub fn stop(session_id: Uuid) -> Result<bool> {
     let session = store
         .session(session_id)
         .with_context(|| format!("no session {session_id} on this host"))?;
-    let name = session.tmux_name();
+    let name = SessionRef::new(session.tmux_name());
     if !tmux::has_session(&name) {
         return Ok(false);
     }

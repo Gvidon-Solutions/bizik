@@ -79,34 +79,45 @@ pub fn relabel(host: &Host, path: &str, label: &str) -> Result<()> {
 /// Every pane is tiled into one window so that several sessions really are
 /// visible at once, which is the whole point — a list of what is running is not
 /// a substitute for watching it run.
-pub fn open_pane(host: &Host, tmux_name: &str) -> Result<String> {
+pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> {
     let cmd = remote::attach_command(host, tmux_name);
+    let tag = |pane: &str| {
+        let _ = tmux::tag_pane(pane, &session.to_string(), &host.name);
+    };
+
     let Some(window) = tmux::find_window(WORK_WINDOW) else {
-        return tmux::new_window(WORK_WINDOW, &cmd);
+        let pane = tmux::new_window(WORK_WINDOW, &cmd)?;
+        tag(&pane);
+        return Ok(pane);
     };
 
     // A session already on screen is focused rather than opened again. Two
     // panes showing one conversation is never what was meant, and it is easy to
     // ask for by selecting a session that was already open.
-    if let Some(pane) = existing_pane(&window, tmux_name) {
+    if let Some(pane) = existing_pane(&window, session) {
         tmux::select_pane(&pane)?;
         return Ok(pane);
     }
 
     let pane = tmux::split_window(&window, &cmd)?;
+    tag(&pane);
     tmux::select_layout(&window, "tiled")?;
     Ok(pane)
 }
 
-/// The pane already viewing `tmux_name`, if any. A pane keeps the command it
-/// was started with, so what it is attached to can simply be read back.
-fn existing_pane(window: &str, tmux_name: &str) -> Option<String> {
-    let needle = format!("'={tmux_name}'");
+/// The pane already viewing this session, if any.
+///
+/// Read from the identity tmux carries on the pane, not from its command line.
+/// Substring matching worked until it did not: two sessions whose names shared
+/// a prefix, or a change to how the command is quoted, would silently pair a
+/// pane with the wrong session.
+fn existing_pane(window: &str, session: Uuid) -> Option<String> {
+    let wanted = session.to_string();
     tmux::window_panes(window)
         .ok()?
         .into_iter()
-        .find(|(_, cmd)| cmd.contains(&needle))
-        .map(|(pane, _)| pane)
+        .find(|p| p.session.as_deref() == Some(wanted.as_str()))
+        .map(|p| p.pane)
 }
 
 /// Switch the terminal to the pane window.
@@ -128,13 +139,12 @@ pub struct OpenPane {
     pub session: Uuid,
 }
 
-/// Work out which session each open pane is showing.
+/// Which session each open pane is showing.
 ///
-/// The pane's start command still contains the tmux session name it attached
-/// to, so the mapping can be recovered by inspection rather than remembered.
-/// That means a layout can be saved from panes opened before this dashboard
-/// started — after a restart, or from a pane opened by hand.
-pub fn panes_in_work(candidates: &[(String, Session)]) -> Vec<OpenPane> {
+/// tmux carries the answer on the pane itself, tagged when the pane was opened.
+/// It survives a dashboard restart, so a layout can still be saved from panes
+/// opened by an earlier run.
+pub fn panes_in_work() -> Vec<OpenPane> {
     let Some(window) = tmux::find_window(WORK_WINDOW) else {
         return Vec::new();
     };
@@ -143,16 +153,13 @@ pub fn panes_in_work(candidates: &[(String, Session)]) -> Vec<OpenPane> {
     };
 
     panes
-        .iter()
-        .filter_map(|(pane, cmd)| {
-            candidates
-                .iter()
-                .find(|(_, s)| cmd.contains(&s.tmux_name()))
-                .map(|(host, s)| OpenPane {
-                    pane: pane.clone(),
-                    host: host.clone(),
-                    session: s.id,
-                })
+        .into_iter()
+        .filter_map(|p| {
+            Some(OpenPane {
+                session: p.session?.parse().ok()?,
+                host: p.host?,
+                pane: p.pane,
+            })
         })
         .collect()
 }

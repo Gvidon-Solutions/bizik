@@ -279,22 +279,41 @@ pub struct TmuxSession {
     /// Last non-empty lines of the first pane, for a preview in the dashboard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// The bizik session uuid tmux itself is carrying for this session, when
+    /// one was tagged. Identity read back from tmux rather than inferred from
+    /// the session's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
+/// Shape of the report a host sends back.
+///
+/// Bumped whenever the laptop could misread an older host's answer. Both sides
+/// ship in one binary, so a mismatch means one of them was not updated — and
+/// saying that outright beats a deserialisation error naming a field nobody
+/// recognises.
+pub const PROTOCOL: u32 = 1;
+
 /// What one host reports in a single ssh round trip.
+///
+/// Sessions arrive already resolved: the host is the only place that can see
+/// its own tmux and processes, so it is the only place that should be deciding
+/// what state a session is in. The laptop displays this rather than re-deriving
+/// it, which is what kept three copies of that logic disagreeing.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Probe {
+    #[serde(default)]
+    pub protocol: u32,
     pub bzk_version: String,
     #[serde(default)]
     pub folders: Vec<Folder>,
     #[serde(default)]
-    pub sessions: Vec<Session>,
+    pub sessions: Vec<crate::reconcile::SessionView>,
     #[serde(default)]
     pub chats: Vec<Chat>,
+    /// Sessions running here that no record claims.
     #[serde(default)]
-    pub live: Vec<LiveAgent>,
-    #[serde(default)]
-    pub tmux: Vec<TmuxSession>,
+    pub orphans: Vec<crate::reconcile::Orphan>,
     /// Agents whose binary is present on this host.
     #[serde(default)]
     pub agents: Vec<AgentKind>,
@@ -302,9 +321,19 @@ pub struct Probe {
     /// installed here.
     #[serde(default)]
     pub hooks_installed: bool,
+    /// When this host's PATH was last captured, if ever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_captured_at: Option<u64>,
     /// Non-fatal problems worth surfacing instead of hiding.
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+impl Probe {
+    /// Live records, for the places that only need the intent.
+    pub fn records(&self) -> impl Iterator<Item = &Session> {
+        self.sessions.iter().map(|v| &v.session)
+    }
 }
 
 #[cfg(test)]

@@ -99,6 +99,9 @@ doctor:
 
 check: fmt-check lint test
 
+# Unit tests are pure; the integration tests drive the real binary against a
+# private tmux socket. Every defect that reached a user lived in that seam, so
+# `make test` runs both or it is not telling you anything.
 test:
 	cargo test
 

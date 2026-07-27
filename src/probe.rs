@@ -3,9 +3,14 @@
 //! Everything a laptop needs to know about one machine is gathered here and
 //! returned in a single JSON document, so a dashboard refresh costs one ssh
 //! round trip per host rather than one per question.
+//!
+//! Crucially the answer is *resolved*, not raw. Only this machine can see its
+//! own tmux sessions and processes, so only this machine should be deciding
+//! what state a session is in — see [`crate::reconcile`].
 
 use crate::agent::{self, ChatIndex};
-use crate::model::{AgentKind, Chat, Probe};
+use crate::model::{AgentKind, Chat, Folder, LiveAgent, PROTOCOL, Probe};
+use crate::reconcile::{self, Inputs};
 use crate::store::HostStore;
 use crate::tmux;
 
@@ -37,8 +42,8 @@ pub fn collect(with_preview: bool) -> Probe {
         ));
     }
 
-    let folders: Vec<_> = store.live_folders().into_iter().cloned().collect();
-    let sessions: Vec<_> = store.live_sessions().into_iter().cloned().collect();
+    let folders: Vec<Folder> = store.live_folders().into_iter().cloned().collect();
+    let records: Vec<_> = store.live_sessions().into_iter().cloned().collect();
 
     let mut index = ChatIndex::load();
     let mut all_chats = Vec::new();
@@ -54,10 +59,11 @@ pub fn collect(with_preview: bool) -> Probe {
     }
 
     // Keep the cache from growing without bound as transcripts are deleted.
-    let seen: Vec<String> = index.entries.keys().cloned().collect();
-    let still_there: Vec<String> = seen
-        .into_iter()
+    let still_there: Vec<String> = index
+        .entries
+        .keys()
         .filter(|p| std::path::Path::new(p).exists())
+        .cloned()
         .collect();
     index.prune(&still_there);
     if let Err(e) = index.save() {
@@ -65,21 +71,63 @@ pub fn collect(with_preview: bool) -> Probe {
     }
 
     let chats = select_chats(&folders, all_chats, &mut warnings);
+    let live = live_agents();
 
-    let mut live = Vec::new();
-    for a in agent::all() {
-        if a.installed() {
-            live.extend(a.live());
-        }
+    let tmux_sessions = if tmux::installed() {
+        tmux::list_sessions(with_preview)
+    } else {
+        warnings.push("tmux is not installed on this host — sessions cannot be started".into());
+        Vec::new()
+    };
+
+    let by_id: std::collections::HashMap<uuid::Uuid, String> =
+        folders.iter().map(|f| (f.id, f.path.clone())).collect();
+    let (sessions, orphans) = reconcile::reconcile(Inputs {
+        sessions: &records,
+        folder_path: &|id| by_id.get(&id).cloned(),
+        tmux: &tmux_sessions,
+        live: &live,
+    });
+
+    if !orphans.is_empty() {
+        warnings.push(format!(
+            "{} tmux session(s) bizik no longer tracks: {} — close with: tmux kill-session -t <name>",
+            orphans.len(),
+            orphans
+                .iter()
+                .map(|o| o.tmux_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
-    // Join in what the hooks reported. Doing it here rather than inside each
-    // adapter keeps the adapters to one job — reading their agent's own files.
-    //
-    // A hook report is only used when it is *newer* than the agent's own status
-    // line. The two can disagree — an agent showing a permission prompt is
-    // arguably still mid-turn — and rather than pick a winner by rule, the
-    // fresher of the two accounts is taken.
+    Probe {
+        protocol: PROTOCOL,
+        bzk_version: env!("CARGO_PKG_VERSION").to_string(),
+        folders,
+        sessions,
+        chats,
+        orphans,
+        agents: installed,
+        hooks_installed: crate::hooks::all_installed(),
+        env_captured_at: crate::hostenv::load().map(|e| e.captured_at),
+        warnings,
+    }
+}
+
+/// Running agents, with whatever their hooks last reported joined in.
+///
+/// A hook report is only used when it is *newer* than the agent's own status
+/// line. The two can disagree — an agent showing a permission prompt is
+/// arguably still mid-turn — and rather than pick a winner by rule, the fresher
+/// of the two accounts is taken.
+fn live_agents() -> Vec<LiveAgent> {
+    let mut live: Vec<LiveAgent> = agent::all()
+        .iter()
+        .filter(|a| a.installed())
+        .flat_map(|a| a.live())
+        .collect();
+
     let marks = crate::attention::read_all();
     for l in &mut live {
         if let Some(id) = &l.agent_session_id
@@ -89,52 +137,13 @@ pub fn collect(with_preview: bool) -> Probe {
             l.attention = Some(mark.state.as_str().to_string());
         }
     }
-
-    let tmux_sessions = if tmux::installed() {
-        tmux::list_sessions(with_preview)
-    } else {
-        warnings.push("tmux is not installed on this host — sessions cannot be started".into());
-        Vec::new()
-    };
-
-    // A bizik-named tmux session with no record behind it is invisible to every
-    // screen — it cannot be attached, stopped or reasoned about, and it keeps
-    // running. Saying so is the difference between a leak and a chore.
-    let tracked: Vec<String> = sessions.iter().map(|s| s.tmux_name()).collect();
-    let orphans: Vec<&str> = tmux_sessions
-        .iter()
-        .map(|t| t.name.as_str())
-        .filter(|name| name.starts_with("bzk-") && !tracked.iter().any(|t| t == name))
-        .collect();
-    if !orphans.is_empty() {
-        warnings.push(format!(
-            "{} tmux session(s) bizik no longer tracks: {} — close with: tmux kill-session -t <name>",
-            orphans.len(),
-            orphans.join(", ")
-        ));
-    }
-
-    Probe {
-        bzk_version: env!("CARGO_PKG_VERSION").to_string(),
-        folders,
-        sessions,
-        chats,
-        live,
-        tmux: tmux_sessions,
-        agents: installed,
-        hooks_installed: crate::hooks::all_installed(),
-        warnings,
-    }
+    live
 }
 
 /// Keep only conversations that belong to a marked folder, newest first, and
 /// say out loud when the per-folder cap drops any — a silent truncation would
 /// read as "this folder has no more history".
-fn select_chats(
-    folders: &[crate::model::Folder],
-    mut chats: Vec<Chat>,
-    warnings: &mut Vec<String>,
-) -> Vec<Chat> {
+fn select_chats(folders: &[Folder], mut chats: Vec<Chat>, warnings: &mut Vec<String>) -> Vec<Chat> {
     // Deduplicate before capping, or the cap silently yields fewer than it
     // promises. One conversation can appear under two project directories when
     // its working directory changed part-way through.
@@ -241,8 +250,6 @@ mod tests {
 
     #[test]
     fn duplicates_are_removed_before_the_cap_is_applied() {
-        // The same conversation can be recorded under two project directories.
-        // Capping first would make the list shorter than the cap claims.
         let folders = vec![Folder::new("/repo".into())];
         let mut chats: Vec<Chat> = (0..MAX_CHATS_PER_FOLDER)
             .map(|i| chat("/repo", &format!("c{i}"), 100 + i as u64))

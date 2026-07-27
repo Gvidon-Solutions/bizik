@@ -109,6 +109,20 @@ when it next starts.
 `bzk doctor` reports which hosts have them, and flags a host still running an
 older binary after you rebuild.
 
+Agents also need to be findable. A non-interactive shell does not have the PATH
+you have when you type — nvm, pyenv and friends are set up by an interactive rc
+file — so codex would find its own binary and then die because
+`#!/usr/bin/env node` could not find node. Capture the real thing once per host:
+
+```sh
+bzk env capture back front   # or with no names, for this machine
+bzk env show
+```
+
+It runs your login shell interactively and remembers the PATH it ends up with,
+which covers nvm, bun, pyenv, conda and whatever comes next. `doctor` says when
+a host has never had it done.
+
 ## Use
 
 On any machine, inside a directory you work in:
@@ -268,6 +282,31 @@ dashboard calls them over ssh, and they are useful by hand or from a script.
 
 `BIZIK_CONFIG_DIR` and `BIZIK_CACHE_DIR` override where state is kept, which is
 handy for keeping two independent profiles on one machine.
+
+## How it is put together
+
+Four things decide what a session is: the record on its host, whether a tmux
+session is alive, whether the agent process is in it, and what the agent's hooks
+last reported. They can disagree, and each disagreement used to be settled
+wherever it was noticed — which is how a layout came to show four missing panes
+that were plainly on screen.
+
+They are joined once, on the host that owns the session, over an exhaustive set
+of states. The laptop displays that answer rather than deriving its own. A
+combination nobody thought about is a compile error rather than a bug report.
+
+Identity is carried by tmux itself (`@bzk_session` on the session and on the
+pane viewing it), not recovered by matching command-line substrings. Targets go
+through a type that knows tmux wants `=name`, `=name:` or `name` depending on
+the command — each spelling was found by a command failing quietly.
+
+`make test` runs the unit tests and an integration suite that drives the real
+binary against a **private tmux socket** and a temporary config. That isolation
+is not a nicety: testing by hand against a live tmux server once destroyed
+sessions that were being worked in.
+
+`bzk doctor` reports the things that go stale silently — an older binary on a
+host, missing hooks, an uncaptured PATH, a tmux too old, a protocol mismatch.
 
 ## Notes on the agents
 

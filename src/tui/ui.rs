@@ -11,8 +11,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use super::rows::{Row, Status};
+use super::rows::Row;
 use super::{App, InputKind, Overlay, Screen, ToastKind};
+use crate::reconcile::State;
 use crate::util::one_line;
 
 const DIM: Color = Color::DarkGray;
@@ -159,12 +160,8 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
             ),
         ])),
 
-        Row::Session {
-            host,
-            session,
-            status,
-            preview,
-        } => {
+        Row::Session { host, view } => {
+            let (session, status, preview) = (&view.session, view.state, &view.preview);
             let picked = app.selected.contains(&(host.clone(), session.id));
             let mut spans = vec![
                 Span::styled(
@@ -173,7 +170,7 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
                 ),
                 Span::styled(
                     format!("{} {:<10}", status.glyph(), status.label()),
-                    status_style(*status),
+                    status_style(status),
                 ),
                 Span::styled(format!("{:<9}", trunc(host, 9)), Style::default().fg(DIM)),
                 Span::styled(
@@ -245,16 +242,19 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
     }
 }
 
-fn status_style(status: Status) -> Style {
+fn status_style(status: State) -> Style {
     match status {
-        Status::NeedsYou => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        Status::Done => Style::default()
+        State::NeedsYou => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        State::Done => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
-        Status::Working => Style::default().fg(Color::Yellow),
-        Status::YourTurn => Style::default().fg(Color::Green),
-        Status::Up => Style::default().fg(Color::Blue),
-        Status::Down => Style::default().fg(DIM),
+        State::Working => Style::default().fg(Color::Yellow),
+        State::YourTurn => Style::default().fg(Color::Green),
+        // The agent is gone and only the fallback shell is left. Red, because
+        // it looked like "running" for as long as nobody distinguished them.
+        State::Exited => Style::default().fg(Color::Red),
+        State::Up => Style::default().fg(Color::Blue),
+        State::Down => Style::default().fg(DIM),
     }
 }
 
@@ -346,7 +346,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  r             refresh now"),
         Line::from(""),
         Line::from(Span::styled(
-            "status  ▲ needs you   ◆ done   ● working   ◇ your turn   ○ running   · stopped",
+            "status  ▲ needs you   ◆ done   ● working   ◇ your turn   ✕ exited   ○ running   · stopped",
             Style::default().fg(DIM),
         )),
         Line::from(Span::styled(

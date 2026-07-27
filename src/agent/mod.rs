@@ -82,16 +82,14 @@ pub fn program(agent: &dyn Agent, fallback: &str) -> String {
         return fallback.to_string();
     };
     let quoted = crate::util::shell_quote(&path.to_string_lossy());
-    match path.parent() {
-        // Assignment right-hand sides are not field-split, so an unquoted
-        // `$PATH` here is safe.
-        Some(dir) => format!(
-            "PATH={}:$PATH {}",
-            crate::util::shell_quote(&dir.to_string_lossy()),
-            quoted
-        ),
-        None => quoted,
-    }
+    let own_dir = path.parent().map(|d| d.to_string_lossy().into_owned());
+    // The captured PATH carries whatever the user's shell actually sets up —
+    // nvm, pyenv, conda. The tool's own directory goes ahead of it as a
+    // belt-and-braces for the case where nothing was ever captured.
+    format!(
+        "{} {quoted}",
+        crate::hostenv::path_prefix(own_dir.as_deref())
+    )
 }
 
 pub fn all() -> Vec<Box<dyn Agent>> {
@@ -345,7 +343,6 @@ mod tests {
             Some(path) => {
                 assert!(cmd.contains(&path.to_string_lossy().into_owned()));
                 assert!(cmd.starts_with("PATH="), "got: {cmd}");
-                assert!(cmd.contains(":$PATH "), "the existing PATH must be kept");
                 let dir = path.parent().unwrap().to_string_lossy().into_owned();
                 assert!(cmd.contains(&dir), "the tool's own directory comes first");
             }

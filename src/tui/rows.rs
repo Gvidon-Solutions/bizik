@@ -1,76 +1,15 @@
-//! What each screen shows, and how a session's state is worked out.
+//! What each screen shows.
 //!
-//! The status column is the reason this tool exists. Launching sessions is easy;
-//! knowing which of them is grinding away and which is sitting there waiting for
-//! an answer is what makes running six at once possible instead of merely
-//! impressive. Where an agent cannot tell us, the status says so rather than
-//! guessing — a fabricated "waiting" is worse than an honest "running".
+//! No state is decided here. The host that owns a session is the only place
+//! that can see its tmux and its processes, so it resolves the state and this
+//! module renders the answer — see [`crate::reconcile`]. Three copies of that
+//! logic living in three layers is precisely what let them disagree.
 
 use uuid::Uuid;
 
-use crate::model::{AgentKind, Chat, Folder, Host, Layout, Probe, Session};
+use crate::model::{AgentKind, Chat, Folder, Host, Layout, Probe};
+use crate::reconcile::{SessionView, State};
 use crate::remote::HostProbe;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Status {
-    /// Blocked on you — a permission prompt or a question. Known only when the
-    /// agent's hooks are installed, and the single most useful thing this tool
-    /// can tell you: a background session in this state will wait forever.
-    NeedsYou,
-    /// A turn ended and there is something to look at.
-    Done,
-    /// The agent is processing right now.
-    Working,
-    /// Idle, but without hooks there is no telling whether that means finished
-    /// or blocked. Deliberately vaguer than the two above.
-    YourTurn,
-    /// The session is up but the agent exposes no status, or which process
-    /// belongs to it is ambiguous.
-    Up,
-    /// Nothing is running; starting it will resume the conversation.
-    Down,
-}
-
-impl Status {
-    pub fn label(self) -> &'static str {
-        match self {
-            Status::NeedsYou => "needs you",
-            Status::Done => "done",
-            Status::Working => "working",
-            Status::YourTurn => "your turn",
-            Status::Up => "running",
-            Status::Down => "stopped",
-        }
-    }
-
-    pub fn glyph(self) -> &'static str {
-        match self {
-            Status::NeedsYou => "▲",
-            Status::Done => "◆",
-            Status::Working => "●",
-            Status::YourTurn => "◇",
-            Status::Up => "○",
-            Status::Down => "·",
-        }
-    }
-
-    /// The ball is in your court.
-    pub fn wants_you(self) -> bool {
-        matches!(self, Status::NeedsYou | Status::Done | Status::YourTurn)
-    }
-
-    /// Sort key for the mission-control list: whatever is blocked comes first.
-    pub fn urgency(self) -> u8 {
-        match self {
-            Status::NeedsYou => 0,
-            Status::Done => 1,
-            Status::YourTurn => 2,
-            Status::Working => 3,
-            Status::Up => 4,
-            Status::Down => 5,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub enum Row {
@@ -92,9 +31,7 @@ pub enum Row {
     },
     Session {
         host: String,
-        session: Session,
-        status: Status,
-        preview: Option<String>,
+        view: SessionView,
     },
     /// An agent conversation on disk that bizik does not yet track.
     Chat {
@@ -129,8 +66,8 @@ impl Row {
                 format!("{host} {} {}", folder.display_name(), folder.path)
             }
             Row::NewSession { agent, .. } => format!("new {agent}"),
-            Row::Session { host, session, .. } => {
-                format!("{host} {} {}", session.title, session.agent)
+            Row::Session { host, view } => {
+                format!("{host} {} {}", view.session.title, view.session.agent)
             }
             Row::Chat { host, chat, .. } => {
                 format!("{host} {} {}", chat.display_title(), chat.agent)
@@ -145,54 +82,17 @@ impl Row {
     /// is made of running things, not of intentions.
     pub fn select_key(&self) -> Option<(String, Uuid)> {
         match self {
-            Row::Session { host, session, .. } => Some((host.clone(), session.id)),
+            Row::Session { host, view } => Some((host.clone(), view.session.id)),
             _ => None,
         }
     }
 }
 
-/// Decide a session's status from what the host reported.
-///
-/// Matching prefers the agent's own conversation id, which is exact. Falling
-/// back to the working directory is only safe when exactly one agent of that
-/// kind is running there; with two, which is which is unknowable from here and
-/// the status stays deliberately vague.
-pub fn session_status(probe: &Probe, session: &Session, folder_path: &str) -> Status {
-    let up = probe.tmux.iter().any(|t| t.name == session.tmux_name());
-    if !up {
-        return Status::Down;
-    }
-
-    let by_id = session.agent_session_id.as_ref().and_then(|id| {
-        probe
-            .live
-            .iter()
-            .find(|l| l.agent == session.agent && l.agent_session_id.as_ref() == Some(id))
-    });
-
-    let live = by_id.or_else(|| {
-        let mut same_place = probe
-            .live
-            .iter()
-            .filter(|l| l.agent == session.agent && l.cwd == folder_path);
-        match (same_place.next(), same_place.next()) {
-            (Some(only), None) => Some(only),
-            _ => None,
-        }
-    });
-
-    // `attention` is only present when a hook report was newer than the agent's
-    // own status line, so where it exists it is the better account.
-    match live {
-        None => Status::Up,
-        Some(l) => match (l.attention.as_deref(), l.status.as_str()) {
-            (Some("waiting"), _) => Status::NeedsYou,
-            (_, "busy") => Status::Working,
-            (Some("done"), "idle") => Status::Done,
-            (_, "idle") => Status::YourTurn,
-            _ => Status::Up,
-        },
-    }
+fn probe_of<'a>(probes: &'a [HostProbe], host: &str) -> Option<&'a Probe> {
+    probes
+        .iter()
+        .find(|p| p.host.name == host)
+        .and_then(|p| p.probe.as_ref())
 }
 
 /// The favourites screen: every marked folder on every host.
@@ -213,23 +113,19 @@ pub fn folders(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
         };
 
         for folder in &probe.folders {
-            let sessions: Vec<&Session> = probe
+            let here: Vec<&SessionView> = probe
                 .sessions
                 .iter()
-                .filter(|s| s.folder_id == folder.id)
-                .collect();
-            let statuses: Vec<Status> = sessions
-                .iter()
-                .map(|s| session_status(probe, s, &folder.path))
+                .filter(|v| v.session.folder_id == folder.id)
                 .collect();
 
             rows.push(Row::Folder {
                 host: host.name.clone(),
                 folder: folder.clone(),
-                sessions: sessions.len(),
-                running: statuses.iter().filter(|s| **s != Status::Down).count(),
-                attention: statuses.iter().filter(|s| s.wants_you()).count(),
-                blocked: statuses.iter().filter(|s| **s == Status::NeedsYou).count(),
+                sessions: here.len(),
+                running: here.iter().filter(|v| v.state.is_running()).count(),
+                attention: here.iter().filter(|v| v.state.wants_you()).count(),
+                blocked: here.iter().filter(|v| v.state == State::NeedsYou).count(),
             });
         }
     }
@@ -246,11 +142,7 @@ pub fn folders(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
 /// exists that bizik has not adopted yet.
 pub fn folder_detail(host_name: &str, folder_id: Uuid, probes: &[HostProbe]) -> Vec<Row> {
     let mut rows = Vec::new();
-    let Some(probe) = probes
-        .iter()
-        .find(|p| p.host.name == host_name)
-        .and_then(|p| p.probe.as_ref())
-    else {
+    let Some(probe) = probe_of(probes, host_name) else {
         return vec![Row::Note(format!("{host_name} is not reachable right now"))];
     };
     let Some(folder) = probe.folders.iter().find(|f| f.id == folder_id) else {
@@ -269,32 +161,26 @@ pub fn folder_detail(host_name: &str, folder_id: Uuid, probes: &[HostProbe]) -> 
         }
     }
 
-    let mut sessions: Vec<&Session> = probe
+    let mut here: Vec<&SessionView> = probe
         .sessions
         .iter()
-        .filter(|s| s.folder_id == folder_id)
+        .filter(|v| v.session.folder_id == folder_id)
         .collect();
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_attached.unwrap_or(s.created_at)));
+    here.sort_by_key(|v| {
+        std::cmp::Reverse(v.session.last_attached.unwrap_or(v.session.created_at))
+    });
 
-    for session in &sessions {
-        let status = session_status(probe, session, &folder.path);
-        let preview = probe
-            .tmux
-            .iter()
-            .find(|t| t.name == session.tmux_name())
-            .and_then(|t| t.preview.clone());
+    for view in &here {
         rows.push(Row::Session {
             host: host_name.to_string(),
-            session: (*session).clone(),
-            status,
-            preview,
+            view: (*view).clone(),
         });
     }
 
     // Conversations already adopted by a session would otherwise appear twice.
-    let adopted: Vec<&str> = sessions
+    let adopted: Vec<&str> = here
         .iter()
-        .filter_map(|s| s.agent_session_id.as_deref())
+        .filter_map(|v| v.session.agent_session_id.as_deref())
         .collect();
 
     // Only conversations that can actually be reopened are offered. Listing a
@@ -326,38 +212,28 @@ pub fn running(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
     let mut rows = Vec::new();
 
     for host in hosts {
-        let Some(probe) = probes
-            .iter()
-            .find(|p| p.host.name == host.name)
-            .and_then(|p| p.probe.as_ref())
-        else {
+        let Some(probe) = probe_of(probes, &host.name) else {
             continue;
         };
-
-        for session in &probe.sessions {
-            let Some(folder) = probe.folders.iter().find(|f| f.id == session.folder_id) else {
-                continue;
-            };
-            let status = session_status(probe, session, &folder.path);
-            if status == Status::Down {
-                continue;
-            }
+        for view in probe.sessions.iter().filter(|v| v.state.is_running()) {
             rows.push(Row::Session {
                 host: host.name.clone(),
-                session: session.clone(),
-                status,
-                preview: probe
-                    .tmux
-                    .iter()
-                    .find(|t| t.name == session.tmux_name())
-                    .and_then(|t| t.preview.clone()),
+                view: view.clone(),
             });
+        }
+        // Something running that no record claims belongs on the screen that
+        // lists what is running, not only in a warning nobody reads.
+        for orphan in &probe.orphans {
+            rows.push(Row::Note(format!(
+                "{}: {} is running but bizik does not track it — tmux kill-session -t {}",
+                host.name, orphan.tmux_name, orphan.tmux_name
+            )));
         }
     }
 
     // Whatever wants you first; that is the only ordering that matters here.
     rows.sort_by_key(|r| match r {
-        Row::Session { status, .. } => status.urgency(),
+        Row::Session { view, .. } => view.state.urgency(),
         _ => u8::MAX,
     });
 
@@ -405,6 +281,9 @@ pub fn hosts_screen(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
                     if !probe.hooks_installed && !probe.agents.is_empty() {
                         detail.push_str(" · no hooks");
                     }
+                    if probe.env_captured_at.is_none() && !probe.agents.is_empty() {
+                        detail.push_str(" · no PATH captured");
+                    }
                     Row::HostEntry {
                         host: host.clone(),
                         detail,
@@ -436,11 +315,8 @@ pub fn layouts(saved: &[Layout], probes: &[HostProbe]) -> Vec<Row> {
                 .panes
                 .iter()
                 .filter(|p| {
-                    !probes
-                        .iter()
-                        .filter(|hp| hp.host.name == p.host)
-                        .filter_map(|hp| hp.probe.as_ref())
-                        .any(|probe| probe.sessions.iter().any(|s| s.id == p.session))
+                    !probe_of(probes, &p.host)
+                        .is_some_and(|probe| probe.records().any(|s| s.id == p.session))
                 })
                 .count();
             Row::LayoutEntry {
@@ -460,174 +336,111 @@ fn under(path: &str, root: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{LiveAgent, TmuxSession};
+    use crate::model::Session;
+    use crate::reconcile::Orphan;
 
-    fn probe_with(session: &Session, live: Vec<LiveAgent>, up: bool) -> Probe {
-        Probe {
-            sessions: vec![session.clone()],
-            tmux: if up {
-                {
-                    vec![TmuxSession {
-                        name: session.tmux_name(),
-                        created: 0,
-                        attached: false,
-                        windows: 1,
-                        preview: None,
-                    }]
-                }
-            } else {
-                Default::default()
-            },
-            live,
-            ..Default::default()
-        }
-    }
-
-    fn live(agent: AgentKind, cwd: &str, id: Option<&str>, status: &str) -> LiveAgent {
-        LiveAgent {
-            agent,
-            pid: 1,
-            cwd: cwd.into(),
-            agent_session_id: id.map(str::to_string),
-            status: status.into(),
-            status_at: 0,
+    fn view(state: State) -> SessionView {
+        SessionView {
+            session: Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into()),
+            state,
+            preview: None,
             attention: None,
         }
     }
 
-    fn with_attention(mut l: LiveAgent, state: &str) -> LiveAgent {
-        l.attention = Some(state.into());
-        l
-    }
-
-    #[test]
-    fn no_tmux_session_means_stopped() {
-        let s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
-        let p = probe_with(&s, vec![], false);
-        assert_eq!(session_status(&p, &s, "/repo"), Status::Down);
-    }
-
-    #[test]
-    fn busy_and_idle_map_to_working_and_your_turn() {
-        let mut s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
-        s.agent_session_id = Some("abc".into());
-
-        let busy = probe_with(
-            &s,
-            vec![live(AgentKind::Claude, "/repo", Some("abc"), "busy")],
-            true,
-        );
-        assert_eq!(session_status(&busy, &s, "/repo"), Status::Working);
-
-        let idle = probe_with(
-            &s,
-            vec![live(AgentKind::Claude, "/repo", Some("abc"), "idle")],
-            true,
-        );
-        assert_eq!(session_status(&idle, &s, "/repo"), Status::YourTurn);
-    }
-
-    #[test]
-    fn hooks_split_idle_into_blocked_and_finished() {
-        // Without hooks, idle is ambiguous and stays vague. With them, the two
-        // cases separate — which is the difference between a background session
-        // you can leave alone and one that will wait forever.
-        let mut s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
-        s.agent_session_id = Some("abc".into());
-        let base = live(AgentKind::Claude, "/repo", Some("abc"), "idle");
-
-        let vague = probe_with(&s, vec![base.clone()], true);
-        assert_eq!(session_status(&vague, &s, "/repo"), Status::YourTurn);
-
-        let blocked = probe_with(&s, vec![with_attention(base.clone(), "waiting")], true);
-        assert_eq!(session_status(&blocked, &s, "/repo"), Status::NeedsYou);
-
-        let finished = probe_with(&s, vec![with_attention(base, "done")], true);
-        assert_eq!(session_status(&finished, &s, "/repo"), Status::Done);
-    }
-
-    #[test]
-    fn a_blocked_agent_outranks_a_busy_status_line() {
-        // An agent showing a permission prompt can still call itself busy. The
-        // probe only attaches `waiting` when the hook was the fresher report,
-        // so by the time it gets here it is the one to believe.
-        let mut s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
-        s.agent_session_id = Some("abc".into());
-        let busy = live(AgentKind::Claude, "/repo", Some("abc"), "busy");
-        let p = probe_with(&s, vec![with_attention(busy, "waiting")], true);
-        assert_eq!(session_status(&p, &s, "/repo"), Status::NeedsYou);
-    }
-
-    #[test]
-    fn blocked_sorts_above_everything_else() {
-        let order = [
-            Status::NeedsYou,
-            Status::Done,
-            Status::YourTurn,
-            Status::Working,
-            Status::Up,
-            Status::Down,
-        ];
-        let mut urgencies: Vec<u8> = order.iter().map(|s| s.urgency()).collect();
-        let sorted = urgencies.clone();
-        urgencies.sort();
-        assert_eq!(urgencies, sorted, "urgency must already be in listed order");
-        assert!(Status::NeedsYou.wants_you() && Status::Done.wants_you());
-        assert!(!Status::Working.wants_you() && !Status::Down.wants_you());
-    }
-
-    #[test]
-    fn two_agents_in_one_folder_are_not_guessed_apart() {
-        // Without a conversation id there is no way to tell which process
-        // belongs to this session, so the status must not claim to know.
-        let s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
-        let p = probe_with(
-            &s,
-            vec![
-                live(AgentKind::Claude, "/repo", None, "busy"),
-                live(AgentKind::Claude, "/repo", None, "idle"),
-            ],
-            true,
-        );
-        assert_eq!(session_status(&p, &s, "/repo"), Status::Up);
-    }
-
-    #[test]
-    fn a_lone_agent_in_the_folder_is_matched_by_directory() {
-        let s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
-        let p = probe_with(
-            &s,
-            vec![live(AgentKind::Claude, "/repo", None, "busy")],
-            true,
-        );
-        assert_eq!(session_status(&p, &s, "/repo"), Status::Working);
-    }
-
-    #[test]
-    fn codex_without_a_status_reports_running_not_a_guess() {
-        let s = Session::new(Uuid::new_v4(), AgentKind::Codex, "t".into());
-        let p = probe_with(
-            &s,
-            vec![live(AgentKind::Codex, "/repo", None, "unknown")],
-            true,
-        );
-        assert_eq!(session_status(&p, &s, "/repo"), Status::Up);
+    fn probed(host: &str, probe: Option<Probe>, error: Option<&str>) -> HostProbe {
+        HostProbe {
+            host: Host::new(host.into(), Some("h".into())),
+            probe,
+            error: error.map(str::to_string),
+        }
     }
 
     #[test]
     fn unreachable_host_becomes_a_note_not_a_silent_gap() {
         let host = Host::new("back".into(), Some("h".into()));
-        let probes = vec![HostProbe {
-            host: host.clone(),
-            probe: None,
-            error: Some("connection refused".into()),
-        }];
-        let rows = folders(&[host], &probes);
+        let rows = folders(&[host], &[probed("back", None, Some("connection refused"))]);
         assert!(matches!(&rows[0], Row::Note(t) if t.contains("connection refused")));
     }
 
     #[test]
     fn notes_are_never_selectable() {
         assert!(!Row::Note("x".into()).selectable());
+    }
+
+    #[test]
+    fn the_running_screen_puts_blocked_sessions_first() {
+        let host = Host::new("back".into(), Some("h".into()));
+        let probe = Probe {
+            sessions: vec![
+                view(State::Working),
+                view(State::NeedsYou),
+                view(State::YourTurn),
+            ],
+            ..Default::default()
+        };
+        let rows = running(&[host], &[probed("back", Some(probe), None)]);
+        match &rows[0] {
+            Row::Session { view, .. } => assert_eq!(view.state, State::NeedsYou),
+            other => panic!("expected a session first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stopped_sessions_are_not_on_the_running_screen() {
+        let host = Host::new("back".into(), Some("h".into()));
+        let probe = Probe {
+            sessions: vec![view(State::Down)],
+            ..Default::default()
+        };
+        let rows = running(&[host], &[probed("back", Some(probe), None)]);
+        assert!(matches!(&rows[0], Row::Note(t) if t.contains("nothing is running")));
+    }
+
+    #[test]
+    fn an_orphan_is_listed_where_running_things_are_listed() {
+        let host = Host::new("back".into(), Some("h".into()));
+        let _ = &host;
+        let probe = Probe {
+            orphans: vec![Orphan {
+                tmux_name: "bzk-dead1234".into(),
+                was_session: None,
+            }],
+            ..Default::default()
+        };
+        let rows = running(&[host], &[probed("back", Some(probe), None)]);
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r, Row::Note(t) if t.contains("bzk-dead1234"))),
+            "an untracked session must not be visible only in a warning"
+        );
+    }
+
+    #[test]
+    fn a_layout_counts_panes_whose_sessions_are_gone() {
+        let present = view(State::Down);
+        let probe = Probe {
+            sessions: vec![present.clone()],
+            ..Default::default()
+        };
+        let layout = Layout::new(
+            "two".into(),
+            vec![
+                crate::model::PaneRef {
+                    host: "back".into(),
+                    session: present.session.id,
+                },
+                crate::model::PaneRef {
+                    host: "back".into(),
+                    session: Uuid::new_v4(),
+                },
+            ],
+            None,
+        );
+        let rows = layouts(&[layout], &[probed("back", Some(probe), None)]);
+        match &rows[0] {
+            Row::LayoutEntry { missing, .. } => assert_eq!(*missing, 1),
+            other => panic!("expected a layout, got {other:?}"),
+        }
     }
 }

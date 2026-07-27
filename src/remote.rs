@@ -169,7 +169,7 @@ pub fn attach_command(host: &Host, tmux_name: &str) -> String {
     match &host.ssh {
         // Same tmux server: `TMUX` has to be cleared for tmux to allow the
         // nested attach at all.
-        None => format!("env TMUX= tmux attach -t '={tmux_name}'"),
+        None => format!("env TMUX= {} attach -t '={tmux_name}'", crate::tmux::cli()),
         Some(target) => {
             let opts = base_opts().join(" ");
             format!("ssh {opts} -t {target} \"tmux attach -t '={tmux_name}'\"")
@@ -266,28 +266,64 @@ pub fn probe_all(hosts: &[Host]) -> Vec<HostProbe> {
     results
 }
 
+/// Just enough of a probe to know whether the rest can be read.
+///
+/// Deserialised on its own, and first. Checking the version *after* parsing the
+/// whole payload is no check at all: the moment a field changes shape, parsing
+/// fails before the version is ever looked at, and the user gets
+/// "missing field `session` at line 1 column 712" instead of "update this
+/// host". Every field here is optional, so this struct can always be read.
+#[derive(serde::Deserialize)]
+struct Envelope {
+    #[serde(default)]
+    protocol: u32,
+}
+
 pub fn probe_one(host: &Host) -> HostProbe {
+    let fail = |error: String| HostProbe {
+        host: host.clone(),
+        probe: None,
+        error: Some(error),
+    };
+
     // `--preview` costs one `capture-pane` per session and is what puts the
     // last few lines of each pane in the dashboard.
-    match run_bzk(host, &["probe", "--json", "--preview"]).and_then(|raw| {
-        serde_json::from_str::<Probe>(&raw).with_context(|| {
-            format!(
-                "parsing probe from {} (version mismatch? got: {})",
-                host.name,
-                crate::util::one_line(&raw, 120)
-            )
-        })
+    let raw = match run_bzk(host, &["probe", "--json", "--preview"]) {
+        Ok(raw) => raw,
+        Err(e) => return fail(format!("{e:#}")),
+    };
+
+    match serde_json::from_str::<Envelope>(&raw) {
+        Ok(envelope) if envelope.protocol != crate::model::PROTOCOL => {
+            return fail(format!(
+                "speaks protocol {} but this bizik is {} — run: bzk install {}",
+                envelope.protocol,
+                crate::model::PROTOCOL,
+                host.name
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return fail(format!(
+                "did not answer with a bizik probe ({e}): {}",
+                crate::util::one_line(&raw, 100)
+            ));
+        }
+    }
+
+    match serde_json::from_str::<Probe>(&raw).with_context(|| {
+        format!(
+            "parsing probe from {} (got: {})",
+            host.name,
+            crate::util::one_line(&raw, 120)
+        )
     }) {
         Ok(probe) => HostProbe {
             host: host.clone(),
             probe: Some(probe),
             error: None,
         },
-        Err(e) => HostProbe {
-            host: host.clone(),
-            probe: None,
-            error: Some(format!("{e:#}")),
-        },
+        Err(e) => fail(format!("{e:#}")),
     }
 }
 
