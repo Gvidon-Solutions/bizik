@@ -77,19 +77,28 @@ fn base_opts() -> Vec<String> {
     ];
 
     if let Some(dir) = control_dir() {
-        let control = dir.join("cm-%C");
-        if control.as_os_str().len() <= MAX_CONTROL_PATH {
-            opts.extend([
-                "-o".into(),
-                "ControlMaster=auto".into(),
-                "-o".into(),
-                format!("ControlPath={}", control.display()),
-                "-o".into(),
-                "ControlPersist=10m".into(),
-            ]);
-        }
+        opts.extend(sharing_opts(&dir.join("cm-%C")));
     }
     opts
+}
+
+/// Connection-sharing options for a socket path, or none if it will not fit.
+///
+/// ssh refuses a `ControlPath` over the unix socket limit outright rather than
+/// degrading, so a path that is too long has to mean "share nothing" — a slower
+/// connection is a far better outcome than no connection at all.
+fn sharing_opts(control: &Path) -> Vec<String> {
+    if control.as_os_str().len() > MAX_CONTROL_PATH {
+        return Vec::new();
+    }
+    vec![
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        format!("ControlPath={}", control.display()),
+        "-o".into(),
+        "ControlPersist=10m".into(),
+    ]
 }
 
 fn ensure_control_dir() {
@@ -370,6 +379,25 @@ mod tests {
         assert!(
             !older_laptop.contains("bzk install anogem"),
             "reinstalling the host cannot fix a stale laptop: {older_laptop}"
+        );
+    }
+
+    #[test]
+    fn an_overlong_control_path_disables_sharing_rather_than_breaking_ssh() {
+        // ssh rejects the connection outright when this path exceeds the unix
+        // socket limit, which once made every host unreachable at once.
+        let short = PathBuf::from("/tmp/bzk-1000/cm-%C");
+        assert!(
+            sharing_opts(&short)
+                .iter()
+                .any(|opt| opt.starts_with("ControlPath=")),
+            "a short path must still share connections"
+        );
+
+        let long = PathBuf::from(format!("/{}/cm-%C", "x".repeat(MAX_CONTROL_PATH)));
+        assert!(
+            sharing_opts(&long).is_empty(),
+            "an unusable path must cost speed, not reachability"
         );
     }
 

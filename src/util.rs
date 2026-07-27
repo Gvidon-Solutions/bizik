@@ -290,6 +290,48 @@ mod tests {
     }
 
     #[test]
+    fn reads_are_bounded_at_both_ends() {
+        // Transcripts reach tens of megabytes; nothing may ever read one whole.
+        let dir = std::env::temp_dir().join(format!("bzk-bounded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.jsonl");
+        let body: String = (0..500).map(|i| format!("line-{i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let head = read_head(&path, 64).unwrap();
+        assert!(head.len() <= 64, "head must respect its budget");
+        assert!(head.starts_with("line-0"));
+
+        let tail = read_tail(&path, 64).unwrap();
+        assert!(tail.len() <= 64);
+        assert!(body.ends_with(&tail), "the tail must come from the end");
+
+        // Asking for more than the file has is not an error.
+        assert_eq!(read_head(&path, 10 * body.len()).unwrap(), body);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_completed_write_leaves_no_temporary_behind() {
+        let dir = std::env::temp_dir().join(format!("bzk-tidy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+
+        atomic_write(&path, b"first").unwrap();
+        atomic_write(&path, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "store.json")
+            .collect();
+        assert!(leftovers.is_empty(), "stray temporaries: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn one_line_collapses_whitespace_and_clamps_by_character() {
         assert_eq!(one_line("  a\n\tb   c ", 80), "a b c");
         assert_eq!(one_line("методичка", 5), "мето…");

@@ -659,6 +659,32 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_line_keeps_its_command_whole() {
+        // The command is the last field and may itself contain a tab. Splitting
+        // on every tab would read part of it as another column and silently
+        // mis-describe the pane.
+        let info = parse_pane("%3\tabc-123\tback\tssh host\t-t 'x'".splitn(4, '\t'));
+        assert_eq!(info.pane, "%3");
+        assert_eq!(info.session.as_deref(), Some("abc-123"));
+        assert_eq!(info.host.as_deref(), Some("back"));
+        assert_eq!(info.start_command, "ssh host\t-t 'x'");
+    }
+
+    #[test]
+    fn an_untagged_pane_reports_no_identity_rather_than_an_empty_one() {
+        // tmux prints an unset user option as an empty field, and older tmux
+        // prints `0`. Either must read as "no tag", or a pane from an older
+        // build looks tagged with nonsense.
+        let empty = parse_pane("%1\t\t\tzsh".splitn(4, '\t'));
+        assert_eq!(empty.session, None);
+        assert_eq!(empty.host, None);
+        assert_eq!(empty.start_command, "zsh");
+
+        let zero = parse_pane("%1\t0\t0\tzsh".splitn(4, '\t'));
+        assert_eq!(zero.session, None);
+    }
+
+    #[test]
     fn wrapper_keeps_the_pane_and_never_restarts_by_itself() {
         let w = wrap_command("claude", "claude --resume x", "/repo");
         assert!(w.contains("exited"), "exit reason must stay on screen");
