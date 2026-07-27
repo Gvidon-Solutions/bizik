@@ -111,10 +111,7 @@ pub fn install() -> Result<Report> {
 }
 
 pub fn install_at(path: &Path) -> Result<Report> {
-    let exe = std::env::current_exe()
-        .context("locating own binary")?
-        .to_string_lossy()
-        .into_owned();
+    let exe = crate::util::own_exe()?.to_string_lossy().into_owned();
 
     let mut settings = read_settings(path)?;
     let mut hooks = match settings.remove("hooks") {

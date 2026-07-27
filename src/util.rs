@@ -163,6 +163,33 @@ pub fn pids_by_comm(comm: &str) -> Vec<u32> {
     out
 }
 
+/// Path to this binary, usable for spawning a copy of ourselves.
+///
+/// Not simply `current_exe()`. On Linux that reads `/proc/self/exe`, and once
+/// the file has been replaced — by an upgrade, while this process is still
+/// running — the link reads `/path/to/bzk (deleted)`. Spawning that fails with
+/// "No such file or directory", which is a baffling way for a long-running
+/// dashboard to start failing an hour after an install. Stripping the marker
+/// lands on whatever occupies the path now, which is exactly what we want.
+pub fn own_exe() -> Result<PathBuf> {
+    let raw = std::env::current_exe().context("locating own binary")?;
+    let path = strip_deleted(&raw);
+    if !path.exists() {
+        anyhow::bail!(
+            "{} no longer exists — bizik was removed while running; restart it",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn strip_deleted(path: &Path) -> PathBuf {
+    match path.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path.to_path_buf(),
+    }
+}
+
 /// This machine's short hostname, for when nobody supplied a better label.
 pub fn hostname() -> String {
     fs::read_to_string("/proc/sys/kernel/hostname")
@@ -185,4 +212,38 @@ pub fn one_line(s: &str, max: usize) -> String {
     }
     let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
     format!("{cut}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replaced_binary_resolves_back_to_its_path() {
+        // What /proc/self/exe reads after the file has been swapped underneath.
+        assert_eq!(
+            strip_deleted(Path::new("/home/me/.local/bin/bzk (deleted)")),
+            Path::new("/home/me/.local/bin/bzk")
+        );
+        // An ordinary path, and one that merely looks suspicious, are untouched.
+        assert_eq!(
+            strip_deleted(Path::new("/usr/bin/bzk")),
+            Path::new("/usr/bin/bzk")
+        );
+        assert_eq!(
+            strip_deleted(Path::new("/opt/my (deleted) tools/bzk")),
+            Path::new("/opt/my (deleted) tools/bzk")
+        );
+    }
+
+    #[test]
+    fn one_line_collapses_whitespace_and_clamps_by_character() {
+        assert_eq!(one_line("  a\n\tb   c ", 80), "a b c");
+        assert_eq!(one_line("методичка", 5), "мето…");
+    }
+
+    #[test]
+    fn shell_quoting_survives_embedded_quotes() {
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
 }

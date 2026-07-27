@@ -116,7 +116,7 @@ fn remote_bzk(args: &[&str]) -> String {
 pub fn run_bzk(host: &Host, args: &[&str]) -> Result<String> {
     match &host.ssh {
         None => {
-            let exe = std::env::current_exe().context("locating own binary")?;
+            let exe = crate::util::own_exe()?;
             let out = Command::new(exe)
                 .args(args)
                 .output()
@@ -182,7 +182,7 @@ pub fn install(host: &Host) -> Result<String> {
     let Some(target) = &host.ssh else {
         return Ok("local host needs no install".into());
     };
-    let exe = std::env::current_exe().context("locating own binary")?;
+    let exe = crate::util::own_exe()?;
     ensure_control_dir();
 
     let mkdir = Command::new("ssh")

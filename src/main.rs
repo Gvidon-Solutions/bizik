@@ -251,7 +251,7 @@ fn cmd_tui() -> Result<()> {
         return tui::run();
     }
 
-    let exe = std::env::current_exe().context("locating own binary")?;
+    let exe = util::own_exe()?;
     let dash = format!("{}{} tui", config_env(), exe.display());
 
     // The session is created detached and attached separately, so options and
