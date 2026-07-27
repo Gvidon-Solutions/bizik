@@ -94,7 +94,7 @@ pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> 
     // A session already on screen is focused rather than opened again. Two
     // panes showing one conversation is never what was meant, and it is easy to
     // ask for by selecting a session that was already open.
-    if let Some(pane) = existing_pane(&window, session) {
+    if let Some(pane) = existing_pane(&window, session, tmux_name, &host.name) {
         tmux::select_pane(&pane)?;
         return Ok(pane);
     }
@@ -107,17 +107,30 @@ pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> 
 
 /// The pane already viewing this session, if any.
 ///
-/// Read from the identity tmux carries on the pane, not from its command line.
-/// Substring matching worked until it did not: two sessions whose names shared
-/// a prefix, or a change to how the command is quoted, would silently pair a
-/// pane with the wrong session.
-fn existing_pane(window: &str, session: Uuid) -> Option<String> {
+/// The tag tmux carries on the pane is the answer when it is there. A pane
+/// opened by an older build has no tag, and ignoring those was not harmless:
+/// restoring a layout over them saw an empty window, opened its own panes
+/// alongside, and left eight where four were meant. So an untagged pane is
+/// recognised by the session name still visible in its start command, and
+/// tagged on the spot — after which it is exact like the rest.
+fn existing_pane(window: &str, session: Uuid, tmux_name: &str, host: &str) -> Option<String> {
     let wanted = session.to_string();
-    tmux::window_panes(window)
-        .ok()?
-        .into_iter()
-        .find(|p| p.session.as_deref() == Some(wanted.as_str()))
-        .map(|p| p.pane)
+    let panes = tmux::window_panes(window).ok()?;
+    let found = panes.iter().find(|p| identifies(p, &wanted, tmux_name))?;
+
+    if found.session.is_none() {
+        let _ = tmux::tag_pane(&found.pane, &wanted, host);
+    }
+    Some(found.pane.clone())
+}
+
+/// Whether this pane is showing that session, by tag or by what it was started
+/// with.
+fn identifies(pane: &tmux::PaneInfo, session_uuid: &str, tmux_name: &str) -> bool {
+    if let Some(tagged) = &pane.session {
+        return tagged == session_uuid;
+    }
+    pane.start_command.contains(&format!("'={tmux_name}'"))
 }
 
 /// Switch the terminal to the pane window.
@@ -144,7 +157,7 @@ pub struct OpenPane {
 /// tmux carries the answer on the pane itself, tagged when the pane was opened.
 /// It survives a dashboard restart, so a layout can still be saved from panes
 /// opened by an earlier run.
-pub fn panes_in_work() -> Vec<OpenPane> {
+pub fn panes_in_work(candidates: &[(String, Session)]) -> Vec<OpenPane> {
     let Some(window) = tmux::find_window(WORK_WINDOW) else {
         return Vec::new();
     };
@@ -155,10 +168,26 @@ pub fn panes_in_work() -> Vec<OpenPane> {
     panes
         .into_iter()
         .filter_map(|p| {
+            // Tagged panes answer for themselves. An untagged one is from an
+            // older build; it is recovered from its start command and tagged,
+            // so this is the last time it needs recovering.
+            if let (Some(session), Some(host)) = (&p.session, &p.host)
+                && let Ok(id) = session.parse()
+            {
+                return Some(OpenPane {
+                    pane: p.pane,
+                    host: host.clone(),
+                    session: id,
+                });
+            }
+            let (host, session) = candidates
+                .iter()
+                .find(|(_, s)| p.start_command.contains(&format!("'={}'", s.tmux_name())))?;
+            let _ = tmux::tag_pane(&p.pane, &session.id.to_string(), host);
             Some(OpenPane {
-                session: p.session?.parse().ok()?,
-                host: p.host?,
                 pane: p.pane,
+                host: host.clone(),
+                session: session.id,
             })
         })
         .collect()
@@ -191,6 +220,58 @@ mod tests {
             .iter()
             .find(|(_, c)| cmd.contains(&c.tmux_name()));
         assert_eq!(hit.map(|(h, _)| h.as_str()), Some("back"));
+    }
+
+    fn pane(tag: Option<&str>, command: &str) -> tmux::PaneInfo {
+        tmux::PaneInfo {
+            pane: "%1".into(),
+            session: tag.map(str::to_string),
+            host: tag.map(|_| "back".to_string()),
+            start_command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_pane_from_an_older_build_is_still_recognised() {
+        // It carries no tag, only the command it was started with. Ignoring
+        // those made a layout restore open its panes alongside the ones already
+        // there — eight where four were meant.
+        let s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
+        let host = Host::new("back".into(), Some("root@h".into()));
+        let legacy = pane(None, &crate::remote::attach_command(&host, &s.tmux_name()));
+
+        assert!(identifies(&legacy, &s.id.to_string(), &s.tmux_name()));
+    }
+
+    #[test]
+    fn a_tag_is_believed_over_the_command_line() {
+        // Once tagged, the tag is the answer — a stale command line cannot
+        // reassign a pane to somebody else's session.
+        let mine = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
+        let other = Session::new(Uuid::new_v4(), AgentKind::Claude, "u".into());
+        let host = Host::new("back".into(), Some("root@h".into()));
+
+        let tagged = pane(
+            Some(&other.id.to_string()),
+            &crate::remote::attach_command(&host, &mine.tmux_name()),
+        );
+        assert!(!identifies(
+            &tagged,
+            &mine.id.to_string(),
+            &mine.tmux_name()
+        ));
+        assert!(identifies(
+            &tagged,
+            &other.id.to_string(),
+            &other.tmux_name()
+        ));
+    }
+
+    #[test]
+    fn an_unrelated_pane_matches_nothing() {
+        let s = Session::new(Uuid::new_v4(), AgentKind::Claude, "t".into());
+        let shell = pane(None, "zsh");
+        assert!(!identifies(&shell, &s.id.to_string(), &s.tmux_name()));
     }
 
     #[test]

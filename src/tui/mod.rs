@@ -200,6 +200,20 @@ impl App {
         self.local.host_by_name(name).cloned()
     }
 
+    /// Every known session paired with its host. Needed only to recognise panes
+    /// opened by a build that predates identity tagging.
+    fn all_sessions(&self) -> Vec<(String, crate::model::Session)> {
+        self.probes
+            .iter()
+            .filter_map(|p| p.probe.as_ref().map(|pr| (p.host.name.clone(), pr)))
+            .flat_map(|(host, pr)| {
+                pr.records()
+                    .map(move |s| (host.clone(), s.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn rebuild(&mut self) {
         let hosts = self.hosts();
         let mut rows = match self.screen().clone() {
@@ -734,7 +748,7 @@ impl App {
     /// nothing about. Rather than silently tile instead, the panes that do not
     /// belong are named and closing them is offered as a choice.
     fn restore_layout(&mut self, layout: &Layout) {
-        let open = actions::panes_in_work();
+        let open = actions::panes_in_work(&self.all_sessions());
         let wanted: HashSet<(String, Uuid)> = layout
             .panes
             .iter()
@@ -959,7 +973,7 @@ impl App {
     }
 
     fn save_layout(&mut self, name: String) {
-        let panes = actions::panes_in_work();
+        let panes = actions::panes_in_work(&self.all_sessions());
         if panes.is_empty() {
             self.error("no bizik panes are open — open some first, then save");
             return;

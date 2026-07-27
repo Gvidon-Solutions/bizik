@@ -530,10 +530,13 @@ pub struct PaneInfo {
     pub pane: String,
     pub session: Option<String>,
     pub host: Option<String>,
+    /// What the pane was started with. Only needed to recognise panes opened
+    /// before identity was tagged onto them.
+    pub start_command: String,
 }
 
 pub fn window_panes(window: &str) -> Result<Vec<PaneInfo>> {
-    let fmt = format!("#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}");
+    let fmt = format!("#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{pane_start_command}}");
     let raw = tmux(&["list-panes", "-t", window, "-F", &fmt])?;
     Ok(raw
         .lines()
@@ -546,6 +549,7 @@ pub fn window_panes(window: &str) -> Result<Vec<PaneInfo>> {
                 pane,
                 session: clean(parts.next()),
                 host: clean(parts.next()),
+                start_command: parts.next().unwrap_or_default().to_string(),
             })
         })
         .collect())
