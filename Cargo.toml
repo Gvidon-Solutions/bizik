@@ -2,6 +2,8 @@
 name = "bizik"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+publish = false
 description = "Remote agent session manager: mark folders on your servers, launch and watch Claude/Codex sessions from one screen"
 
 [[bin]]
@@ -25,3 +27,18 @@ strip = true
 
 [dev-dependencies]
 serde_json = "1.0.151"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+map_unwrap_or = "deny"
+redundant_clone = "deny"
+unchecked_time_subtraction = "deny"

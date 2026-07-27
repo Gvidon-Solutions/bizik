@@ -31,7 +31,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_body(frame, app, body);
     draw_footer(frame, app, footer);
 
-    match &app.overlay {
+    match &app.state.overlay {
         Some(Overlay::Help) => draw_help(frame, frame.area()),
         Some(Overlay::Confirm { prompt, .. }) => draw_confirm(frame, prompt, frame.area()),
         Some(Overlay::Input {
@@ -44,7 +44,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let current = app.stack.last().cloned().unwrap_or(Screen::Folders);
+    let current = app.state.stack.last().cloned().unwrap_or(Screen::Folders);
     let active = current.tab_index();
 
     let mut spans = vec![Span::styled(
@@ -72,12 +72,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
     // Starting happens off the drawing thread, so say it is happening —
     // otherwise a slow ssh looks like a key that did nothing.
-    if app.starting > 0 {
+    if app.state.starting > 0 {
         spans.push(Span::styled(
-            format!("  starting {}…", app.starting),
+            format!("  starting {}…", app.state.starting),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
-    } else if app.refreshing {
+    } else if app.state.refreshing {
         spans.push(Span::styled("  refreshing…", Style::default().fg(DIM)));
     }
 
@@ -87,6 +87,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = area.width.saturating_sub(4) as usize;
     let items: Vec<ListItem> = app
+        .state
         .rows
         .iter()
         .map(|row| render_row(row, width, app))
@@ -97,7 +98,7 @@ fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌");
 
-    frame.render_stateful_widget(list, area, &mut app.list);
+    frame.render_stateful_widget(list, area, &mut app.state.list);
 }
 
 fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
@@ -162,7 +163,7 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
 
         Row::Session { host, view } => {
             let (session, status, preview) = (&view.session, view.state, &view.preview);
-            let picked = app.selected.contains(&(host.clone(), session.id));
+            let picked = app.state.selected.contains(&(host.clone(), session.id));
             let mut spans = vec![
                 Span::styled(
                     if picked { "✓ " } else { "  " },
@@ -261,7 +262,7 @@ fn status_style(status: State) -> Style {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     // A toast takes the footer, because an error the user cannot see is an
     // error that gets repeated.
-    if let Some((text, kind, _)) = &app.toast {
+    if let Some((text, kind, _)) = &app.state.toast {
         let style = match kind {
             ToastKind::Info => Style::default().fg(Color::Black).bg(Color::Green),
             ToastKind::Error => Style::default().fg(Color::White).bg(Color::Red),
@@ -273,11 +274,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    if app.filtering {
+    if app.state.filtering {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" filter: ", Style::default().fg(Color::Black).bg(ACCENT)),
-                Span::raw(format!(" {}▏", app.filter)),
+                Span::raw(format!(" {}▏", app.state.filter)),
                 Span::styled("  enter keep · esc clear", Style::default().fg(DIM)),
             ])),
             area,
@@ -285,7 +286,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let keys = match app.stack.last() {
+    let keys = match app.state.stack.last() {
         Some(Screen::Folders) => {
             "enter open · e rename · d unmark · / filter · w panes · q detach · ? keys"
         }
@@ -299,15 +300,18 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut spans = vec![Span::styled(format!(" {keys}"), Style::default().fg(DIM))];
-    if !app.selected.is_empty() {
+    if !app.state.selected.is_empty() {
         spans.push(Span::styled(
-            format!("  [{} selected — enter opens all]", app.selected.len()),
+            format!(
+                "  [{} selected — enter opens all]",
+                app.state.selected.len()
+            ),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     }
-    if !app.filter.is_empty() {
+    if !app.state.filter.is_empty() {
         spans.push(Span::styled(
-            format!("  filter “{}”", app.filter),
+            format!("  filter “{}”", app.state.filter),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -378,7 +382,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         )),
     ];
 
-    let popup = centered(74, lines.len() as u16 + 2, area);
+    let content_height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let popup = centered(74, content_height, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -492,6 +499,51 @@ fn ago(when_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AgentKind, Chat, Folder, Host, Layout, Session};
+    use crate::reconcile::{SessionView, State as SessionState};
+    use crate::store::LocalStore;
+    use crate::tui::Confirm;
+    use crate::tui::state::State as DashboardState;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::sync::mpsc::channel;
+    use std::time::Instant;
+
+    fn test_app(rows: Vec<Row>) -> super::App {
+        let (tx, rx) = channel();
+        let (launch_tx, launch_rx) = channel();
+        let mut state = DashboardState {
+            rows,
+            ..DashboardState::default()
+        };
+        state.list.select(Some(0));
+        super::App {
+            local: LocalStore::default(),
+            probes: Vec::new(),
+            state,
+            last_refresh: Instant::now(),
+            quit: false,
+            tx,
+            rx,
+            launch_tx,
+            launch_rx,
+        }
+    }
+
+    fn render(app: &mut super::App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("creating the test terminal");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("rendering the dashboard");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
 
     #[test]
     fn truncation_counts_characters_not_bytes() {
@@ -522,5 +574,108 @@ mod tests {
         let popup = centered(64, 20, area);
         assert!(popup.height <= area.height);
         assert!(popup.x + popup.width <= area.width);
+    }
+
+    #[test]
+    fn every_row_variant_renders_on_a_headless_terminal() {
+        let folder = Folder::new("/srv/repo".into());
+        let session = Session::new(folder.id, AgentKind::Claude, "important work".into());
+        let host = Host::new("server".into(), Some("root@example".into()));
+        let rows = vec![
+            Row::Folder {
+                host: "server".into(),
+                folder: folder.clone(),
+                sessions: 1,
+                running: 1,
+                attention: 0,
+                blocked: 0,
+            },
+            Row::NewSession {
+                host: "server".into(),
+                folder: folder.id,
+                agent: AgentKind::Shell,
+            },
+            Row::Session {
+                host: "server".into(),
+                view: SessionView {
+                    session,
+                    state: SessionState::Working,
+                    preview: Some("editing src/lib.rs".into()),
+                    attention: None,
+                },
+            },
+            Row::Chat {
+                host: "server".into(),
+                folder: folder.id,
+                chat: Chat {
+                    agent: AgentKind::Claude,
+                    id: "chat-1".into(),
+                    cwd: folder.path,
+                    title: Some("history".into()),
+                    last_prompt: None,
+                    git_branch: None,
+                    last_active: crate::util::now_ms(),
+                    size: 1,
+                },
+            },
+            Row::HostEntry {
+                host,
+                detail: "reachable".into(),
+                ok: true,
+            },
+            Row::LayoutEntry {
+                layout: Layout::new("focus layout".into(), Vec::new(), None),
+                missing: 0,
+            },
+            Row::Note("plain note".into()),
+        ];
+        let mut app = test_app(rows);
+
+        let rendered = render(&mut app, 120, 24);
+        for expected in [
+            "repo",
+            "new shell session",
+            "important work",
+            "history",
+            "root@example",
+            "focus layout",
+            "plain note",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlays_and_footer_states_render_without_a_real_terminal() {
+        let mut app = test_app(vec![Row::Note("empty".into())]);
+
+        app.state.overlay = Some(Overlay::Help);
+        assert!(render(&mut app, 100, 34).contains("any key closes this"));
+
+        app.state.overlay = Some(Overlay::Confirm {
+            prompt: "stop it?".into(),
+            action: Confirm::CloseViewer,
+        });
+        assert!(render(&mut app, 100, 20).contains("stop it?"));
+
+        app.state.overlay = Some(Overlay::Input {
+            prompt: "layout name".into(),
+            value: "focus".into(),
+            kind: InputKind::SaveLayout,
+        });
+        let input = render(&mut app, 100, 20);
+        assert!(input.contains("layout name"));
+        assert!(input.contains("focus"));
+
+        app.state.overlay = None;
+        app.state.filtering = true;
+        app.state.filter = "needle".into();
+        assert!(render(&mut app, 100, 12).contains("needle"));
+
+        app.state.info("saved");
+        assert!(render(&mut app, 100, 12).contains("saved"));
     }
 }

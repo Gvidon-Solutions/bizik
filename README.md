@@ -4,6 +4,9 @@ Mark folders on the machines you work on. From one screen, launch Claude Code or
 Codex sessions in any of them, watch several at once, and see which one is
 waiting on you.
 
+The module boundaries, persistence invariants, quality gates, and current
+refactoring roadmap are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ```
  bizik  folders  running  layouts  hosts
 ▌▲ needs you   gvidon   claude   payments API        Should I drop the old column?
@@ -84,9 +87,10 @@ C toolchain.
 
 </details>
 
-`bzk install` puts the binary at `~/.local/bin/bzk` on each host. It is the same
-binary on both sides, so the two can never disagree about the data format. If
-the copy will not run there, install says so and repeats the musl command.
+`bzk install` puts the binary at `~/.local/bin/bzk` on each host. A normal
+deploy therefore runs the same protocol version on both sides; if one host was
+missed, probing refuses the mismatch and `doctor` names the stale side. If the
+copy will not run there, install says so and repeats the musl command.
 
 Each server needs tmux, and whichever agents you intend to run.
 

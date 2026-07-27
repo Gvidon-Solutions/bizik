@@ -59,9 +59,7 @@ fn private_dir(path: &Path) -> Result<()> {
 
 fn uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self")
-        .map(|m| m.uid())
-        .unwrap_or(0)
+    std::fs::metadata("/proc/self").map_or(0, |metadata| metadata.uid())
 }
 
 /// ssh options shared by every invocation.
@@ -133,6 +131,8 @@ pub fn run_bzk(host: &Host, args: &[&str]) -> Result<String> {
             // Fail fast instead of hanging on a password prompt: a probe runs
             // unattended and a stuck one would freeze the dashboard.
             cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]);
+            // A configured target is data, never another ssh option.
+            cmd.arg("--");
             cmd.arg(target);
             cmd.arg(remote_bzk(args));
 
@@ -171,8 +171,17 @@ pub fn attach_command(host: &Host, tmux_name: &str) -> String {
         // nested attach at all.
         None => format!("env TMUX= {} attach -t '={tmux_name}'", crate::tmux::cli()),
         Some(target) => {
-            let opts = base_opts().join(" ");
-            format!("ssh {opts} -t {target} \"tmux attach -t '={tmux_name}'\"")
+            let opts = base_opts()
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let remote = format!("tmux attach -t '={tmux_name}'");
+            format!(
+                "ssh {opts} -t -- {} {}",
+                shell_quote(target),
+                shell_quote(&remote)
+            )
         }
     }
 }
@@ -187,6 +196,7 @@ pub fn install(host: &Host) -> Result<String> {
 
     let mkdir = Command::new("ssh")
         .args(base_opts())
+        .arg("--")
         .arg(target)
         .arg("mkdir -p ~/.local/bin")
         .output()
@@ -199,6 +209,7 @@ pub fn install(host: &Host) -> Result<String> {
     // half-written binary that the next probe would try to execute.
     let scp = Command::new("scp")
         .args(base_opts())
+        .arg("--")
         .arg(&exe)
         .arg(format!("{target}:.local/bin/bzk.new"))
         .output()
@@ -209,6 +220,7 @@ pub fn install(host: &Host) -> Result<String> {
 
     let finish = Command::new("ssh")
         .args(base_opts())
+        .arg("--")
         .arg(target)
         .arg("chmod +x ~/.local/bin/bzk.new && mv ~/.local/bin/bzk.new ~/.local/bin/bzk && ~/.local/bin/bzk --version")
         .output()
@@ -374,7 +386,7 @@ mod tests {
     fn remote_attach_requests_a_tty_and_reuses_connections() {
         let h = Host::new("back".into(), Some("root@1.2.3.4".into()));
         let cmd = attach_command(&h, "bzk-a1");
-        assert!(cmd.contains("-t root@1.2.3.4"), "a TUI needs a tty");
+        assert!(cmd.contains("-t -- 'root@1.2.3.4'"), "a TUI needs a tty");
         assert!(
             cmd.contains("ControlMaster=auto"),
             "six panes, one handshake"
@@ -402,9 +414,22 @@ mod tests {
     fn remote_quoting_survives_both_shells() {
         let h = Host::new("back".into(), Some("h".into()));
         let cmd = attach_command(&h, "bzk-a1");
-        // Outer double quotes are consumed locally; the inner single quotes
-        // have to reach the remote login shell intact.
-        assert!(cmd.ends_with("\"tmux attach -t '=bzk-a1'\""));
+        // The local shell must pass the inner single quotes through as part of
+        // one remote command argument.
+        assert!(cmd.ends_with(r"'tmux attach -t '\''=bzk-a1'\'''"));
+    }
+
+    #[test]
+    fn an_ssh_target_cannot_inject_a_pane_command() {
+        let h = Host::new(
+            "host".into(),
+            Some("server; touch /tmp/bizik-injected".into()),
+        );
+        let cmd = attach_command(&h, "bzk-a1");
+        assert!(
+            cmd.contains("-t -- 'server; touch /tmp/bizik-injected'"),
+            "the target must remain one positional argument: {cmd}"
+        );
     }
 
     #[test]

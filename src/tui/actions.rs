@@ -225,7 +225,7 @@ mod tests {
         let host = Host::new("back".into(), Some("root@h".into()));
         // The real pane command, so the test breaks if its shape changes.
         let cmd = crate::remote::attach_command(&host, &s.tmux_name());
-        let candidates = [("back".to_string(), s.clone())];
+        let candidates = [("back".to_string(), s)];
         let hit = candidates
             .iter()
             .find(|(_, c)| cmd.contains(&c.tmux_name()));

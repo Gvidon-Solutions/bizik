@@ -209,7 +209,7 @@ fn parse_transcript(path: &std::path::Path, mtime: u64, size: u64) -> Result<Opt
     // is a background job's stub, not a conversation.
     let Some(cwd) = cwd else { return Ok(None) };
 
-    let mut last_prompt = first_prompt.clone();
+    let mut last_prompt = first_prompt;
     if size > TAIL_BYTES as u64 {
         let tail = read_tail(path, TAIL_BYTES)?;
         for v in parse_lines(&tail, true) {

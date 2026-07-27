@@ -254,7 +254,7 @@ mod tests {
         let mut chats: Vec<Chat> = (0..MAX_CHATS_PER_FOLDER)
             .map(|i| chat("/repo", &format!("c{i}"), 100 + i as u64))
             .collect();
-        chats.extend((0..10).map(|i| chat("/repo/sub", &format!("c{i}"), 100 + i as u64)));
+        chats.extend((0_u64..10).map(|i| chat("/repo/sub", &format!("c{i}"), 100 + i)));
         let mut w = Vec::new();
         let got = select_chats(&folders, chats, &mut w);
         assert_eq!(

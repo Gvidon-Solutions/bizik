@@ -11,12 +11,12 @@
 
 pub mod actions;
 pub mod rows;
+mod state;
 mod ui;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::widgets::ListState;
+use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -27,71 +27,13 @@ use crate::remote::{self, HostProbe};
 use crate::store::LocalStore;
 use crate::tmux;
 use rows::Row;
+pub use state::{Confirm, InputKind, Overlay, Screen, ToastKind};
+use state::{Intent, State};
 
 /// How often hosts are re-probed. Short enough that a status change is noticed
 /// while you are looking at it, long enough not to hammer six ssh connections.
 const REFRESH_EVERY: Duration = Duration::from_secs(4);
 const TOAST_FOR: Duration = Duration::from_secs(6);
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Screen {
-    Folders,
-    Folder {
-        host: String,
-        folder: Uuid,
-        name: String,
-    },
-    Running,
-    Layouts,
-    Hosts,
-}
-
-impl Screen {
-    fn title(&self) -> String {
-        match self {
-            Screen::Folders => "folders".into(),
-            Screen::Folder { name, .. } => name.clone(),
-            Screen::Running => "running".into(),
-            Screen::Layouts => "layouts".into(),
-            Screen::Hosts => "hosts".into(),
-        }
-    }
-
-    /// Screens reachable with Tab. A folder's detail is not among them: it is
-    /// reached by opening a folder and left with Esc.
-    const TABS: [Screen; 4] = [
-        Screen::Folders,
-        Screen::Running,
-        Screen::Layouts,
-        Screen::Hosts,
-    ];
-
-    fn tab_index(&self) -> Option<usize> {
-        Self::TABS.iter().position(|t| t == self)
-    }
-}
-
-pub enum Overlay {
-    Help,
-    Confirm {
-        prompt: String,
-        action: Confirm,
-    },
-    Input {
-        prompt: String,
-        value: String,
-        kind: InputKind,
-    },
-}
-
-pub enum Confirm {
-    CloseViewer,
-    Stop { host: String, session: Uuid },
-    Forget { host: String, session: Uuid },
-    Unmark { host: String, path: String },
-    DeleteLayout { id: Uuid },
-    RestoreLayout { id: Uuid, close: Vec<String> },
-}
 
 /// A finished round of session starts, handed back from the worker thread.
 struct LaunchBatch {
@@ -103,31 +45,10 @@ struct LaunchBatch {
     results: Vec<(Host, Result<crate::hostops::SpawnResult, String>)>,
 }
 
-pub enum InputKind {
-    SaveLayout,
-    Relabel { host: String, path: String },
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum ToastKind {
-    Info,
-    Error,
-}
-
-pub struct App {
-    pub local: LocalStore,
-    pub probes: Vec<HostProbe>,
-    pub stack: Vec<Screen>,
-    pub overlay: Option<Overlay>,
-    pub list: ListState,
-    pub rows: Vec<Row>,
-    pub filter: String,
-    pub filtering: bool,
-    pub selected: HashSet<(String, Uuid)>,
-    pub toast: Option<(String, ToastKind, Instant)>,
-    pub refreshing: bool,
-    /// Sessions currently being started on a worker thread.
-    pub starting: usize,
+struct App {
+    local: LocalStore,
+    probes: Vec<HostProbe>,
+    state: State,
     last_refresh: Instant,
     quit: bool,
     tx: Sender<Vec<HostProbe>>,
@@ -153,20 +74,12 @@ impl App {
         }
         let (tx, rx) = channel();
         let (launch_tx, launch_rx) = channel();
+        let now = Instant::now();
         Ok(Self {
             local,
             probes: Vec::new(),
-            stack: vec![Screen::Folders],
-            overlay: None,
-            list: ListState::default(),
-            rows: Vec::new(),
-            filter: String::new(),
-            filtering: false,
-            selected: HashSet::new(),
-            toast: None,
-            refreshing: false,
-            starting: 0,
-            last_refresh: Instant::now() - REFRESH_EVERY,
+            state: State::default(),
+            last_refresh: now.checked_sub(REFRESH_EVERY).unwrap_or(now),
             quit: false,
             tx,
             rx,
@@ -189,7 +102,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn screen(&self) -> &Screen {
-        self.stack.last().expect("the stack always has a root")
+        self.state.screen()
     }
 
     pub fn hosts(&self) -> Vec<Host> {
@@ -227,26 +140,30 @@ impl App {
             Screen::Hosts => rows::hosts_screen(&hosts, &self.probes),
         };
 
-        if !self.filter.is_empty() {
-            rows = fuzzy_filter(rows, &self.filter);
+        if !self.state.filter.is_empty() {
+            rows = fuzzy_filter(rows, &self.state.filter);
             if rows.is_empty() {
-                rows.push(Row::Note(format!("nothing matches “{}”", self.filter)));
+                rows.push(Row::Note(format!(
+                    "nothing matches “{}”",
+                    self.state.filter
+                )));
             }
         }
-        self.rows = rows;
+        self.state.rows = rows;
 
         // Keep the cursor on something actionable.
         let selectable: Vec<usize> = self
+            .state
             .rows
             .iter()
             .enumerate()
             .filter(|(_, r)| r.selectable())
             .map(|(i, _)| i)
             .collect();
-        match self.list.selected() {
-            _ if selectable.is_empty() => self.list.select(None),
+        match self.state.list.selected() {
+            _ if selectable.is_empty() => self.state.list.select(None),
             Some(i) if selectable.contains(&i) => {}
-            _ => self.list.select(selectable.first().copied()),
+            _ => self.state.list.select(selectable.first().copied()),
         }
     }
 
@@ -260,7 +177,7 @@ impl App {
 
         while let Ok(probes) = self.rx.try_recv() {
             self.probes = probes;
-            self.refreshing = false;
+            self.state.refreshing = false;
             self.last_refresh = Instant::now();
         }
 
@@ -270,26 +187,26 @@ impl App {
 
         // Polling every host every few seconds for a dashboard nobody is
         // looking at is pure waste, on this machine and on theirs.
-        if !self.refreshing
+        if !self.state.refreshing
             && self.last_refresh.elapsed() >= REFRESH_EVERY
             && tmux::current_session_attached()
         {
             self.kick_refresh();
         }
 
-        if let Some((_, _, at)) = &self.toast
+        if let Some((_, _, at)) = &self.state.toast
             && at.elapsed() > TOAST_FOR
         {
-            self.toast = None;
+            self.state.toast = None;
         }
         Ok(())
     }
 
     fn kick_refresh(&mut self) {
-        if self.refreshing {
+        if self.state.refreshing {
             return;
         }
-        self.refreshing = true;
+        self.state.refreshing = true;
         self.last_refresh = Instant::now();
         let hosts = self.hosts();
         let tx = self.tx.clone();
@@ -300,15 +217,15 @@ impl App {
     }
 
     pub fn info(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), ToastKind::Info, Instant::now()));
+        self.state.info(msg);
     }
 
     pub fn error(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), ToastKind::Error, Instant::now()));
+        self.state.error(msg);
     }
 
     fn current(&self) -> Option<Row> {
-        self.list.selected().and_then(|i| self.rows.get(i).cloned())
+        self.state.current()
     }
 
     // -----------------------------------------------------------------------
@@ -316,143 +233,25 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn on_key(&mut self, key: KeyEvent) {
-        if self.overlay.is_some() {
-            self.on_overlay_key(key);
+        let Some(intent) = self.state.reduce_key(key) else {
             return;
-        }
-        if self.filtering {
-            self.on_filter_key(key);
-            return;
-        }
-
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            // Esc is the single way back, at every depth.
-            KeyCode::Esc => self.go_back(),
-            KeyCode::Char('q') => self.detach(),
-            KeyCode::Char('c') if ctrl => self.detach(),
-            KeyCode::Char('Q') => {
-                self.overlay = Some(Overlay::Confirm {
-                    prompt:
-                        "close the panes and this dashboard? sessions keep running on their hosts"
-                            .into(),
-                    action: Confirm::CloseViewer,
-                })
-            }
-            KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
-            KeyCode::Char('r') => self.kick_refresh(),
-            KeyCode::Char('/') => self.filtering = true,
-
-            KeyCode::Tab => self.cycle_tab(1),
-            KeyCode::BackTab => self.cycle_tab(-1),
-
-            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-            KeyCode::PageDown => self.move_cursor(10),
-            KeyCode::PageUp => self.move_cursor(-10),
-            KeyCode::Home | KeyCode::Char('g') => self.jump(true),
-            KeyCode::End | KeyCode::Char('G') => self.jump(false),
-
-            KeyCode::Char(' ') => self.toggle_selection(),
-            KeyCode::Enter => self.activate(false),
-            KeyCode::Char('b') => self.activate(true),
-            KeyCode::Char('w') => match actions::focus_work() {
-                Ok(()) => {}
-                Err(e) => self.error(format!("{e:#}")),
-            },
-            KeyCode::Char('S') => {
-                self.overlay = Some(Overlay::Input {
-                    prompt: "name for this layout".into(),
-                    value: String::new(),
-                    kind: InputKind::SaveLayout,
-                })
-            }
-            KeyCode::Char('e') => self.begin_relabel(),
-            KeyCode::Char('x') => self.ask_stop(),
-            KeyCode::Char('d') => self.ask_delete(),
-            KeyCode::Char('i') => self.install_host(),
-            _ => {}
-        }
-    }
-
-    fn on_filter_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Leaving the filter must not also leave the screen — one Esc, one
-            // step back.
-            KeyCode::Esc => {
-                self.filter.clear();
-                self.filtering = false;
-            }
-            KeyCode::Enter => self.filtering = false,
-            KeyCode::Backspace => {
-                self.filter.pop();
-            }
-            KeyCode::Char(c) => self.filter.push(c),
-            KeyCode::Down => self.move_cursor(1),
-            KeyCode::Up => self.move_cursor(-1),
-            _ => {}
-        }
-    }
-
-    fn on_overlay_key(&mut self, key: KeyEvent) {
-        match self.overlay.take() {
-            Some(Overlay::Help) => {
-                // Any key closes help; the same key that opened it also toggles.
-                let _ = key;
-            }
-            Some(Overlay::Confirm { prompt, action }) => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.run_confirmed(action),
-                KeyCode::Esc | KeyCode::Char('n') => {}
-                _ => self.overlay = Some(Overlay::Confirm { prompt, action }),
-            },
-            Some(Overlay::Input {
-                prompt,
-                mut value,
-                kind,
-            }) => match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => self.run_input(kind, value.trim().to_string()),
-                KeyCode::Backspace => {
-                    value.pop();
-                    self.overlay = Some(Overlay::Input {
-                        prompt,
-                        value,
-                        kind,
-                    });
+        };
+        match intent {
+            Intent::Activate { background } => self.activate(background),
+            Intent::AskDelete => self.ask_delete(),
+            Intent::AskStop => self.ask_stop(),
+            Intent::BeginRelabel => self.begin_relabel(),
+            Intent::Detach => self.detach(),
+            Intent::FocusWork => {
+                if let Err(error) = actions::focus_work() {
+                    self.error(format!("{error:#}"));
                 }
-                KeyCode::Char(c) => {
-                    value.push(c);
-                    self.overlay = Some(Overlay::Input {
-                        prompt,
-                        value,
-                        kind,
-                    });
-                }
-                _ => {
-                    self.overlay = Some(Overlay::Input {
-                        prompt,
-                        value,
-                        kind,
-                    })
-                }
-            },
-            None => {}
+            }
+            Intent::InstallHost => self.install_host(),
+            Intent::Refresh => self.kick_refresh(),
+            Intent::RunConfirmed(action) => self.run_confirmed(action),
+            Intent::RunInput(kind, value) => self.run_input(kind, value),
         }
-    }
-
-    fn go_back(&mut self) {
-        if self.filtering || !self.filter.is_empty() {
-            self.filter.clear();
-            self.filtering = false;
-            return;
-        }
-        if self.stack.len() > 1 {
-            self.stack.pop();
-            self.list.select(None);
-            self.filter.clear();
-            return;
-        }
-        self.detach();
     }
 
     /// Hand the terminal back, leaving everything running.
@@ -468,58 +267,6 @@ impl App {
         }
     }
 
-    fn cycle_tab(&mut self, delta: isize) {
-        let current = self.screen().tab_index().unwrap_or(0);
-        let len = Screen::TABS.len() as isize;
-        let next = ((current as isize + delta) % len + len) % len;
-        self.stack = vec![Screen::TABS[next as usize].clone()];
-        self.list.select(None);
-        self.filter.clear();
-    }
-
-    fn move_cursor(&mut self, delta: isize) {
-        let selectable: Vec<usize> = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.selectable())
-            .map(|(i, _)| i)
-            .collect();
-        if selectable.is_empty() {
-            return;
-        }
-        let at = self
-            .list
-            .selected()
-            .and_then(|s| selectable.iter().position(|i| *i == s))
-            .unwrap_or(0) as isize;
-        let next = (at + delta).clamp(0, selectable.len() as isize - 1) as usize;
-        self.list.select(Some(selectable[next]));
-    }
-
-    fn jump(&mut self, top: bool) {
-        let mut selectable = self.rows.iter().enumerate().filter(|(_, r)| r.selectable());
-        let target = if top {
-            selectable.next()
-        } else {
-            selectable.next_back()
-        };
-        if let Some((i, _)) = target {
-            self.list.select(Some(i));
-        }
-    }
-
-    fn toggle_selection(&mut self) {
-        let Some(key) = self.current().and_then(|r| r.select_key()) else {
-            self.info("only sessions can be selected");
-            return;
-        };
-        if !self.selected.remove(&key) {
-            self.selected.insert(key);
-        }
-        self.move_cursor(1);
-    }
-
     // -----------------------------------------------------------------------
     // Doing things
     // -----------------------------------------------------------------------
@@ -529,7 +276,7 @@ impl App {
     /// With sessions selected, this acts on the selection rather than the row
     /// under the cursor — which is how several panes get opened in one go.
     fn activate(&mut self, background: bool) {
-        if !self.selected.is_empty() {
+        if !self.state.selected.is_empty() {
             self.launch_selected(background);
             return;
         }
@@ -541,17 +288,17 @@ impl App {
                     self.info("open the folder to choose what to start");
                 } else {
                     let name = folder.display_name();
-                    self.stack.push(Screen::Folder {
+                    self.state.stack.push(Screen::Folder {
                         host,
                         folder: folder.id,
                         name,
                     });
-                    self.list.select(None);
+                    self.state.list.select(None);
                     // A filter belongs to the list it was typed into. Carried
                     // into a folder it hides that folder's own actions — you
                     // search for "anogem", open it, and the entries for
                     // starting something are gone.
-                    self.filter.clear();
+                    self.state.filter.clear();
                 }
             }
             Row::NewSession {
@@ -611,7 +358,7 @@ impl App {
         if jobs.is_empty() {
             return;
         }
-        self.starting += jobs.len();
+        self.state.starting += jobs.len();
         let tx = self.launch_tx.clone();
 
         std::thread::spawn(move || {
@@ -646,7 +393,7 @@ impl App {
     /// Open panes for a finished batch. Runs on the drawing thread, where every
     /// call is a local tmux command and therefore fast.
     fn finish_batch(&mut self, batch: LaunchBatch) {
-        self.starting = self.starting.saturating_sub(batch.results.len());
+        self.state.starting = self.state.starting.saturating_sub(batch.results.len());
 
         let mut opened = 0;
         let mut failed = 0;
@@ -729,7 +476,7 @@ impl App {
     }
 
     fn launch_selected(&mut self, background: bool) {
-        let picked: Vec<(String, Uuid)> = self.selected.iter().cloned().collect();
+        let picked: Vec<(String, Uuid)> = self.state.selected.iter().cloned().collect();
         let mut jobs: Vec<(Host, Uuid)> = Vec::new();
         for (host_name, session) in &picked {
             match self.host(host_name) {
@@ -737,7 +484,7 @@ impl App {
                 None => self.error(format!("unknown host {host_name}")),
             }
         }
-        self.selected.clear();
+        self.state.selected.clear();
         self.spawn_batch(jobs, background, None, None);
     }
 
@@ -749,24 +496,7 @@ impl App {
     /// belong are named and closing them is offered as a choice.
     fn restore_layout(&mut self, layout: &Layout) {
         let open = actions::panes_in_work(&self.all_sessions());
-        let wanted: HashSet<(String, Uuid)> = layout
-            .panes
-            .iter()
-            .map(|p| (p.host.clone(), p.session))
-            .collect();
-
-        // Two things have to go: panes the layout knows nothing about, and
-        // second copies of panes it does. Only the first was being counted, so
-        // a window that already held the layout twice over was declared clean
-        // and left at eight panes for four entries.
-        let mut seen: HashSet<(String, Uuid)> = HashSet::new();
-        let mut close: Vec<String> = Vec::new();
-        for p in &open {
-            let key = (p.host.clone(), p.session);
-            if !wanted.contains(&key) || !seen.insert(key) {
-                close.push(p.pane.clone());
-            }
-        }
+        let close = panes_to_close(&open, &layout.panes);
 
         if close.is_empty() {
             // Say what was counted. "It offered to close nothing" and "it never
@@ -777,15 +507,14 @@ impl App {
                     "{} panes open, {} identified, none judged surplus — bzk panes shows why",
                     tmux::find_window(actions::WORK_WINDOW)
                         .and_then(|w| tmux::window_panes(&w).ok())
-                        .map(|p| p.len())
-                        .unwrap_or(0),
+                        .map_or(0, |panes| panes.len()),
                     open.len()
                 ));
             }
             self.do_restore(layout, &[]);
             return;
         }
-        self.overlay = Some(Overlay::Confirm {
+        self.state.overlay = Some(Overlay::Confirm {
             prompt: format!(
                 "“{}” wants the pane window to itself. Close {} pane{} that do not belong to it — duplicates and strangers — and restore its exact arrangement?",
                 layout.name,
@@ -825,7 +554,7 @@ impl App {
     fn begin_relabel(&mut self) {
         match self.current() {
             Some(Row::Folder { host, folder, .. }) => {
-                self.overlay = Some(Overlay::Input {
+                self.state.overlay = Some(Overlay::Input {
                     prompt: format!("new label for {}", folder.path),
                     value: folder.label.clone().unwrap_or_default(),
                     kind: InputKind::Relabel {
@@ -842,7 +571,7 @@ impl App {
         match self.current() {
             Some(Row::Session { host, view }) => {
                 let session = view.session;
-                self.overlay = Some(Overlay::Confirm {
+                self.state.overlay = Some(Overlay::Confirm {
                     prompt: format!(
                         "stop “{}” on {host}? the conversation is kept and can be resumed",
                         session.title
@@ -861,7 +590,7 @@ impl App {
         match self.current() {
             Some(Row::Session { host, view }) => {
                 let session = view.session;
-                self.overlay = Some(Overlay::Confirm {
+                self.state.overlay = Some(Overlay::Confirm {
                     prompt: format!(
                         "forget “{}”? it stops, and bizik drops its record — the agent's own history stays on disk",
                         session.title
@@ -873,7 +602,7 @@ impl App {
                 })
             }
             Some(Row::Folder { host, folder, .. }) => {
-                self.overlay = Some(Overlay::Confirm {
+                self.state.overlay = Some(Overlay::Confirm {
                     prompt: format!(
                         "unmark {}? its sessions are forgotten too — nothing on disk is touched",
                         folder.path
@@ -885,7 +614,7 @@ impl App {
                 })
             }
             Some(Row::LayoutEntry { layout, .. }) => {
-                self.overlay = Some(Overlay::Confirm {
+                self.state.overlay = Some(Overlay::Confirm {
                     prompt: format!("delete layout “{}”?", layout.name),
                     action: Confirm::DeleteLayout { id: layout.id },
                 })
@@ -1017,6 +746,23 @@ impl App {
     }
 }
 
+/// Panes a layout restore must remove: strangers and every duplicate after the
+/// first matching pane. Kept pure so the exact destructive decision is tested
+/// without touching tmux.
+fn panes_to_close(open: &[actions::OpenPane], wanted: &[PaneRef]) -> Vec<String> {
+    let wanted: HashSet<(String, Uuid)> = wanted
+        .iter()
+        .map(|pane| (pane.host.clone(), pane.session))
+        .collect();
+    let mut seen: HashSet<(String, Uuid)> = HashSet::new();
+    open.iter()
+        .filter_map(|pane| {
+            let key = (pane.host.clone(), pane.session);
+            (!wanted.contains(&key) || !seen.insert(key)).then(|| pane.pane.clone())
+        })
+        .collect()
+}
+
 /// Rank rows by a fuzzy match, keeping notes out of the way.
 fn fuzzy_filter(rows: Vec<Row>, needle: &str) -> Vec<Row> {
     use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -1076,69 +822,47 @@ mod tests {
         assert!(got.iter().all(|r| r.selectable()));
     }
 
-    /// The set a layout restore has to clear out of the pane window.
-    ///
-    /// Extracted so the rule can be stated once and checked: exactly one pane
-    /// per layout entry, nothing else.
-    fn to_close(open: &[(String, Uuid, &str)], wanted: &[(String, Uuid)]) -> Vec<String> {
-        let wanted: HashSet<(String, Uuid)> = wanted.iter().cloned().collect();
-        let mut seen: HashSet<(String, Uuid)> = HashSet::new();
-        let mut close = Vec::new();
-        for (host, session, pane) in open {
-            let key = (host.clone(), *session);
-            if !wanted.contains(&key) || !seen.insert(key) {
-                close.push(pane.to_string());
-            }
-        }
-        close
-    }
-
     #[test]
     fn a_restore_closes_strangers_and_second_copies_alike() {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let stranger = Uuid::new_v4();
-        let wanted = vec![("back".to_string(), a), ("back".to_string(), b)];
+        let wanted = vec![
+            PaneRef {
+                host: "back".into(),
+                session: a,
+            },
+            PaneRef {
+                host: "back".into(),
+                session: b,
+            },
+        ];
+        let pane = |host: &str, session, pane: &str| actions::OpenPane {
+            host: host.into(),
+            session,
+            pane: pane.into(),
+        };
 
         // Exactly the shape that left eight panes for four entries: every pane
         // belongs to the layout, so nothing looked out of place.
-        let doubled = to_close(
+        let doubled = panes_to_close(
             &[
-                ("back".into(), a, "%1"),
-                ("back".into(), b, "%2"),
-                ("back".into(), a, "%3"),
-                ("back".into(), b, "%4"),
+                pane("back", a, "%1"),
+                pane("back", b, "%2"),
+                pane("back", a, "%3"),
+                pane("back", b, "%4"),
             ],
             &wanted,
         );
         assert_eq!(doubled, vec!["%3", "%4"], "second copies have to go too");
 
-        let mixed = to_close(
-            &[("back".into(), a, "%1"), ("back".into(), stranger, "%2")],
+        let mixed = panes_to_close(
+            &[pane("back", a, "%1"), pane("back", stranger, "%2")],
             &wanted,
         );
         assert_eq!(mixed, vec!["%2"]);
 
-        let clean = to_close(
-            &[("back".into(), a, "%1"), ("back".into(), b, "%2")],
-            &wanted,
-        );
+        let clean = panes_to_close(&[pane("back", a, "%1"), pane("back", b, "%2")], &wanted);
         assert!(clean.is_empty(), "a window already right is left alone");
-    }
-
-    #[test]
-    fn tab_cycles_forwards_and_wraps() {
-        assert_eq!(Screen::Folders.tab_index(), Some(0));
-        assert_eq!(Screen::Hosts.tab_index(), Some(3));
-        // A folder's detail screen is outside the tab ring by design.
-        assert_eq!(
-            Screen::Folder {
-                host: "h".into(),
-                folder: Uuid::new_v4(),
-                name: "n".into()
-            }
-            .tab_index(),
-            None
-        );
     }
 }

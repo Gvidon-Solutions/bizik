@@ -81,9 +81,10 @@ pub fn capture() -> Result<HostEnv> {
 /// `bzk env capture` must still be able to start agents, just with the older,
 /// guessier behaviour.
 pub fn effective_path() -> String {
-    load()
-        .map(|e| e.path)
-        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+    load().map_or_else(
+        || std::env::var("PATH").unwrap_or_default(),
+        |environment| environment.path,
+    )
 }
 
 /// A `PATH=…` assignment to prefix a launch command with, with `extra` first.

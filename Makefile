@@ -18,7 +18,7 @@ HOSTS   ?=
 -include hosts.mk
 
 .PHONY: help setup build dev install push hooks hosts deploy run doctor \
-        check test lint fmt fmt-check clean uninstall
+        check verify test lint docs audit coverage fmt fmt-check clean uninstall
 
 help:
 	@echo "bizik"
@@ -29,7 +29,8 @@ help:
 	@echo "  make run        open the dashboard"
 	@echo "  make doctor     check the local setup and every host"
 	@echo
-	@echo "  make check      fmt, clippy and tests — everything CI would run"
+	@echo "  make check      fast gate: fmt, clippy and tests"
+	@echo "  make verify     full gate: check, dependency audit and coverage"
 	@echo "  make test       tests only"
 	@echo "  make dev        fast native debug build"
 	@echo
@@ -97,7 +98,9 @@ doctor:
 
 # --- quality --------------------------------------------------------------
 
-check: fmt-check lint test
+check: fmt-check lint docs test
+
+verify: check audit coverage
 
 # Unit tests are pure; the integration tests drive the real binary against a
 # private tmux socket. Every defect that reached a user lived in that seam, so
@@ -106,7 +109,20 @@ test:
 	cargo test
 
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
+
+docs:
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+# cargo-deny checks RustSec advisories, licenses, duplicate dependency versions
+# and untrusted package sources. Install with: cargo install cargo-deny --locked
+audit:
+	cargo deny --locked check
+
+# LLVM source coverage, including the tmux integration suite.
+# Install with: cargo install cargo-llvm-cov --locked
+coverage:
+	cargo llvm-cov --all-features --workspace --fail-under-lines 65
 
 fmt:
 	cargo fmt

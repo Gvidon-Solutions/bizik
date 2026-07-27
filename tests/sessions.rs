@@ -248,3 +248,79 @@ fn a_broken_store_degrades_instead_of_taking_the_host_down() {
     );
     assert!(probe["folders"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn mark_rejects_a_file_without_mutating_the_store() {
+    let s = Sandbox::new("mark-file");
+    let file = s.root.join("not-a-directory");
+    std::fs::write(&file, "content").unwrap();
+
+    let out = s.bzk(&["mark", file.to_str().unwrap()]);
+
+    out.failed();
+    assert!(out.stderr.contains("not a directory"), "{}", out.stderr);
+    assert!(
+        !s.root.join("config/host.json").exists(),
+        "validation must happen before persistence"
+    );
+}
+
+#[test]
+fn local_host_cannot_be_reinterpreted_as_a_remote_host() {
+    let s = Sandbox::new("host-kind");
+    s.bzk(&["host", "ls"]).ok();
+
+    let out = s.bzk(&["host", "add", "local", "remote.example"]);
+
+    out.failed();
+    assert!(out.stderr.contains("cannot change"), "{}", out.stderr);
+    let listed = s.bzk(&["host", "ls"]);
+    listed.ok();
+    assert_eq!(listed.stdout.lines().count(), 1);
+    assert!(listed.stdout.contains("(this machine)"));
+}
+
+#[test]
+fn unmarking_a_folder_stops_what_it_had_running() {
+    // Tombstoning a session without stopping it strands the tmux session:
+    // nothing can attach to it or stop it afterwards, because the record that
+    // named it is gone. `rm-session` already refuses to do that; unmarking a
+    // whole folder tombstones every session in it at once and owed the same
+    // guarantee.
+    let s = Sandbox::new("unmark-stops");
+    let dir = s.dir("project");
+    let folder = s.mark(&dir);
+    let session = s.new_session(&folder, "one");
+    s.spawn(&session).ok();
+    s.eventually("the session to start", || s.tmux_sessions().len() == 1);
+
+    s.bzk_in(&dir, &["unmark"]).ok();
+
+    assert!(
+        s.tmux_sessions().is_empty(),
+        "unmarking must not leave a session nothing can manage: {:?}",
+        s.tmux_sessions()
+    );
+    assert!(
+        s.probe()["orphans"].as_array().unwrap().is_empty(),
+        "and so must not manufacture an orphan"
+    );
+}
+
+#[test]
+fn a_folder_that_no_longer_exists_can_still_be_unmarked() {
+    // The case where unmarking matters most. Requiring the directory to still
+    // be there left the entry unremovable by any means short of editing the
+    // store by hand.
+    let s = Sandbox::new("unmark-gone");
+    let dir = s.dir("doomed");
+    s.mark(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let out = s.bzk(&["unmark", dir.to_str().unwrap()]);
+    out.ok();
+    assert!(
+        s.probe()["folders"].as_array().unwrap().is_empty(),
+        "the entry has to go even though its directory did first"
+    );
+}

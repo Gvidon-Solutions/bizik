@@ -139,8 +139,7 @@ fn tmux_ok(args: &[&str]) -> bool {
     command()
         .args(args)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 pub fn installed() -> bool {
@@ -611,8 +610,7 @@ pub fn detach_current() -> Result<()> {
 /// has on screen.
 pub fn current_session_attached() -> bool {
     tmux(&["display-message", "-p", "#{session_attached}"])
-        .map(|v| v.trim() != "0")
-        .unwrap_or(true)
+        .map_or(true, |value| value.trim() != "0")
 }
 
 pub fn select_window(window: &str) -> Result<()> {

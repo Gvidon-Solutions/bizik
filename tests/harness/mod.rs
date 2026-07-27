@@ -97,8 +97,7 @@ impl Sandbox {
             .args(["-L", &self.socket])
             .args(args)
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|output| output.status.success())
     }
 
     pub fn tmux_sessions(&self) -> Vec<String> {

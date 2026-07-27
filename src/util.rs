@@ -2,22 +2,22 @@
 //! file reads and /proc introspection.
 
 use anyhow::{Context, Result};
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
 /// `$BIZIK_CONFIG_DIR` overrides everything — handy for tests and for running
@@ -27,8 +27,7 @@ pub fn config_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"))
+        .map_or_else(|| home().join(".config"), PathBuf::from)
         .join("bizik")
 }
 
@@ -37,22 +36,64 @@ pub fn cache_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".cache"))
+        .map_or_else(|| home().join(".cache"), PathBuf::from)
         .join("bizik")
 }
 
 /// Write via a temp file + rename so a crash mid-write can never leave a
 /// truncated store behind.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating directory {}", parent.display()))?;
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating directory {}", parent.display()))?;
+
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?
+        .to_string_lossy();
+    // A pid+counter name can collide with a stale file after a crash and pid
+    // reuse. A fresh UUID makes abandoned temp files harmless to later writes.
+    let tmp = parent.join(format!(".{name}.tmp-{}", Uuid::new_v4().simple()));
+
+    let result = (|| {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+
+        // Replacing a file must not unexpectedly change its access policy.
+        if let Ok(metadata) = fs::metadata(path) {
+            file.set_permissions(metadata.permissions())
+                .with_context(|| format!("preserving permissions of {}", path.display()))?;
+        }
+
+        file.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
+        fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+
+        // The rename itself is durable only after its directory entry is
+        // synced. Directory fsync is supported on the Linux targets we ship.
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("syncing directory {}", parent.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
-    Ok(())
+    result
 }
 
 /// Read at most `max` bytes from the start of a file. Session transcripts reach
@@ -72,7 +113,8 @@ pub fn read_tail(path: &Path, max: usize) -> Result<String> {
     let len = f.metadata()?.len();
     let start = len.saturating_sub(max as u64);
     f.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::with_capacity(max.min(len as usize));
+    let file_len = usize::try_from(len).unwrap_or(usize::MAX);
+    let mut buf = Vec::with_capacity(max.min(file_len));
     f.take(max as u64).read_to_end(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
@@ -82,12 +124,13 @@ pub fn mtime_ms(path: &Path) -> u64 {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 pub fn file_size(path: &Path) -> u64 {
-    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +249,17 @@ pub fn shell_quote(s: &str) -> String {
 
 /// Collapse whitespace and clamp to `max` characters, for one-line previews.
 pub fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let safe: String = s
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let flat = safe.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
         return flat;
     }
@@ -240,10 +293,32 @@ mod tests {
     fn one_line_collapses_whitespace_and_clamps_by_character() {
         assert_eq!(one_line("  a\n\tb   c ", 80), "a b c");
         assert_eq!(one_line("методичка", 5), "мето…");
+        assert_eq!(one_line("safe\u{1b}[2Jtext", 80), "safe [2Jtext");
     }
 
     #[test]
     fn shell_quoting_survives_embedded_quotes() {
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("bzk-atomic-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_write(&path, b"new").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_dir_all(dir).ok();
     }
 }
