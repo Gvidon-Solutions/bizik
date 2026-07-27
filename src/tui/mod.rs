@@ -755,26 +755,33 @@ impl App {
             .map(|p| (p.host.clone(), p.session))
             .collect();
 
-        let strangers: Vec<String> = open
-            .iter()
-            .filter(|p| !wanted.contains(&(p.host.clone(), p.session)))
-            .map(|p| p.pane.clone())
-            .collect();
+        // Two things have to go: panes the layout knows nothing about, and
+        // second copies of panes it does. Only the first was being counted, so
+        // a window that already held the layout twice over was declared clean
+        // and left at eight panes for four entries.
+        let mut seen: HashSet<(String, Uuid)> = HashSet::new();
+        let mut close: Vec<String> = Vec::new();
+        for p in &open {
+            let key = (p.host.clone(), p.session);
+            if !wanted.contains(&key) || !seen.insert(key) {
+                close.push(p.pane.clone());
+            }
+        }
 
-        if strangers.is_empty() {
+        if close.is_empty() {
             self.do_restore(layout, &[]);
             return;
         }
         self.overlay = Some(Overlay::Confirm {
             prompt: format!(
-                "“{}” needs the pane window to itself. Close {} other pane{} and restore its exact arrangement?",
+                "“{}” wants the pane window to itself. Close {} pane{} that do not belong to it — duplicates and strangers — and restore its exact arrangement?",
                 layout.name,
-                strangers.len(),
-                if strangers.len() == 1 { "" } else { "s" }
+                close.len(),
+                if close.len() == 1 { "" } else { "s" }
             ),
             action: Confirm::RestoreLayout {
                 id: layout.id,
-                close: strangers,
+                close,
             },
         });
     }
@@ -1054,6 +1061,56 @@ mod tests {
         let rows = vec![Row::Note("some warning".into()), folder_row("app", "h")];
         let got = fuzzy_filter(rows, "app");
         assert!(got.iter().all(|r| r.selectable()));
+    }
+
+    /// The set a layout restore has to clear out of the pane window.
+    ///
+    /// Extracted so the rule can be stated once and checked: exactly one pane
+    /// per layout entry, nothing else.
+    fn to_close(open: &[(String, Uuid, &str)], wanted: &[(String, Uuid)]) -> Vec<String> {
+        let wanted: HashSet<(String, Uuid)> = wanted.iter().cloned().collect();
+        let mut seen: HashSet<(String, Uuid)> = HashSet::new();
+        let mut close = Vec::new();
+        for (host, session, pane) in open {
+            let key = (host.clone(), *session);
+            if !wanted.contains(&key) || !seen.insert(key) {
+                close.push(pane.to_string());
+            }
+        }
+        close
+    }
+
+    #[test]
+    fn a_restore_closes_strangers_and_second_copies_alike() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let stranger = Uuid::new_v4();
+        let wanted = vec![("back".to_string(), a), ("back".to_string(), b)];
+
+        // Exactly the shape that left eight panes for four entries: every pane
+        // belongs to the layout, so nothing looked out of place.
+        let doubled = to_close(
+            &[
+                ("back".into(), a, "%1"),
+                ("back".into(), b, "%2"),
+                ("back".into(), a, "%3"),
+                ("back".into(), b, "%4"),
+            ],
+            &wanted,
+        );
+        assert_eq!(doubled, vec!["%3", "%4"], "second copies have to go too");
+
+        let mixed = to_close(
+            &[("back".into(), a, "%1"), ("back".into(), stranger, "%2")],
+            &wanted,
+        );
+        assert_eq!(mixed, vec!["%2"]);
+
+        let clean = to_close(
+            &[("back".into(), a, "%1"), ("back".into(), b, "%2")],
+            &wanted,
+        );
+        assert!(clean.is_empty(), "a window already right is left alone");
     }
 
     #[test]
