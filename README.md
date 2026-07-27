@@ -164,14 +164,15 @@ Restoring a layout wants the pane window to itself: if panes are open that the
 layout does not know about, it offers to close them and replay the saved
 geometry exactly, rather than silently tiling everything together.
 
-Panes open in a window called `bzk-work`. To get from a pane back to the
-dashboard, use tmux: prefix then `w`, or prefix then `0`.
+Panes open in a window called `bzk-work`, and the dashboard stays in its own
+window — so `S`, `x` and everything else are pressed there, not from inside a
+pane where the agent owns the keyboard.
 
-If you want one key for it, add this to `~/.tmux.conf`:
-
-```tmux
-bind -n F12 select-window -t bzk-dash
-```
+**`F12` gets you back to the dashboard from any pane.** bizik binds it when it
+starts, and the binding is conditional: outside bizik's own tmux session the key
+passes straight through to whatever is running, so nothing else is affected.
+`BIZIK_RETURN_KEY=F9 bzk` picks a different one; tmux prefix then `0` always
+works too.
 
 ### Nesting
 

@@ -643,13 +643,21 @@ impl App {
             let _ = actions::focus_work();
         }
 
+        // The moment panes open is the moment the dashboard goes off screen, so
+        // that is where the way back belongs — not only in the help overlay.
+        let back = if batch.background {
+            String::new()
+        } else {
+            format!(" · {} returns here", tmux::return_key())
+        };
+
         if failed > 0 {
             self.error(format!("{opened} started, {failed} failed"));
         } else if let Some(name) = batch.label {
-            self.info(format!("restored {name}"));
+            self.info(format!("restored {name}{back}"));
         } else {
             self.info(format!(
-                "{opened} session{} {}",
+                "{opened} session{} {}{back}",
                 if opened == 1 { "" } else { "s" },
                 if batch.background { "started" } else { "open" }
             ));

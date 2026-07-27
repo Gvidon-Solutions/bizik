@@ -359,8 +359,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "from a pane back to here: tmux prefix, then w or 0",
-            Style::default().fg(DIM),
+            format!(
+                "from a pane back to here: {}  (or tmux prefix, then 0)",
+                crate::tmux::return_key()
+            ),
+            Style::default().fg(ACCENT),
         )),
         Line::from(Span::styled(
             "any key closes this",

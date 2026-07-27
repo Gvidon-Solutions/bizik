@@ -245,8 +245,54 @@ pub fn split_window(window: &str, cmd: &str) -> Result<String> {
     Ok(out.trim().to_string())
 }
 
+/// The key that jumps back to the dashboard from inside any pane.
+///
+/// A pane is showing another machine's tmux, and the agent inside it owns the
+/// keyboard — so the way back has to be a binding, not a key the dashboard
+/// listens for. `F12` is used by neither Claude Code nor Codex.
+pub fn return_key() -> String {
+    std::env::var("BIZIK_RETURN_KEY").unwrap_or_else(|_| "F12".to_string())
+}
+
+/// Bind the return key on this tmux server.
+///
+/// Bindings are server-wide, and bizik shares the server with whatever else the
+/// user runs — so the binding is conditional: inside bizik's own session it
+/// switches to the dashboard, and everywhere else it passes the key straight
+/// through to the application, as though it were not bound at all. The
+/// condition is a format expression rather than a shell test, so no process is
+/// spawned per keypress.
+pub fn bind_return_key(session: &str, window: &str) -> Result<()> {
+    let key = return_key();
+    tmux(&[
+        "bind-key",
+        "-n",
+        &key,
+        "if-shell",
+        "-F",
+        &format!("#{{==:#{{session_name}},{session}}}"),
+        &format!("select-window -t ={session}:{window}"),
+        &format!("send-keys {key}"),
+    ])
+    .map(|_| ())
+}
+
 pub fn kill_pane(pane: &str) -> Result<()> {
     tmux(&["kill-pane", "-t", pane]).map(|_| ())
+}
+
+/// Name of the session this process is running inside.
+pub fn current_session() -> Option<String> {
+    let out = tmux(&["display-message", "-p", "#{session_name}"]).ok()?;
+    let name = out.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Name of the window this process is running inside.
+pub fn current_window_name() -> Option<String> {
+    let out = tmux(&["display-message", "-p", "#{window_name}"]).ok()?;
+    let name = out.trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 pub fn select_pane(pane: &str) -> Result<()> {

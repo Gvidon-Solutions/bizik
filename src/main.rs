@@ -235,11 +235,22 @@ fn cmd_tui() -> Result<()> {
         bail!("tmux is required — install it with: sudo apt install tmux");
     }
     if tmux::inside_tmux() {
+        // Started inside a session already — bind the way back to wherever the
+        // dashboard actually is, which need not be bizik's own session.
+        if let (Some(session), Some(window)) =
+            (tmux::current_session(), tmux::current_window_name())
+        {
+            let _ = tmux::bind_return_key(&session, &window);
+        }
         return tui::run();
     }
 
     let exe = std::env::current_exe().context("locating own binary")?;
     let dash = format!("{}{} tui", config_env(), exe.display());
+
+    // Re-applied on every launch: bindings live on the tmux server, which may
+    // have restarted since last time.
+    let _ = tmux::bind_return_key(SESSION, DASH_WINDOW);
 
     // Reattaching must always land on a live dashboard. A previous run may have
     // been quit while its panes stayed open, leaving the session alive but with
