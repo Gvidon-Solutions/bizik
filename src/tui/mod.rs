@@ -769,6 +769,19 @@ impl App {
         }
 
         if close.is_empty() {
+            // Say what was counted. "It offered to close nothing" and "it never
+            // looked" are indistinguishable otherwise, and telling them apart
+            // by reasoning about the code wasted an afternoon.
+            if open.len() > layout.panes.len() {
+                self.error(format!(
+                    "{} panes open, {} identified, none judged surplus — bzk panes shows why",
+                    tmux::find_window(actions::WORK_WINDOW)
+                        .and_then(|w| tmux::window_panes(&w).ok())
+                        .map(|p| p.len())
+                        .unwrap_or(0),
+                    open.len()
+                ));
+            }
             self.do_restore(layout, &[]);
             return;
         }
