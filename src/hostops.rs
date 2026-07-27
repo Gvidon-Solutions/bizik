@@ -38,13 +38,40 @@ pub fn create_session(
         .find(|f| f.id == folder_id && f.deleted_at.is_none())
         .with_context(|| format!("no marked folder {folder_id} on this host"))?;
 
-    let title = title.unwrap_or_else(|| format!("{} · {}", kind, folder.display_name()));
+    let base = format!("{} · {}", kind, folder.display_name());
+    let title = title.unwrap_or_else(|| unique_title(&store, folder_id, &base));
     let mut session = Session::new(folder_id, kind, title);
     session.agent_session_id = resume;
 
     store.sessions.push(session.clone());
     store.save()?;
     Ok(session)
+}
+
+/// A generated title that is not already in use in this folder.
+///
+/// Several sessions in one directory is a normal thing to want — one doing the
+/// work, one for questions, a couple of shells. Four rows all reading
+/// "shell · anogem" would make the list useless for the very case it exists to
+/// serve, so generated titles get a number when they would collide. A title the
+/// caller supplied is left exactly as given.
+fn unique_title(store: &HostStore, folder_id: Uuid, base: &str) -> String {
+    let taken: Vec<&str> = store
+        .live_sessions()
+        .iter()
+        .filter(|s| s.folder_id == folder_id)
+        .map(|s| s.title.as_str())
+        .collect();
+
+    if !taken.contains(&base) {
+        return base.to_string();
+    }
+    // Counting is not enough: deleting the second of three must leave the name
+    // free rather than pushing the next one to four.
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|candidate| !taken.contains(&candidate.as_str()))
+        .unwrap_or_else(|| base.to_string())
 }
 
 /// Start a session's detached tmux session, if it is not already up.
@@ -183,6 +210,41 @@ fn is_descendant(pid: u32, root: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_titles_are_numbered_only_when_they_would_collide() {
+        let mut store = HostStore::default();
+        let folder = store.upsert_folder("/repo");
+        let other = store.upsert_folder("/elsewhere");
+
+        assert_eq!(unique_title(&store, folder, "shell · repo"), "shell · repo");
+
+        for expected in ["shell · repo", "shell · repo 2", "shell · repo 3"] {
+            let title = unique_title(&store, folder, "shell · repo");
+            assert_eq!(title, expected);
+            store
+                .sessions
+                .push(Session::new(folder, AgentKind::Shell, title));
+        }
+
+        // A different folder starts over — the name is only crowded here.
+        assert_eq!(unique_title(&store, other, "shell · repo"), "shell · repo");
+    }
+
+    #[test]
+    fn a_freed_number_is_reused_rather_than_skipped() {
+        let mut store = HostStore::default();
+        let folder = store.upsert_folder("/repo");
+        for title in ["s", "s 2", "s 3"] {
+            store
+                .sessions
+                .push(Session::new(folder, AgentKind::Shell, title.into()));
+        }
+        let middle = store.sessions[1].id;
+        store.remove_session(middle);
+
+        assert_eq!(unique_title(&store, folder, "s"), "s 2");
+    }
 
     #[test]
     fn a_process_is_its_own_descendant() {

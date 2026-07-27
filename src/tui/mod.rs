@@ -430,6 +430,7 @@ impl App {
         if self.stack.len() > 1 {
             self.stack.pop();
             self.list.select(None);
+            self.filter.clear();
             return;
         }
         self.quit = true;
@@ -514,6 +515,11 @@ impl App {
                         name,
                     });
                     self.list.select(None);
+                    // A filter belongs to the list it was typed into. Carried
+                    // into a folder it hides that folder's own actions — you
+                    // search for "anogem", open it, and the entries for
+                    // starting something are gone.
+                    self.filter.clear();
                 }
             }
             Row::NewSession {

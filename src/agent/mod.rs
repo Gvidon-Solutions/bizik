@@ -63,18 +63,35 @@ pub trait Agent {
     }
 }
 
-/// How an agent should be named in a command: by absolute path when we know it.
+/// How to invoke an agent: its absolute path, with its own directory put on
+/// `PATH` first.
 ///
 /// Relying on `$PATH` is not safe even inside a login shell. Node tools are
 /// routinely installed under nvm, whose directory is added by an *interactive*
 /// shell's rc file — so `sh -lc codex` fails on a machine where codex is
-/// plainly installed. Resolving the path here, on the host that will run it,
-/// removes the guesswork entirely.
+/// plainly installed.
+///
+/// The absolute path alone is still not enough. These tools start with
+/// `#!/usr/bin/env node`, and the interpreter lives in the same directory as
+/// the tool — so without it on `PATH` the kernel finds the script, `env` fails
+/// to find node, and the session dies instantly with status 127. Prepending the
+/// binary's own directory fixes that for any tool installed alongside its
+/// runtime, which is most of them.
 pub fn program(agent: &dyn Agent, fallback: &str) -> String {
-    agent
-        .binary()
-        .map(|p| crate::util::shell_quote(&p.to_string_lossy()))
-        .unwrap_or_else(|| fallback.to_string())
+    let Some(path) = agent.binary() else {
+        return fallback.to_string();
+    };
+    let quoted = crate::util::shell_quote(&path.to_string_lossy());
+    match path.parent() {
+        // Assignment right-hand sides are not field-split, so an unquoted
+        // `$PATH` here is safe.
+        Some(dir) => format!(
+            "PATH={}:$PATH {}",
+            crate::util::shell_quote(&dir.to_string_lossy()),
+            quoted
+        ),
+        None => quoted,
+    }
 }
 
 pub fn all() -> Vec<Box<dyn Agent>> {
@@ -318,17 +335,52 @@ mod tests {
     }
 
     #[test]
-    fn a_resolved_agent_is_launched_by_absolute_path() {
-        // `$PATH` is not to be trusted here: nvm-installed tools are missing
-        // from a login shell's environment even when plainly installed.
+    fn a_resolved_agent_is_launched_by_path_with_its_own_directory_first() {
+        // Two separate failures are being avoided: a login shell that cannot
+        // find the tool, and one that finds it but not the interpreter its
+        // shebang names — which exits 127 the moment the session starts.
         let claude = claude::ClaudeAgent;
         let cmd = claude.launch_cmd(None);
-        if let Some(path) = claude.binary() {
-            assert!(cmd.contains(&path.to_string_lossy().into_owned()));
-            assert!(cmd.starts_with('\''), "the path must be quoted");
-        } else {
-            assert_eq!(cmd, "claude", "fall back to the bare name when unresolved");
+        match claude.binary() {
+            Some(path) => {
+                assert!(cmd.contains(&path.to_string_lossy().into_owned()));
+                assert!(cmd.starts_with("PATH="), "got: {cmd}");
+                assert!(cmd.contains(":$PATH "), "the existing PATH must be kept");
+                let dir = path.parent().unwrap().to_string_lossy().into_owned();
+                assert!(cmd.contains(&dir), "the tool's own directory comes first");
+            }
+            None => assert_eq!(cmd, "claude", "fall back to the bare name when unresolved"),
         }
+    }
+
+    #[test]
+    fn an_unresolvable_agent_falls_back_without_a_path_prefix() {
+        struct Missing;
+        impl Agent for Missing {
+            fn kind(&self) -> AgentKind {
+                AgentKind::Codex
+            }
+            fn caps(&self) -> Caps {
+                Caps {
+                    titles: false,
+                    live_status: false,
+                    resume: true,
+                }
+            }
+            fn binary(&self) -> Option<std::path::PathBuf> {
+                None
+            }
+            fn scan_chats(&self, _: &mut ChatIndex, _: &mut Vec<String>) -> Vec<Chat> {
+                Vec::new()
+            }
+            fn live(&self) -> Vec<crate::model::LiveAgent> {
+                Vec::new()
+            }
+            fn launch_cmd(&self, _: Option<&str>) -> String {
+                program(self, "codex")
+            }
+        }
+        assert_eq!(Missing.launch_cmd(None), "codex");
     }
 
     #[test]
