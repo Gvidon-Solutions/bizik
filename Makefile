@@ -5,7 +5,7 @@
 #
 # Servers are not hardcoded here. Put yours in an untracked `hosts.mk`:
 #
-#     HOSTS = back=168.119.201.8 front=example.com
+#     HOSTS = back=203.0.113.10 front=example.com
 #
 # and `make setup` becomes one command. Without it, pass HOSTS on the
 # command line, or register hosts once with `bzk host add`.

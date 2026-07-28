@@ -48,7 +48,7 @@ Needs Rust, tmux, and ssh.
 Write your servers into an untracked `hosts.mk`:
 
 ```make
-HOSTS = back=168.119.201.8 front=example.com
+HOSTS = back=203.0.113.10 front=example.com
 ```
 
 Then:
@@ -72,7 +72,7 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 install -m755 target/x86_64-unknown-linux-musl/release/bzk ~/.local/bin/bzk
 
-bzk host add back  168.119.201.8
+bzk host add back  203.0.113.10
 bzk host add front example.com
 bzk install                 # scp's this binary to every host
 bzk hooks install back front
