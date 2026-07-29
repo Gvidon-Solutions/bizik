@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -24,8 +25,65 @@ use crate::util::{
 
 pub struct CodexAgent;
 
+const DEFAULT_THEME: &str = "catppuccin-latte";
+
 fn sessions_root() -> PathBuf {
     home().join(".codex/sessions")
+}
+
+/// Codex chooses a syntax-highlighting theme when its TUI starts. A bizik agent
+/// starts in a detached tmux session, before any terminal is attached, so the
+/// terminal background query has nobody to answer it and Codex falls back to a
+/// dark code/diff palette even when the eventual viewer is light.
+///
+/// Respect an explicit Codex theme. Otherwise provide the light counterpart to
+/// bizik's own fixed light workspace. The environment knob is useful for
+/// one-off launches and `inherit` restores Codex's automatic choice.
+fn launch_theme() -> Option<String> {
+    let requested = std::env::var("BIZIK_CODEX_THEME").ok();
+    choose_theme(config_has_theme(), requested.as_deref())
+}
+
+fn choose_theme(configured: bool, requested: Option<&str>) -> Option<String> {
+    match requested.map(str::trim) {
+        Some("inherit" | "off") => None,
+        Some(theme) if valid_theme_name(theme) => Some(theme.to_string()),
+        Some(_) => Some(DEFAULT_THEME.to_string()),
+        None if configured => None,
+        None => Some(DEFAULT_THEME.to_string()),
+    }
+}
+
+fn valid_theme_name(theme: &str) -> bool {
+    !theme.is_empty()
+        && theme
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn config_has_theme() -> bool {
+    let codex_home =
+        std::env::var_os("CODEX_HOME").map_or_else(|| home().join(".codex"), PathBuf::from);
+    fs::read_to_string(codex_home.join("config.toml")).is_ok_and(|raw| config_text_has_theme(&raw))
+}
+
+fn config_text_has_theme(raw: &str) -> bool {
+    let mut in_tui = false;
+    for raw_line in raw.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_tui = line[1..line.len() - 1].trim() == "tui";
+            continue;
+        }
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(['\'', '"']);
+        if key == "tui.theme" || (in_tui && key == "theme") {
+            return true;
+        }
+    }
+    false
 }
 
 impl Agent for CodexAgent {
@@ -94,7 +152,12 @@ impl Agent for CodexAgent {
 
     fn launch_cmd(&self, resume: Option<&str>) -> String {
         let bin = super::program(self, "codex");
-        let bin = format!("{bin} --dangerously-bypass-approvals-and-sandbox");
+        let mut bin = format!("{bin} --dangerously-bypass-approvals-and-sandbox");
+        if let Some(theme) = launch_theme() {
+            let setting = format!("tui.theme=\"{theme}\"");
+            bin.push_str(" -c ");
+            bin.push_str(&crate::util::shell_quote(&setting));
+        }
         match resume {
             Some(id) => format!("{bin} resume {}", crate::util::shell_quote(id)),
             None => bin,
@@ -261,6 +324,47 @@ mod tests {
         let resumed = agent.launch_cmd(Some("thread id"));
 
         assert!(fresh.contains(" --dangerously-bypass-approvals-and-sandbox"));
-        assert!(resumed.contains(" --dangerously-bypass-approvals-and-sandbox resume 'thread id'"));
+        assert!(resumed.contains(" resume 'thread id'"));
+    }
+
+    #[test]
+    fn detached_launch_defaults_to_a_light_syntax_theme() {
+        assert_eq!(
+            choose_theme(false, None).as_deref(),
+            Some("catppuccin-latte")
+        );
+    }
+
+    #[test]
+    fn an_explicit_codex_theme_is_not_overridden() {
+        assert_eq!(choose_theme(true, None), None);
+        assert_eq!(choose_theme(false, Some("inherit")), None);
+        assert_eq!(
+            choose_theme(true, Some("solarized-light")).as_deref(),
+            Some("solarized-light")
+        );
+    }
+
+    #[test]
+    fn only_safe_kebab_case_theme_names_reach_the_shell() {
+        assert!(valid_theme_name("base16-ocean-light"));
+        assert!(!valid_theme_name("theme'; touch /tmp/nope"));
+        assert_eq!(
+            choose_theme(false, Some("theme'; touch /tmp/nope")).as_deref(),
+            Some(DEFAULT_THEME)
+        );
+    }
+
+    #[test]
+    fn codex_theme_is_found_in_both_supported_config_forms() {
+        assert!(config_text_has_theme(
+            "[tui]\nanimations = true\ntheme = \"catppuccin-latte\"\n"
+        ));
+        assert!(config_text_has_theme(
+            "model = \"gpt-5\"\ntui.theme = \"catppuccin-latte\"\n"
+        ));
+        assert!(!config_text_has_theme(
+            "[tui]\nanimations = true\n\n[projects.\"/tmp/theme\"]\ntrust_level = \"trusted\"\n"
+        ));
     }
 }
