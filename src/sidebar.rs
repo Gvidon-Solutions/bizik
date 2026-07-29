@@ -104,6 +104,7 @@ impl TreeRow {
 
 struct LaunchResult {
     host: Host,
+    focus_sidebar: bool,
     result: Result<SpawnResult, String>,
 }
 
@@ -353,17 +354,26 @@ impl Sidebar {
                 self.starting = false;
                 match launch.result {
                     Ok(spawned) => {
-                        match actions::open_pane(
+                        let opened = actions::open_pane(
                             &launch.host,
                             spawned.session.id,
                             &spawned.tmux_name,
-                        ) {
+                        );
+                        if launch.focus_sidebar {
+                            self.focus_sidebar();
+                        }
+                        match opened {
                             Ok(_) => self.set_message("switched", false),
                             Err(error) => self.set_message(format!("{error:#}"), true),
                         }
                         self.kick_refresh();
                     }
-                    Err(error) => self.set_message(error, true),
+                    Err(error) => {
+                        if launch.focus_sidebar {
+                            self.focus_sidebar();
+                        }
+                        self.set_message(error, true);
+                    }
                 }
             }
 
@@ -381,6 +391,7 @@ impl Sidebar {
 
             while let Ok(mutation) = self.mutation_rx.try_recv() {
                 self.mutating = false;
+                let mut focus_sidebar = true;
                 match mutation.result {
                     Ok(()) => {
                         let was_delete = matches!(&mutation.mutation, Mutation::Delete { .. });
@@ -406,7 +417,7 @@ impl Sidebar {
                                     _ => None,
                                 })
                         {
-                            self.open_named(&host, session);
+                            focus_sidebar = !self.open_named_with_focus(&host, session, true);
                         }
                         self.set_message(
                             if was_delete {
@@ -419,6 +430,9 @@ impl Sidebar {
                         self.kick_refresh();
                     }
                     Err(error) => self.set_message(error, true),
+                }
+                if focus_sidebar {
+                    self.focus_sidebar();
                 }
             }
 
@@ -804,20 +818,44 @@ impl Sidebar {
     }
 
     fn open_named(&mut self, host_name: &str, session: Uuid) {
+        self.open_named_with_focus(host_name, session, false);
+    }
+
+    fn open_named_with_focus(
+        &mut self,
+        host_name: &str,
+        session: Uuid,
+        focus_sidebar: bool,
+    ) -> bool {
         let Some(host) = self.local.host_by_name(host_name).cloned() else {
             self.set_message(format!("unknown host {host_name}"), true);
-            return;
+            return false;
         };
-        self.open(host, session);
+        self.open_with_focus(host, session, focus_sidebar);
+        true
     }
 
     fn open(&mut self, host: Host, session: Uuid) {
+        self.open_with_focus(host, session, false);
+    }
+
+    fn open_with_focus(&mut self, host: Host, session: Uuid, focus_sidebar: bool) {
         self.starting = true;
         let tx = self.launch_tx.clone();
         std::thread::spawn(move || {
             let result = actions::start(&host, session).map_err(|error| format!("{error:#}"));
-            let _ = tx.send(LaunchResult { host, result });
+            let _ = tx.send(LaunchResult {
+                host,
+                focus_sidebar,
+                result,
+            });
         });
+    }
+
+    fn focus_sidebar(&mut self) {
+        if actions::focus_sidebar().is_ok() {
+            self.focused = true;
+        }
     }
 
     fn handle_agent_picker(&mut self, event: Event) {
