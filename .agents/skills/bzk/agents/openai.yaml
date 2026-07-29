@@ -1,0 +1,4 @@
+interface:
+  display_name: "BZK Operator"
+  short_description: "Manage bizik projects, hosts, sessions, and keys"
+  default_prompt: "Use $bzk to create and launch a project on my SSH host, then keep me updated."
