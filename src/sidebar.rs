@@ -7,8 +7,8 @@
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEventKind, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout};
@@ -40,6 +40,7 @@ const DASH_WINDOW: &str = "bzk-dash";
 const BG: Color = Color::Rgb(239, 241, 245);
 const SURFACE: Color = Color::Rgb(230, 233, 239);
 const SELECTED: Color = Color::Rgb(220, 224, 232);
+const FOCUSED_SELECTED: Color = Color::Rgb(216, 204, 255);
 const FG: Color = Color::Rgb(76, 79, 105);
 const DIM: Color = Color::Rgb(140, 143, 161);
 const ACCENT: Color = Color::Rgb(136, 57, 239);
@@ -135,14 +136,14 @@ enum SessionOverlay {
         target: ProjectTarget,
         value: String,
     },
-    ConfirmClose {
+    ConfirmDelete {
         target: SessionTarget,
     },
 }
 
 enum Mutation {
     Rename,
-    Close { was_active: bool },
+    Delete { was_active: bool },
 }
 
 struct MutationResult {
@@ -169,6 +170,7 @@ struct Sidebar {
     rows: Vec<TreeRow>,
     list: ListState,
     active: Option<(String, Uuid)>,
+    focused: bool,
     collapsed: HashSet<(String, Uuid)>,
     agent_picker: Option<AgentPicker>,
     session_overlay: Option<SessionOverlay>,
@@ -192,11 +194,11 @@ struct Sidebar {
 
 pub fn run() -> Result<()> {
     let mut sidebar = Sidebar::new()?;
-    execute!(stdout(), EnableMouseCapture)?;
+    execute!(stdout(), EnableMouseCapture, EnableFocusChange)?;
     let mut terminal = ratatui::init();
     let result = sidebar.main_loop(&mut terminal);
     ratatui::restore();
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(stdout(), DisableFocusChange, DisableMouseCapture);
     result
 }
 
@@ -218,6 +220,7 @@ impl Sidebar {
             rows: vec![TreeRow::Note("loading…".into())],
             list: ListState::default(),
             active: actions::active_session(),
+            focused: tmux::current_pane_active(),
             collapsed: HashSet::new(),
             agent_picker: None,
             session_overlay: None,
@@ -249,6 +252,17 @@ impl Sidebar {
 
             if event::poll(Duration::from_millis(150))? {
                 let event = event::read()?;
+                match event {
+                    Event::FocusGained => {
+                        self.focused = true;
+                        continue;
+                    }
+                    Event::FocusLost => {
+                        self.focused = false;
+                        continue;
+                    }
+                    _ => {}
+                }
                 if self.session_overlay.is_some() {
                     self.handle_session_overlay(event);
                 } else if self.agent_picker.is_some() {
@@ -265,6 +279,7 @@ impl Sidebar {
                             KeyCode::Enter => self.open_selected(),
                             KeyCode::Char('n' | 'т') => self.begin_new_session(),
                             KeyCode::Char('e' | 'у') => self.begin_rename(),
+                            KeyCode::Char('d' | 'в') => self.begin_delete(),
                             KeyCode::Char('r' | 'к') => self.kick_refresh(),
                             KeyCode::Char('q' | 'й') | KeyCode::Esc => {
                                 if let Some(window) = tmux::find_window(DASH_WINDOW) {
@@ -342,10 +357,10 @@ impl Sidebar {
                 self.mutating = false;
                 match mutation.result {
                     Ok(()) => {
-                        let was_close = matches!(&mutation.mutation, Mutation::Close { .. });
-                        let replace_closed = match mutation.mutation {
+                        let was_delete = matches!(&mutation.mutation, Mutation::Delete { .. });
+                        let replace_deleted = match mutation.mutation {
                             Mutation::Rename => false,
-                            Mutation::Close { was_active } => {
+                            Mutation::Delete { was_active } => {
                                 was_active
                                     || self.active.as_ref().is_some_and(|active| {
                                         active.0 == mutation.target.host
@@ -353,7 +368,7 @@ impl Sidebar {
                                     })
                             }
                         };
-                        if replace_closed
+                        if replace_deleted
                             && let Some((host, session)) =
                                 self.rows.iter().find_map(|row| match row {
                                     TreeRow::Session { host, id, .. }
@@ -368,8 +383,8 @@ impl Sidebar {
                             self.open_named(&host, session);
                         }
                         self.set_message(
-                            if was_close {
-                                format!("closed {}", mutation.target.title)
+                            if was_delete {
+                                format!("deleted {}", mutation.target.title)
                             } else {
                                 "session renamed".to_string()
                             },
@@ -555,6 +570,32 @@ impl Sidebar {
             }),
             _ => {
                 self.set_message("select a project or session to rename", true);
+                None
+            }
+        };
+    }
+
+    /// Delete the selected bizik session record after confirmation. The
+    /// agent's conversation remains in its own transcript store.
+    fn begin_delete(&mut self) {
+        if self.mutating {
+            return;
+        }
+        let Some(index) = self.list.selected() else {
+            return;
+        };
+        self.session_overlay = match self.rows.get(index) {
+            Some(TreeRow::Session {
+                host, id, title, ..
+            }) => Some(SessionOverlay::ConfirmDelete {
+                target: SessionTarget {
+                    host: host.clone(),
+                    id: *id,
+                    title: title.clone(),
+                },
+            }),
+            _ => {
+                self.set_message("select a session to delete", true);
                 None
             }
         };
@@ -824,25 +865,25 @@ impl Sidebar {
                     self.session_overlay = Some(SessionOverlay::RenameProject { target, value });
                 }
             },
-            SessionOverlay::ConfirmClose { target } => match event {
+            SessionOverlay::ConfirmDelete { target } => match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
-                        self.submit_close(target);
+                        self.submit_delete(target);
                     }
                     KeyCode::Esc | KeyCode::Char('n' | 'N' | 'т' | 'Т') => {}
                     _ => {
-                        self.session_overlay = Some(SessionOverlay::ConfirmClose { target });
+                        self.session_overlay = Some(SessionOverlay::ConfirmDelete { target });
                     }
                 },
                 Event::Mouse(mouse)
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
                 {
                     if mouse.row == 4 && mouse.column < 12 {
-                        self.submit_close(target);
+                        self.submit_delete(target);
                     }
                 }
                 _ => {
-                    self.session_overlay = Some(SessionOverlay::ConfirmClose { target });
+                    self.session_overlay = Some(SessionOverlay::ConfirmDelete { target });
                 }
             },
         }
@@ -854,7 +895,7 @@ impl Sidebar {
                 value: String::new(),
                 target,
             }),
-            1 => Some(SessionOverlay::ConfirmClose { target }),
+            1 => Some(SessionOverlay::ConfirmDelete { target }),
             _ => None,
         };
     }
@@ -909,7 +950,7 @@ impl Sidebar {
         });
     }
 
-    fn submit_close(&mut self, target: SessionTarget) {
+    fn submit_delete(&mut self, target: SessionTarget) {
         let Some(host) = self.local.host_by_name(&target.host).cloned() else {
             self.set_message(format!("unknown host {}", target.host), true);
             return;
@@ -924,7 +965,7 @@ impl Sidebar {
             let result = actions::forget(&host, target.id).map_err(|e| format!("{e:#}"));
             let _ = tx.send(MutationResult {
                 target,
-                mutation: Mutation::Close { was_active },
+                mutation: Mutation::Delete { was_active },
                 result,
             });
         });
@@ -1050,12 +1091,7 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
             .style(Style::default().fg(FG).bg(BG))
             .highlight_symbol("  ")
             .highlight_spacing(HighlightSpacing::Always)
-            .highlight_style(
-                Style::default()
-                    .fg(FG)
-                    .bg(SELECTED)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_style(selection_style(sidebar.focused));
         frame.render_stateful_widget(list, body, &mut sidebar.list);
     }
 
@@ -1075,7 +1111,7 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
             },
         )),
         None => Line::from(Span::styled(
-            " j/k move  h/l open  n new  e rename",
+            " j/k h/l  n new  e name  d delete",
             Style::default().fg(DIM).bg(SURFACE),
         )),
     };
@@ -1091,6 +1127,13 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
     );
 }
 
+fn selection_style(focused: bool) -> Style {
+    Style::default()
+        .fg(FG)
+        .bg(if focused { FOCUSED_SELECTED } else { SELECTED })
+        .add_modifier(Modifier::BOLD)
+}
+
 fn draw_session_overlay(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -1103,7 +1146,7 @@ fn draw_session_overlay(
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             menu_line("  Rename", *selected == 0),
-            menu_line("  Close session", *selected == 1),
+            menu_line("  Delete session", *selected == 1),
             menu_line("  Cancel", *selected == 2),
             Line::styled("  Enter select · Esc close", Style::default().fg(DIM)),
         ],
@@ -1136,15 +1179,15 @@ fn draw_session_overlay(
             Line::styled("  Folder path stays unchanged", Style::default().fg(DIM)),
             Line::styled("  Enter save · Esc cancel", Style::default().fg(DIM)),
         ],
-        SessionOverlay::ConfirmClose { target } => vec![
+        SessionOverlay::ConfirmDelete { target } => vec![
             Line::styled(
-                format!("  Close {}?", util::one_line(&target.title, 20)),
+                format!("  Delete {}?", util::one_line(&target.title, 19)),
                 Style::default().fg(RED).add_modifier(Modifier::BOLD),
             ),
             Line::styled("  Conversation stays on disk.", Style::default().fg(DIM)),
             Line::from(vec![
                 Span::styled(
-                    "  [ Close ] ",
+                    "  [ Delete ] ",
                     Style::default().fg(BG).bg(RED).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" [ Cancel ] "),
@@ -1297,6 +1340,24 @@ mod tests {
     use super::*;
     use crate::model::{Folder, Probe, Session};
     use crate::reconcile::SessionView;
+
+    #[test]
+    fn selected_row_is_brighter_only_while_the_sidebar_is_focused() {
+        assert_eq!(
+            selection_style(true),
+            Style::default()
+                .fg(FG)
+                .bg(FOCUSED_SELECTED)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            selection_style(false),
+            Style::default()
+                .fg(FG)
+                .bg(SELECTED)
+                .add_modifier(Modifier::BOLD)
+        );
+    }
 
     #[test]
     fn tree_groups_sessions_under_their_project() {

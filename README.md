@@ -208,8 +208,9 @@ to move between the tree and the active agent. In the sidebar, `j`/`k` moves,
 `h` collapses or moves to the parent project, and `l` expands or opens. The same
 physical keys work in Russian layout: `о`/`л` and `р`/`д`. `e` (`у`) changes a
 project's display label or renames a session without touching its directory;
-`n` (`т`) creates a session. Arrow keys and `Enter` work too. `prefix z` zooms
-the active agent to the whole window and back.
+`n` (`т`) creates a session, and `d` (`в`) deletes the selected session after
+confirmation while keeping its conversation on disk. Arrow keys and `Enter`
+work too. `prefix z` zooms the active agent to the whole window and back.
 
 The workspace and attached agent sessions hide tmux's own status bars: the
 sidebar already shows the project, session, agent and state, so duplicated

@@ -103,12 +103,7 @@ pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> 
     let cmd = remote::attach_command(host, tmux_name);
     let (window, panes, created) = if let Some(window) = work_window() {
         let panes = tmux::window_panes(&window)?;
-        if let Some(sidebar) = panes
-            .iter()
-            .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE))
-        {
-            remember_sidebar_width(&window, &sidebar.pane);
-        }
+        remember_sidebar_width(&window, &panes);
         (window, panes, None)
     } else {
         let viewer = tmux::new_window(WORK_WINDOW, &cmd)?;
@@ -210,10 +205,31 @@ fn remembered_sidebar_width(window: &str) -> u16 {
         .max(20)
 }
 
-fn remember_sidebar_width(window: &str, pane: &str) {
-    if let Some(width) = tmux::pane_width(pane) {
+/// Persist a user-adjusted width only while both workspace panes exist.
+///
+/// When an active agent session is deleted, its attach client exits first and
+/// tmux briefly stretches the sidebar across the entire window. That transient
+/// geometry must never replace the user's real sidebar width.
+fn remember_sidebar_width(window: &str, panes: &[tmux::PaneInfo]) {
+    let Some(sidebar) = stable_sidebar_pane(panes) else {
+        return;
+    };
+    if let Some(width) = tmux::pane_width(sidebar) {
         let _ = tmux::set_window_option(window, SIDEBAR_WIDTH, &width.to_string());
     }
+}
+
+fn stable_sidebar_pane(panes: &[tmux::PaneInfo]) -> Option<&str> {
+    let has_viewer = panes
+        .iter()
+        .any(|pane| pane.role.as_deref() == Some(VIEWER_ROLE));
+    if !has_viewer {
+        return None;
+    }
+    panes
+        .iter()
+        .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE))
+        .map(|pane| pane.pane.as_str())
 }
 
 fn sidebar_hidden(window: &str) -> bool {
@@ -231,7 +247,7 @@ pub fn toggle_sidebar() -> Result<()> {
         .iter()
         .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE))
     {
-        remember_sidebar_width(&window, &sidebar.pane);
+        remember_sidebar_width(&window, &panes);
         tmux::set_window_option(&window, SIDEBAR_HIDDEN, "1")?;
         tmux::kill_pane(&sidebar.pane)?;
     } else {
@@ -407,6 +423,26 @@ mod tests {
             .iter()
             .find(|(_, c)| cmd.contains(&c.tmux_name()));
         assert_eq!(hit.map(|(h, _)| h.as_str()), Some("back"));
+    }
+
+    #[test]
+    fn a_temporarily_full_width_sidebar_is_not_remembered() {
+        let sidebar = pane_with_role("%1", SIDEBAR_ROLE);
+        assert_eq!(stable_sidebar_pane(&[sidebar]), None);
+
+        let sidebar = pane_with_role("%1", SIDEBAR_ROLE);
+        let viewer = pane_with_role("%2", VIEWER_ROLE);
+        assert_eq!(stable_sidebar_pane(&[sidebar, viewer]), Some("%1"));
+    }
+
+    fn pane_with_role(id: &str, role: &str) -> tmux::PaneInfo {
+        tmux::PaneInfo {
+            pane: id.into(),
+            session: None,
+            host: None,
+            role: Some(role.into()),
+            start_command: String::new(),
+        }
     }
 
     fn pane(tag: Option<&str>, command: &str) -> tmux::PaneInfo {

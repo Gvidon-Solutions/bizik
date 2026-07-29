@@ -516,7 +516,9 @@ pub fn style_app_window(window: &str) {
     for (option, value) in [
         ("pane-border-status", "off"),
         ("pane-border-style", "fg=colour250"),
-        ("pane-active-border-style", "fg=colour134"),
+        // Focus belongs in the application header, not in a full-height strip
+        // that visually cuts the workspace in two.
+        ("pane-active-border-style", "fg=colour250"),
         ("window-style", "fg=colour237,bg=colour255"),
         ("window-active-style", "fg=colour237,bg=colour255"),
     ] {
@@ -548,6 +550,10 @@ pub fn apply_session_options(session: &SessionRef) {
     // and creates a second status bar beneath attached agent sessions.
     for (option, value) in [
         ("status", "off"),
+        // Scoped to bizik's session. Applications in its panes can now receive
+        // terminal FocusGained/FocusLost without changing the user's other
+        // tmux sessions.
+        ("focus-events", "on"),
         ("message-style", "fg=colour237,bg=colour255"),
         ("mode-style", "fg=colour255,bg=colour134"),
     ] {
@@ -607,6 +613,18 @@ pub fn current_window_name() -> Option<String> {
 
 pub fn select_pane(pane: &str) -> Result<()> {
     tmux(&["select-pane", "-t", pane]).map(|_| ())
+}
+
+/// Whether the pane running this process currently owns keyboard focus.
+pub fn current_pane_active() -> bool {
+    let Some(pane) = std::env::var("TMUX_PANE")
+        .ok()
+        .filter(|pane| !pane.is_empty())
+    else {
+        return false;
+    };
+    tmux(&["display-message", "-p", "-t", &pane, "#{pane_active}"])
+        .is_ok_and(|value| value.trim() == "1")
 }
 
 /// What each pane of a window is: its id, and the bizik identity tagged onto
