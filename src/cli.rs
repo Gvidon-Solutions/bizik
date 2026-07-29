@@ -22,6 +22,23 @@ enum Cmd {
     /// Open the dashboard (default when run with no arguments)
     Tui,
 
+    /// Draw the project/session tree inside the work window
+    #[command(hide = true)]
+    Sidebar,
+
+    /// Show or hide the project/session sidebar
+    #[command(hide = true)]
+    ToggleSidebar,
+
+    /// Start and show one session in the workspace
+    #[command(hide = true)]
+    View {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        session: Uuid,
+    },
+
     /// Add the current directory to favourites
     #[command(visible_alias = "m")]
     Mark(MarkArgs),
@@ -83,6 +100,15 @@ enum Cmd {
     RmSession {
         #[arg(long)]
         session: Uuid,
+    },
+
+    /// Rename a session record on this machine
+    #[command(hide = true)]
+    RenameSession {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        title: String,
     },
 
     /// Manage the hosts this laptop drives
@@ -194,6 +220,9 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         None | Some(Cmd::Tui) => cmd_tui(),
+        Some(Cmd::Sidebar) => crate::sidebar::run(),
+        Some(Cmd::ToggleSidebar) => tui::actions::toggle_sidebar(),
+        Some(Cmd::View { host, session }) => cmd_view(&host, session),
         Some(Cmd::Mark(a)) => cmd_mark(a, false),
         Some(Cmd::MarkRepo(a)) => cmd_mark(a, true),
         Some(Cmd::Unmark { path }) => cmd_unmark(path),
@@ -211,6 +240,7 @@ pub fn run() -> Result<()> {
         }) => cmd_spawn(session, host_label.as_deref()),
         Some(Cmd::Stop { session }) => cmd_stop(session),
         Some(Cmd::RmSession { session }) => cmd_rm_session(session),
+        Some(Cmd::RenameSession { session, title }) => cmd_rename_session(session, &title),
         Some(Cmd::Host(c)) => cmd_host(c),
         Some(Cmd::Install { host }) => cmd_install(host),
         Some(Cmd::Hook { event }) => cmd_hook(&event),
@@ -244,12 +274,17 @@ fn cmd_tui() -> Result<()> {
             (tmux::current_session(), tmux::current_window_name())
         {
             let _ = tmux::bind_return_key(&session, &window);
+            let _ = bind_workspace_keys(&session);
         }
         return tui::run();
     }
 
     let exe = util::own_exe()?;
-    let dash = format!("{}{} tui", config_env(), exe.display());
+    let dash = format!(
+        "{}{} tui",
+        util::config_env(),
+        util::shell_quote(&exe.to_string_lossy())
+    );
 
     // The session is created detached and attached separately, so options and
     // bindings can be applied to a session that exists but nobody is looking at
@@ -272,6 +307,7 @@ fn cmd_tui() -> Result<()> {
     // Both re-applied every launch: bindings live on the tmux server and
     // options on the session, either of which may have gone away since.
     let _ = tmux::bind_return_key(&session_ref(), DASH_WINDOW);
+    let _ = bind_workspace_keys(&session_ref());
     tmux::apply_session_options(&session_ref());
 
     tmux::attach_interactively(&session_ref())
@@ -285,28 +321,24 @@ fn session_ref() -> tmux::SessionRef {
     tmux::SessionRef::new(SESSION)
 }
 
-/// An `env …` prefix carrying this process's settings into the relaunch.
-///
-/// The dashboard is restarted by the tmux server, which spawns it with *its
-/// own* environment — whatever it inherited whenever it happened to start.
-/// Without this, `BIZIK_CONFIG_DIR=… bzk` would silently read the default
-/// configuration instead of the one that was asked for.
-///
-/// Every `BIZIK_*` variable travels, not a hand-written list. The list was
-/// wrong within a day of being written: `BIZIK_TMUX_SOCKET` was added and not
-/// added here, so a dashboard asked to use a private tmux server quietly drove
-/// the default one instead — which is exactly the isolation the test suite
-/// depends on.
-fn config_env() -> String {
-    let mut vars: Vec<String> = std::env::vars()
-        .filter(|(name, _)| name.starts_with("BIZIK_"))
-        .map(|(name, value)| format!("{name}={}", util::shell_quote(&value)))
-        .collect();
-    if vars.is_empty() {
-        return String::new();
-    }
-    vars.sort();
-    format!("env {} ", vars.join(" "))
+fn bind_workspace_keys(session: &tmux::SessionRef) -> Result<()> {
+    let exe = util::own_exe()?;
+    let command = format!(
+        "{}{} toggle-sidebar",
+        util::config_env(),
+        util::shell_quote(&exe.to_string_lossy())
+    );
+    tmux::bind_workspace_key(session, &tui::actions::sidebar_key(), &command)
+}
+
+fn cmd_view(host_name: &str, session: Uuid) -> Result<()> {
+    let store = LocalStore::load()?;
+    let host = store
+        .host_by_name(host_name)
+        .with_context(|| format!("no host named {host_name}"))?;
+    let spawned = tui::actions::start(host, session)?;
+    tui::actions::open_pane(host, spawned.session.id, &spawned.tmux_name)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +520,12 @@ fn cmd_rm_session(session: Uuid) -> Result<()> {
         session,
     )?;
     println!("{}", serde_json::json!({ "removed": removed }));
+    Ok(())
+}
+
+fn cmd_rename_session(session: Uuid, title: &str) -> Result<()> {
+    let renamed = application::rename_session(&FsHostStateRepository::default(), session, title)?;
+    println!("{}", serde_json::to_string(&renamed)?);
     Ok(())
 }
 

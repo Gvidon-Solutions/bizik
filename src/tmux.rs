@@ -31,6 +31,8 @@ use crate::util::shell_quote;
 pub const OPT_SESSION: &str = "@bzk_session";
 /// User option carrying the host a pane is viewing.
 pub const OPT_HOST: &str = "@bzk_host";
+/// User option distinguishing the persistent sidebar from the active viewer.
+pub const OPT_ROLE: &str = "@bzk_role";
 
 // ---------------------------------------------------------------------------
 // Targets
@@ -315,6 +317,10 @@ pub fn tag_pane(pane: &str, uuid: &str, host: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn tag_pane_role(pane: &str, role: &str) -> Result<()> {
+    tmux(&["set-option", "-p", "-t", pane, OPT_ROLE, role]).map(|_| ())
+}
+
 /// Wrap an agent command so the pane outlives it.
 ///
 /// When an agent exits — crash or a clean `/exit` — the pane must not vanish,
@@ -381,10 +387,48 @@ pub fn new_window_in(session: &SessionRef, name: &str, cmd: &str) -> Result<Stri
     Ok(out.trim().to_string())
 }
 
-/// Split `window` and return the new pane id.
-pub fn split_window(window: &str, cmd: &str) -> Result<String> {
-    let out = tmux(&["split-window", "-t", window, "-P", "-F", "#{pane_id}", cmd])?;
+/// Split a pane horizontally, placing the new pane before (to the left of) it.
+pub fn split_window_left(pane: &str, width: u16, cmd: &str) -> Result<String> {
+    let width = width.to_string();
+    let out = tmux(&[
+        "split-window",
+        "-b",
+        "-h",
+        "-l",
+        &width,
+        "-t",
+        pane,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        cmd,
+    ])?;
     Ok(out.trim().to_string())
+}
+
+/// Split a pane horizontally, placing the new pane after (to the right of) it.
+pub fn split_window_right(pane: &str, cmd: &str) -> Result<String> {
+    let out = tmux(&[
+        "split-window",
+        "-h",
+        "-t",
+        pane,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        cmd,
+    ])?;
+    Ok(out.trim().to_string())
+}
+
+/// Replace what a pane is showing without changing its geometry or pane id.
+pub fn respawn_pane(pane: &str, cmd: &str) -> Result<()> {
+    tmux(&["respawn-pane", "-k", "-t", pane, cmd]).map(|_| ())
+}
+
+pub fn resize_pane_width(pane: &str, width: u16) -> Result<()> {
+    let width = width.to_string();
+    tmux(&["resize-pane", "-t", pane, "-x", &width]).map(|_| ())
 }
 
 /// The key that jumps back to the dashboard from inside any pane.
@@ -415,6 +459,21 @@ pub fn bind_return_key(session: &SessionRef, window: &str) -> Result<()> {
     .map(|_| ())
 }
 
+/// Bind a global key that runs a command only inside bizik's own tmux session.
+pub fn bind_workspace_key(session: &SessionRef, key: &str, command_to_run: &str) -> Result<()> {
+    tmux(&[
+        "bind-key",
+        "-n",
+        key,
+        "if-shell",
+        "-F",
+        &format!("#{{==:#{{session_name}},{session}}}"),
+        &format!("run-shell -b {}", shell_quote(command_to_run)),
+        &format!("send-keys {key}"),
+    ])
+    .map(|_| ())
+}
+
 /// Create a detached session running `cmd` in a window called `window`.
 ///
 /// Detached first, then attached separately, so session options can be set
@@ -438,6 +497,17 @@ pub fn new_detached_session(session: &SessionRef, window: &str, cmd: &str) -> Re
 /// the same server and the global defaults are untouched.
 pub fn set_session_option(session: &SessionRef, name: &str, value: &str) -> Result<()> {
     tmux(&["set-option", "-t", session.plain(), name, value]).map(|_| ())
+}
+
+pub fn set_window_option(window: &str, name: &str, value: &str) -> Result<()> {
+    tmux(&["set-option", "-w", "-t", window, name, value]).map(|_| ())
+}
+
+pub fn window_option(window: &str, name: &str) -> Option<String> {
+    tmux(&["show-options", "-w", "-v", "-t", window, name])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Whether the mouse should be on. `BIZIK_MOUSE=off` turns it off.
@@ -508,19 +578,6 @@ pub fn select_pane(pane: &str) -> Result<()> {
     tmux(&["select-pane", "-t", pane]).map(|_| ())
 }
 
-pub fn select_layout(window: &str, layout: &str) -> Result<()> {
-    tmux(&["select-layout", "-t", window, layout]).map(|_| ())
-}
-
-/// The window's geometry as a string that `select-layout` can replay verbatim.
-pub fn capture_layout(window: &str) -> Result<String> {
-    Ok(
-        tmux(&["display-message", "-p", "-t", window, "#{window_layout}"])?
-            .trim()
-            .to_string(),
-    )
-}
-
 /// What each pane of a window is: its id, and the bizik identity tagged onto
 /// it. Read from tmux's own per-pane options rather than parsed out of a
 /// command line, so a rename, a quoting change or a similar-looking session
@@ -529,6 +586,7 @@ pub struct PaneInfo {
     pub pane: String,
     pub session: Option<String>,
     pub host: Option<String>,
+    pub role: Option<String>,
     /// What the pane was started with. Only needed to recognise panes opened
     /// before identity was tagged onto them.
     pub start_command: String,
@@ -542,13 +600,13 @@ pub struct PaneInfo {
 /// guessing at it.
 pub fn panes_of_window_anywhere(name: &str) -> Result<Vec<PaneInfo>> {
     let fmt = format!(
-        "#{{window_name}}\t#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{pane_start_command}}"
+        "#{{window_name}}\t#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{pane_start_command}}"
     );
     let raw = tmux(&["list-panes", "-a", "-F", &fmt])?;
     Ok(raw
         .lines()
         .filter_map(|l| {
-            let mut parts = l.splitn(5, '\t');
+            let mut parts = l.splitn(6, '\t');
             if parts.next()? != name {
                 return None;
             }
@@ -558,9 +616,11 @@ pub fn panes_of_window_anywhere(name: &str) -> Result<Vec<PaneInfo>> {
 }
 
 pub fn window_panes(window: &str) -> Result<Vec<PaneInfo>> {
-    let fmt = format!("#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{pane_start_command}}");
+    let fmt = format!(
+        "#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{pane_start_command}}"
+    );
     let raw = tmux(&["list-panes", "-t", window, "-F", &fmt])?;
-    Ok(raw.lines().map(|l| parse_pane(l.splitn(4, '\t'))).collect())
+    Ok(raw.lines().map(|l| parse_pane(l.splitn(5, '\t'))).collect())
 }
 
 /// The command is last and taken whole: `splitn` keeps a tab inside it from
@@ -571,6 +631,7 @@ fn parse_pane<'a>(mut parts: impl Iterator<Item = &'a str>) -> PaneInfo {
         pane: parts.next().unwrap_or_default().to_string(),
         session: clean(parts.next()),
         host: clean(parts.next()),
+        role: clean(parts.next()),
         start_command: parts.next().unwrap_or_default().to_string(),
     }
 }
@@ -663,10 +724,11 @@ mod tests {
         // The command is the last field and may itself contain a tab. Splitting
         // on every tab would read part of it as another column and silently
         // mis-describe the pane.
-        let info = parse_pane("%3\tabc-123\tback\tssh host\t-t 'x'".splitn(4, '\t'));
+        let info = parse_pane("%3\tabc-123\tback\tviewer\tssh host\t-t 'x'".splitn(5, '\t'));
         assert_eq!(info.pane, "%3");
         assert_eq!(info.session.as_deref(), Some("abc-123"));
         assert_eq!(info.host.as_deref(), Some("back"));
+        assert_eq!(info.role.as_deref(), Some("viewer"));
         assert_eq!(info.start_command, "ssh host\t-t 'x'");
     }
 
@@ -675,12 +737,13 @@ mod tests {
         // tmux prints an unset user option as an empty field, and older tmux
         // prints `0`. Either must read as "no tag", or a pane from an older
         // build looks tagged with nonsense.
-        let empty = parse_pane("%1\t\t\tzsh".splitn(4, '\t'));
+        let empty = parse_pane("%1\t\t\t\tzsh".splitn(5, '\t'));
         assert_eq!(empty.session, None);
         assert_eq!(empty.host, None);
+        assert_eq!(empty.role, None);
         assert_eq!(empty.start_command, "zsh");
 
-        let zero = parse_pane("%1\t0\t0\tzsh".splitn(4, '\t'));
+        let zero = parse_pane("%1\t0\t0\t0\tzsh".splitn(5, '\t'));
         assert_eq!(zero.session, None);
     }
 

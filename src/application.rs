@@ -209,6 +209,24 @@ pub fn forget_session(
     Ok(true)
 }
 
+pub fn rename_session(
+    repository: &impl HostStateRepository,
+    id: uuid::Uuid,
+    title: &str,
+) -> Result<Session> {
+    let mut store = repository.load()?;
+    let session = store
+        .session_mut(id)
+        .with_context(|| format!("no session {id} on this host"))?;
+    session.title = title.trim().to_string();
+    session.updated_at = now_ms();
+    let renamed = session.clone();
+    // Saving validates the title length, emptiness and control characters
+    // before replacing the on-disk store.
+    repository.save(&store)?;
+    Ok(renamed)
+}
+
 fn unique_session_title(store: &HostStore, folder: uuid::Uuid, base: &str) -> String {
     let taken: Vec<&str> = store
         .live_sessions()
@@ -466,6 +484,14 @@ mod tests {
         assert_eq!(create().title, "shell · repo");
         let second = create();
         assert_eq!(second.title, "shell · repo 2");
+
+        let renamed = rename_session(&repository, second.id, "  build API  ").unwrap();
+        assert_eq!(renamed.title, "build API");
+        assert_eq!(
+            repository.load().unwrap().session(second.id).unwrap().title,
+            "build API"
+        );
+        assert!(rename_session(&repository, second.id, "   ").is_err());
 
         let terminator = FakeTerminator {
             calls: Cell::new(0),

@@ -247,6 +247,24 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// An `env …` prefix carrying this process's bizik settings into a child
+/// started by tmux.
+///
+/// The tmux server may be older than this process and therefore have stale
+/// environment variables. Carrying every `BIZIK_*` variable explicitly keeps
+/// alternate config directories, cache directories and test sockets intact.
+pub fn config_env() -> String {
+    let mut vars: Vec<String> = std::env::vars()
+        .filter(|(name, _)| name.starts_with("BIZIK_"))
+        .map(|(name, value)| format!("{name}={}", shell_quote(&value)))
+        .collect();
+    if vars.is_empty() {
+        return String::new();
+    }
+    vars.sort();
+    format!("env {} ", vars.join(" "))
+}
+
 /// Collapse whitespace and clamp to `max` characters, for one-line previews.
 pub fn one_line(s: &str, max: usize) -> String {
     let safe: String = s

@@ -1,0 +1,1094 @@
+//! Compact project/session tree shown beside the active agent.
+//!
+//! The sidebar is a viewer, not an owner. Folders and sessions still live on
+//! their hosts, and the active agent still lives in its detached tmux session.
+//! Selecting another row only replaces the attach client in the viewer pane.
+
+use anyhow::Result;
+use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+    MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use std::collections::HashSet;
+use std::io::stdout;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+use crate::hostops::SpawnResult;
+use crate::model::{AgentKind, Host, Session};
+use crate::reconcile::State;
+use crate::remote::{self, HostProbe};
+use crate::store::LocalStore;
+use crate::tmux;
+use crate::tui::actions;
+use crate::util;
+
+const REFRESH_EVERY: Duration = Duration::from_secs(4);
+const MESSAGE_FOR: Duration = Duration::from_secs(5);
+const DASH_WINDOW: &str = "bzk-dash";
+const ACCENT: Color = Color::Magenta;
+const DIM: Color = Color::DarkGray;
+
+#[derive(Clone, Debug)]
+enum TreeRow {
+    Project {
+        host: String,
+        folder: Uuid,
+        name: String,
+        attention: usize,
+        collapsed: bool,
+    },
+    Session {
+        host: String,
+        id: Uuid,
+        agent: AgentKind,
+        title: String,
+        state: State,
+    },
+    NewSession {
+        host: String,
+        folder: Uuid,
+        project: String,
+    },
+    Note(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TreeKey {
+    Project(String, Uuid),
+    Session(String, Uuid),
+    NewSession(String, Uuid),
+}
+
+impl TreeRow {
+    fn key(&self) -> Option<TreeKey> {
+        match self {
+            Self::Project { host, folder, .. } => Some(TreeKey::Project(host.clone(), *folder)),
+            Self::Session { host, id, .. } => Some(TreeKey::Session(host.clone(), *id)),
+            Self::NewSession { host, folder, .. } => {
+                Some(TreeKey::NewSession(host.clone(), *folder))
+            }
+            Self::Note(_) => None,
+        }
+    }
+
+    fn matches_key(&self, key: &TreeKey) -> bool {
+        self.key().as_ref() == Some(key)
+    }
+}
+
+struct LaunchResult {
+    host: Host,
+    result: Result<SpawnResult, String>,
+}
+
+struct CreateResult {
+    host: Host,
+    result: Result<Session, String>,
+}
+
+#[derive(Clone)]
+struct SessionTarget {
+    host: String,
+    id: Uuid,
+    title: String,
+}
+
+enum SessionOverlay {
+    Menu {
+        target: SessionTarget,
+        selected: usize,
+    },
+    Rename {
+        target: SessionTarget,
+        value: String,
+    },
+    ConfirmClose {
+        target: SessionTarget,
+    },
+}
+
+enum Mutation {
+    Rename,
+    Close { was_active: bool },
+}
+
+struct MutationResult {
+    target: SessionTarget,
+    mutation: Mutation,
+    result: Result<(), String>,
+}
+
+#[derive(Clone)]
+struct AgentPicker {
+    host: String,
+    folder: Uuid,
+    project: String,
+    selected: usize,
+}
+
+struct Sidebar {
+    local: LocalStore,
+    probes: Vec<HostProbe>,
+    rows: Vec<TreeRow>,
+    list: ListState,
+    active: Option<(String, Uuid)>,
+    collapsed: HashSet<(String, Uuid)>,
+    agent_picker: Option<AgentPicker>,
+    session_overlay: Option<SessionOverlay>,
+    refreshing: bool,
+    starting: bool,
+    creating: bool,
+    mutating: bool,
+    last_refresh: Instant,
+    message: Option<(String, bool, Instant)>,
+    probe_tx: Sender<Vec<HostProbe>>,
+    probe_rx: Receiver<Vec<HostProbe>>,
+    launch_tx: Sender<LaunchResult>,
+    launch_rx: Receiver<LaunchResult>,
+    create_tx: Sender<CreateResult>,
+    create_rx: Receiver<CreateResult>,
+    mutation_tx: Sender<MutationResult>,
+    mutation_rx: Receiver<MutationResult>,
+}
+
+pub fn run() -> Result<()> {
+    let mut sidebar = Sidebar::new()?;
+    execute!(stdout(), EnableMouseCapture)?;
+    let mut terminal = ratatui::init();
+    let result = sidebar.main_loop(&mut terminal);
+    ratatui::restore();
+    let _ = execute!(stdout(), DisableMouseCapture);
+    result
+}
+
+impl Sidebar {
+    fn new() -> Result<Self> {
+        let mut local = LocalStore::load()?;
+        if local.ensure_local_host() {
+            local.save()?;
+        }
+        let (probe_tx, probe_rx) = channel();
+        let (launch_tx, launch_rx) = channel();
+        let (create_tx, create_rx) = channel();
+        let (mutation_tx, mutation_rx) = channel();
+        let now = Instant::now();
+        let mut sidebar = Self {
+            local,
+            probes: Vec::new(),
+            rows: vec![TreeRow::Note("loading…".into())],
+            list: ListState::default(),
+            active: actions::active_session(),
+            collapsed: HashSet::new(),
+            agent_picker: None,
+            session_overlay: None,
+            refreshing: false,
+            starting: false,
+            creating: false,
+            mutating: false,
+            last_refresh: now.checked_sub(REFRESH_EVERY).unwrap_or(now),
+            message: None,
+            probe_tx,
+            probe_rx,
+            launch_tx,
+            launch_rx,
+            create_tx,
+            create_rx,
+            mutation_tx,
+            mutation_rx,
+        };
+        sidebar.kick_refresh();
+        Ok(sidebar)
+    }
+
+    fn main_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        loop {
+            self.active = actions::active_session();
+            terminal.draw(|frame| draw(frame, self))?;
+
+            if event::poll(Duration::from_millis(150))? {
+                let event = event::read()?;
+                if self.session_overlay.is_some() {
+                    self.handle_session_overlay(event);
+                } else if self.agent_picker.is_some() {
+                    self.handle_agent_picker(event);
+                } else {
+                    match event {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
+                            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
+                            KeyCode::Home | KeyCode::Char('g') => self.jump(true),
+                            KeyCode::End | KeyCode::Char('G') => self.jump(false),
+                            KeyCode::Enter => self.open_selected(),
+                            KeyCode::Char('r') => self.kick_refresh(),
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                if let Some(window) = tmux::find_window(DASH_WINDOW) {
+                                    let _ = tmux::select_window(&window);
+                                }
+                            }
+                            _ => {}
+                        },
+                        Event::Mouse(mouse)
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                                && mouse.row >= 2 =>
+                        {
+                            let index = self.row_at(mouse.row);
+                            if self.rows.get(index).is_some_and(|row| row.key().is_some()) {
+                                self.list.select(Some(index));
+                                self.open_selected();
+                            }
+                        }
+                        Event::Mouse(mouse)
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                                && mouse.row >= 2 =>
+                        {
+                            let index = self.row_at(mouse.row);
+                            self.show_session_menu(index);
+                        }
+                        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::ScrollUp) => {
+                            self.move_cursor(-1);
+                        }
+                        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::ScrollDown) => {
+                            self.move_cursor(1);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            while let Ok(probes) = self.probe_rx.try_recv() {
+                self.probes = probes;
+                self.refreshing = false;
+                self.last_refresh = Instant::now();
+                self.rebuild();
+            }
+
+            while let Ok(launch) = self.launch_rx.try_recv() {
+                self.starting = false;
+                match launch.result {
+                    Ok(spawned) => {
+                        match actions::open_pane(
+                            &launch.host,
+                            spawned.session.id,
+                            &spawned.tmux_name,
+                        ) {
+                            Ok(_) => self.set_message("switched", false),
+                            Err(error) => self.set_message(format!("{error:#}"), true),
+                        }
+                        self.kick_refresh();
+                    }
+                    Err(error) => self.set_message(error, true),
+                }
+            }
+
+            while let Ok(created) = self.create_rx.try_recv() {
+                self.creating = false;
+                match created.result {
+                    Ok(session) => {
+                        self.set_message("session created", false);
+                        self.open(created.host, session.id);
+                        self.kick_refresh();
+                    }
+                    Err(error) => self.set_message(error, true),
+                }
+            }
+
+            while let Ok(mutation) = self.mutation_rx.try_recv() {
+                self.mutating = false;
+                match mutation.result {
+                    Ok(()) => {
+                        let was_close = matches!(&mutation.mutation, Mutation::Close { .. });
+                        let replace_closed = match mutation.mutation {
+                            Mutation::Rename => false,
+                            Mutation::Close { was_active } => {
+                                was_active
+                                    || self.active.as_ref().is_some_and(|active| {
+                                        active.0 == mutation.target.host
+                                            && active.1 == mutation.target.id
+                                    })
+                            }
+                        };
+                        if replace_closed
+                            && let Some((host, session)) =
+                                self.rows.iter().find_map(|row| match row {
+                                    TreeRow::Session { host, id, .. }
+                                        if host != &mutation.target.host
+                                            || id != &mutation.target.id =>
+                                    {
+                                        Some((host.clone(), *id))
+                                    }
+                                    _ => None,
+                                })
+                        {
+                            self.open_named(&host, session);
+                        }
+                        self.set_message(
+                            if was_close {
+                                format!("closed {}", mutation.target.title)
+                            } else {
+                                "session renamed".to_string()
+                            },
+                            false,
+                        );
+                        self.kick_refresh();
+                    }
+                    Err(error) => self.set_message(error, true),
+                }
+            }
+
+            if !self.refreshing && self.last_refresh.elapsed() >= REFRESH_EVERY {
+                self.kick_refresh();
+            }
+            if self
+                .message
+                .as_ref()
+                .is_some_and(|(_, _, at)| at.elapsed() > MESSAGE_FOR)
+            {
+                self.message = None;
+            }
+        }
+    }
+
+    fn hosts(&self) -> Vec<Host> {
+        self.local.live_hosts().into_iter().cloned().collect()
+    }
+
+    fn kick_refresh(&mut self) {
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
+        self.last_refresh = Instant::now();
+        let hosts = self.hosts();
+        let tx = self.probe_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(remote::probe_all(&hosts));
+        });
+    }
+
+    fn rebuild(&mut self) {
+        let selected = self.current_key().or_else(|| {
+            self.active
+                .clone()
+                .map(|(host, session)| TreeKey::Session(host, session))
+        });
+        self.rows = build_tree(&self.hosts(), &self.probes, &self.collapsed);
+        let target = selected
+            .and_then(|key| self.rows.iter().position(|row| row.matches_key(&key)))
+            .or_else(|| self.rows.iter().position(|row| row.key().is_some()));
+        self.list.select(target);
+    }
+
+    fn current_key(&self) -> Option<TreeKey> {
+        self.list
+            .selected()
+            .and_then(|index| self.rows.get(index))
+            .and_then(TreeRow::key)
+    }
+
+    fn row_at(&self, mouse_row: u16) -> usize {
+        self.list
+            .offset()
+            .saturating_add(usize::from(mouse_row.saturating_sub(2)))
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        let selectable: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.key().map(|_| index))
+            .collect();
+        if selectable.is_empty() {
+            return;
+        }
+        let at = self
+            .list
+            .selected()
+            .and_then(|selected| selectable.iter().position(|index| *index == selected))
+            .unwrap_or(0);
+        let next = at.saturating_add_signed(delta).min(selectable.len() - 1);
+        self.list.select(Some(selectable[next]));
+    }
+
+    fn jump(&mut self, first: bool) {
+        let mut selectable = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.key().is_some());
+        let target = if first {
+            selectable.next()
+        } else {
+            selectable.next_back()
+        };
+        self.list.select(target.map(|(index, _)| index));
+    }
+
+    fn open_selected(&mut self) {
+        if self.starting || self.creating || self.mutating {
+            return;
+        }
+        let Some(key) = self.current_key() else {
+            return;
+        };
+        match key {
+            TreeKey::Project(host, folder) => {
+                let key = (host, folder);
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+                self.rebuild();
+            }
+            TreeKey::NewSession(host, folder) => {
+                let project = self
+                    .rows
+                    .iter()
+                    .find_map(|row| match row {
+                        TreeRow::NewSession {
+                            host: row_host,
+                            folder: row_folder,
+                            project,
+                        } if row_host == &host && row_folder == &folder => Some(project.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "project".to_string());
+                self.agent_picker = Some(AgentPicker {
+                    host,
+                    folder,
+                    project,
+                    selected: 0,
+                });
+            }
+            TreeKey::Session(host, session) => self.open_named(&host, session),
+        }
+    }
+
+    fn open_named(&mut self, host_name: &str, session: Uuid) {
+        let Some(host) = self.local.host_by_name(host_name).cloned() else {
+            self.set_message(format!("unknown host {host_name}"), true);
+            return;
+        };
+        self.open(host, session);
+    }
+
+    fn open(&mut self, host: Host, session: Uuid) {
+        self.starting = true;
+        let tx = self.launch_tx.clone();
+        std::thread::spawn(move || {
+            let result = actions::start(&host, session).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(LaunchResult { host, result });
+        });
+    }
+
+    fn handle_agent_picker(&mut self, event: Event) {
+        let Some(mut picker) = self.agent_picker.take() else {
+            return;
+        };
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.selected = picker.selected.saturating_sub(1);
+                    self.agent_picker = Some(picker);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picker.selected = (picker.selected + 1).min(2);
+                    self.agent_picker = Some(picker);
+                }
+                KeyCode::Enter => self.create_from_picker(picker),
+                _ => self.agent_picker = Some(picker),
+            },
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+            {
+                if (3..=5).contains(&mouse.row) {
+                    picker.selected = usize::from(mouse.row - 3);
+                    self.create_from_picker(picker);
+                } else {
+                    self.agent_picker = Some(picker);
+                }
+            }
+            _ => self.agent_picker = Some(picker),
+        }
+    }
+
+    fn create_from_picker(&mut self, picker: AgentPicker) {
+        let Some(host) = self.local.host_by_name(&picker.host).cloned() else {
+            self.set_message(format!("unknown host {}", picker.host), true);
+            return;
+        };
+        let agent = [AgentKind::Codex, AgentKind::Claude, AgentKind::Shell][picker.selected];
+        self.creating = true;
+        let tx = self.create_tx.clone();
+        std::thread::spawn(move || {
+            let result = actions::create_session(&host, picker.folder, agent, None, None)
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(CreateResult { host, result });
+        });
+    }
+
+    fn show_session_menu(&mut self, index: usize) {
+        if self.mutating {
+            return;
+        }
+        let Some(TreeRow::Session {
+            host, id, title, ..
+        }) = self.rows.get(index)
+        else {
+            return;
+        };
+        self.list.select(Some(index));
+        self.session_overlay = Some(SessionOverlay::Menu {
+            target: SessionTarget {
+                host: host.clone(),
+                id: *id,
+                title: title.clone(),
+            },
+            selected: 0,
+        });
+    }
+
+    fn handle_session_overlay(&mut self, event: Event) {
+        let Some(overlay) = self.session_overlay.take() else {
+            return;
+        };
+        match overlay {
+            SessionOverlay::Menu {
+                target,
+                mut selected,
+            } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        selected = selected.saturating_sub(1);
+                        self.session_overlay = Some(SessionOverlay::Menu { target, selected });
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        selected = (selected + 1).min(2);
+                        self.session_overlay = Some(SessionOverlay::Menu { target, selected });
+                    }
+                    KeyCode::Enter => self.choose_session_menu(target, selected),
+                    _ => {
+                        self.session_overlay = Some(SessionOverlay::Menu { target, selected });
+                    }
+                },
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    match mouse.row {
+                        3 => self.choose_session_menu(target, 0),
+                        4 => self.choose_session_menu(target, 1),
+                        _ => {}
+                    }
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) => {}
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::Menu { target, selected });
+                }
+            },
+            SessionOverlay::Rename { target, mut value } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter => self.submit_rename(target, &value),
+                    KeyCode::Backspace => {
+                        value.pop();
+                        self.session_overlay = Some(SessionOverlay::Rename { target, value });
+                    }
+                    KeyCode::Char(character) if value.chars().count() < 256 => {
+                        value.push(character);
+                        self.session_overlay = Some(SessionOverlay::Rename { target, value });
+                    }
+                    _ => {
+                        self.session_overlay = Some(SessionOverlay::Rename { target, value });
+                    }
+                },
+                Event::Paste(text) => {
+                    value.extend(
+                        text.chars()
+                            .filter(|character| !character.is_control())
+                            .take(256usize.saturating_sub(value.chars().count())),
+                    );
+                    self.session_overlay = Some(SessionOverlay::Rename { target, value });
+                }
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::Rename { target, value });
+                }
+            },
+            SessionOverlay::ConfirmClose { target } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y') => self.submit_close(target),
+                    KeyCode::Esc | KeyCode::Char('n' | 'N') => {}
+                    _ => {
+                        self.session_overlay = Some(SessionOverlay::ConfirmClose { target });
+                    }
+                },
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    if mouse.row == 4 && mouse.column < 12 {
+                        self.submit_close(target);
+                    }
+                }
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::ConfirmClose { target });
+                }
+            },
+        }
+    }
+
+    fn choose_session_menu(&mut self, target: SessionTarget, selected: usize) {
+        self.session_overlay = match selected {
+            0 => Some(SessionOverlay::Rename {
+                value: target.title.clone(),
+                target,
+            }),
+            1 => Some(SessionOverlay::ConfirmClose { target }),
+            _ => None,
+        };
+    }
+
+    fn submit_rename(&mut self, target: SessionTarget, value: &str) {
+        let title = value.trim().to_string();
+        if title.is_empty() {
+            self.set_message("session name cannot be empty", true);
+            self.session_overlay = Some(SessionOverlay::Rename {
+                target,
+                value: value.to_string(),
+            });
+            return;
+        }
+        let Some(host) = self.local.host_by_name(&target.host).cloned() else {
+            self.set_message(format!("unknown host {}", target.host), true);
+            return;
+        };
+        self.mutating = true;
+        let tx = self.mutation_tx.clone();
+        std::thread::spawn(move || {
+            let result =
+                actions::rename_session(&host, target.id, &title).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(MutationResult {
+                target,
+                mutation: Mutation::Rename,
+                result,
+            });
+        });
+    }
+
+    fn submit_close(&mut self, target: SessionTarget) {
+        let Some(host) = self.local.host_by_name(&target.host).cloned() else {
+            self.set_message(format!("unknown host {}", target.host), true);
+            return;
+        };
+        let was_active = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.0 == target.host && active.1 == target.id);
+        self.mutating = true;
+        let tx = self.mutation_tx.clone();
+        std::thread::spawn(move || {
+            let result = actions::forget(&host, target.id).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(MutationResult {
+                target,
+                mutation: Mutation::Close { was_active },
+                result,
+            });
+        });
+    }
+
+    fn set_message(&mut self, text: impl Into<String>, error: bool) {
+        self.message = Some((text.into(), error, Instant::now()));
+    }
+}
+
+fn build_tree(
+    hosts: &[Host],
+    probes: &[HostProbe],
+    collapsed: &HashSet<(String, Uuid)>,
+) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    for host in hosts {
+        let Some(probed) = probes.iter().find(|probe| probe.host.name == host.name) else {
+            continue;
+        };
+        let Some(probe) = &probed.probe else {
+            rows.push(TreeRow::Note(format!("{} offline", host.name)));
+            continue;
+        };
+
+        for folder in &probe.folders {
+            let mut sessions: Vec<_> = probe
+                .sessions
+                .iter()
+                .filter(|view| view.session.folder_id == folder.id)
+                .collect();
+            sessions.sort_by_key(|view| view.session.created_at);
+            let is_collapsed = collapsed.contains(&(host.name.clone(), folder.id));
+            rows.push(TreeRow::Project {
+                host: host.name.clone(),
+                folder: folder.id,
+                name: folder.display_name(),
+                attention: sessions
+                    .iter()
+                    .filter(|view| view.state.wants_you())
+                    .count(),
+                collapsed: is_collapsed,
+            });
+            if !is_collapsed {
+                rows.push(TreeRow::NewSession {
+                    host: host.name.clone(),
+                    folder: folder.id,
+                    project: folder.display_name(),
+                });
+                rows.extend(sessions.into_iter().map(|view| TreeRow::Session {
+                    host: host.name.clone(),
+                    id: view.session.id,
+                    agent: view.session.agent,
+                    title: view.session.title.clone(),
+                    state: view.state,
+                }));
+            }
+        }
+    }
+    if rows.is_empty() {
+        rows.push(TreeRow::Note("no marked projects".into()));
+    }
+    rows
+}
+
+fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .areas(frame.area());
+
+    let activity = if sidebar.mutating {
+        " saving…"
+    } else if sidebar.creating {
+        " creating…"
+    } else if sidebar.starting {
+        " starting…"
+    } else if sidebar.refreshing {
+        " ↻"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " projects",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(activity, Style::default().fg(DIM)),
+        ]))
+        .block(Block::default().borders(Borders::BOTTOM)),
+        header,
+    );
+
+    let width = usize::from(body.width.saturating_sub(4));
+    if let Some(overlay) = &sidebar.session_overlay {
+        draw_session_overlay(frame, body, overlay);
+    } else if let Some(picker) = &sidebar.agent_picker {
+        draw_agent_picker(frame, body, picker);
+    } else {
+        let items: Vec<ListItem> = sidebar
+            .rows
+            .iter()
+            .map(|row| render_row(row, width, sidebar.active.as_ref()))
+            .collect();
+        let list = List::new(items)
+            .highlight_symbol("▌")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        frame.render_stateful_widget(list, body, &mut sidebar.list);
+    }
+
+    let footer_line = match &sidebar.message {
+        Some((text, error, _)) => Line::from(Span::styled(
+            format!(" {}", util::one_line(text, width.max(4))),
+            if *error {
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            },
+        )),
+        None => Line::from(Span::styled(
+            " click open · right-click manage · F10 hide",
+            Style::default().fg(DIM),
+        )),
+    };
+    frame.render_widget(
+        Paragraph::new(footer_line).block(Block::default().borders(Borders::TOP)),
+        footer,
+    );
+}
+
+fn draw_session_overlay(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    overlay: &SessionOverlay,
+) {
+    let lines = match overlay {
+        SessionOverlay::Menu { target, selected } => vec![
+            Line::styled(
+                format!(" {}", util::one_line(&target.title, 24)),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            menu_line(" Rename", *selected == 0),
+            menu_line(" Close session", *selected == 1),
+            menu_line(" Cancel", *selected == 2),
+            Line::styled(" click an action · Esc closes", Style::default().fg(DIM)),
+        ],
+        SessionOverlay::Rename { target, value } => vec![
+            Line::styled(
+                format!(" Rename {}", util::one_line(&target.title, 18)),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Line::from(vec![
+                Span::styled(" Name: ", Style::default().fg(DIM)),
+                Span::styled(
+                    util::one_line(value, usize::from(area.width.saturating_sub(8))),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::styled(" Enter saves · Esc cancels", Style::default().fg(DIM)),
+        ],
+        SessionOverlay::ConfirmClose { target } => vec![
+            Line::styled(
+                format!(" Close {}?", util::one_line(&target.title, 20)),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(" Conversation stays on disk.", Style::default().fg(DIM)),
+            Line::from(vec![
+                Span::styled(
+                    " [ Close ] ",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                ),
+                Span::raw(" [ Cancel ] "),
+            ]),
+        ],
+    };
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn menu_line(label: &str, selected: bool) -> Line<'static> {
+    Line::styled(
+        label.to_string(),
+        if selected {
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+        },
+    )
+}
+
+fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> ListItem<'static> {
+    match row {
+        TreeRow::Project {
+            host,
+            name,
+            attention,
+            collapsed,
+            ..
+        } => {
+            let suffix = if *attention > 0 {
+                format!(" ▲{attention}")
+            } else {
+                String::new()
+            };
+            let available = width.saturating_sub(suffix.chars().count() + 3);
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{} {}",
+                        if *collapsed { "▸" } else { "▾" },
+                        util::one_line(name, available.max(1))
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(suffix, Style::default().fg(Color::Red)),
+                Span::styled(
+                    if host == "local" {
+                        String::new()
+                    } else {
+                        format!(" @{host}")
+                    },
+                    Style::default().fg(DIM),
+                ),
+            ]))
+        }
+        TreeRow::Session {
+            host,
+            id,
+            agent,
+            title,
+            state,
+        } => {
+            let is_active = active
+                .is_some_and(|(active_host, active_id)| active_host == host && active_id == id);
+            let prefix = if is_active { "  ▸" } else { "   " };
+            let label = format!("{prefix}{} {}", state.glyph(), title);
+            let style = if is_active {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                state_style(*state)
+            };
+            let agent = match agent {
+                AgentKind::Claude => " c",
+                AgentKind::Codex => " x",
+                AgentKind::Shell => " $",
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    util::one_line(&label, width.saturating_sub(2).max(1)),
+                    style,
+                ),
+                Span::styled(agent, Style::default().fg(DIM)),
+            ]))
+        }
+        TreeRow::NewSession { .. } => ListItem::new(Line::from(Span::styled(
+            "   ＋ New session",
+            Style::default().fg(ACCENT),
+        ))),
+        TreeRow::Note(text) => ListItem::new(Line::from(Span::styled(
+            util::one_line(text, width.max(1)),
+            Style::default().fg(DIM),
+        ))),
+    }
+}
+
+fn draw_agent_picker(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    picker: &AgentPicker,
+) {
+    let mut lines = vec![Line::styled(
+        format!(" New session in {}", util::one_line(&picker.project, 18)),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    for (index, label) in ["Codex", "Claude", "Shell"].iter().enumerate() {
+        lines.push(Line::styled(
+            format!(" {label}"),
+            if picker.selected == index {
+                Style::default()
+                    .fg(ACCENT)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ));
+    }
+    lines.push(Line::styled(" Esc cancels", Style::default().fg(DIM)));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn state_style(state: State) -> Style {
+    match state {
+        State::NeedsYou | State::Exited => Style::default().fg(Color::Red),
+        State::Done | State::YourTurn => Style::default().fg(Color::Green),
+        State::Working => Style::default().fg(Color::Yellow),
+        State::Up => Style::default().fg(Color::Blue),
+        State::Down => Style::default().fg(DIM),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Folder, Probe, Session};
+    use crate::reconcile::SessionView;
+
+    #[test]
+    fn tree_groups_sessions_under_their_project() {
+        let host = Host::new("local".into(), None);
+        let folder = Folder::new("/work/project".into());
+        let mut first = Session::new(folder.id, AgentKind::Codex, "session 1".into());
+        first.created_at = 10;
+        first.last_attached = Some(20);
+        let mut second = Session::new(folder.id, AgentKind::Claude, "session 2".into());
+        second.created_at = 20;
+        second.last_attached = Some(10);
+        let probe = HostProbe {
+            host: host.clone(),
+            probe: Some(Probe {
+                folders: vec![folder],
+                sessions: vec![
+                    SessionView {
+                        session: second,
+                        state: State::Down,
+                        preview: None,
+                        attention: None,
+                    },
+                    SessionView {
+                        session: first,
+                        state: State::Working,
+                        preview: None,
+                        attention: None,
+                    },
+                ],
+                ..Probe::default()
+            }),
+            error: None,
+        };
+
+        let rows = build_tree(
+            std::slice::from_ref(&host),
+            std::slice::from_ref(&probe),
+            &HashSet::new(),
+        );
+        assert!(matches!(
+            &rows[0],
+            TreeRow::Project { name, .. } if name == "project"
+        ));
+        assert!(matches!(
+            &rows[1],
+            TreeRow::NewSession { project, .. } if project == "project"
+        ));
+        assert!(matches!(
+            &rows[2],
+            TreeRow::Session { title, .. } if title == "session 1"
+        ));
+        assert!(matches!(
+            &rows[3],
+            TreeRow::Session { title, .. } if title == "session 2"
+        ));
+
+        let collapsed = HashSet::from([(
+            "local".to_string(),
+            match &rows[0] {
+                TreeRow::Project { folder, .. } => *folder,
+                _ => Uuid::nil(),
+            },
+        )]);
+        let folded = build_tree(
+            std::slice::from_ref(&host),
+            std::slice::from_ref(&probe),
+            &collapsed,
+        );
+        assert_eq!(folded.len(), 1);
+        assert!(matches!(
+            &folded[0],
+            TreeRow::Project {
+                collapsed: true,
+                ..
+            }
+        ));
+    }
+}

@@ -173,10 +173,14 @@ pub fn reconcile(input: Inputs<'_>) -> (Vec<SessionView>, Vec<Orphan>) {
     (views, orphans)
 }
 
-/// A tmux session is ours if it carries our tag, or — for sessions started
-/// before tagging existed — if it is named the way we name them.
+/// Agent sessions always carry the `bzk-` name.
+///
+/// The owner format can inherit a pane option when it is read while listing a
+/// session. The dashboard's viewer pane intentionally carries that option, so
+/// treating an owner value alone as proof would report the `bizik` dashboard
+/// itself as an orphaned agent session.
 fn looks_like_ours(t: &TmuxSession) -> bool {
-    t.owner.is_some() || t.name.starts_with("bzk-")
+    t.name.starts_with("bzk-")
 }
 
 /// Which running agent belongs to this session.
@@ -391,6 +395,20 @@ mod tests {
             owner: None,
         };
         let (_, orphans) = run(&[], &[theirs], &[]);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn the_dashboard_is_not_an_orphan_when_its_viewer_pane_exposes_an_owner() {
+        let dashboard = TmuxSession {
+            name: "bizik".into(),
+            created: 0,
+            attached: true,
+            windows: 2,
+            preview: None,
+            owner: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        let (_, orphans) = run(&[], &[dashboard], &[]);
         assert!(orphans.is_empty());
     }
 

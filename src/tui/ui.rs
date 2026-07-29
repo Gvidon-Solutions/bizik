@@ -17,7 +17,7 @@ use crate::reconcile::State;
 use crate::util::one_line;
 
 const DIM: Color = Color::DarkGray;
-const ACCENT: Color = Color::Cyan;
+const ACCENT: Color = Color::Magenta;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
@@ -54,7 +54,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     for (i, tab) in Screen::TABS.iter().enumerate() {
         let selected = active == Some(i);
         let style = if selected {
-            Style::default().fg(Color::Black).bg(ACCENT)
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else {
             Style::default().fg(DIM)
         };
@@ -66,7 +68,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     if active.is_none() {
         spans.push(Span::styled(
             format!(" › {} ", current.title()),
-            Style::default().fg(Color::Black).bg(ACCENT),
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
         ));
     }
 
@@ -264,8 +268,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     // error that gets repeated.
     if let Some((text, kind, _)) = &app.state.toast {
         let style = match kind {
-            ToastKind::Info => Style::default().fg(Color::Black).bg(Color::Green),
-            ToastKind::Error => Style::default().fg(Color::White).bg(Color::Red),
+            ToastKind::Info => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ToastKind::Error => Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(format!(" {text} "), style))),
@@ -277,7 +285,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.state.filtering {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" filter: ", Style::default().fg(Color::Black).bg(ACCENT)),
+                Span::styled(
+                    " filter: ",
+                    Style::default()
+                        .fg(ACCENT)
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                ),
                 Span::raw(format!(" {}▏", app.state.filter)),
                 Span::styled("  enter keep · esc clear", Style::default().fg(DIM)),
             ])),
@@ -293,8 +306,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Some(Screen::Folder { .. }) => {
             "enter start+view · b background · space select · x stop · d forget · esc back"
         }
-        Some(Screen::Running) => "enter view · space select · x stop · w panes · esc back",
-        Some(Screen::Layouts) => "enter restore · S save open panes · d delete · esc back",
+        Some(Screen::Running) => "enter view · space select · x stop · w workspace · esc back",
+        Some(Screen::Layouts) => "enter restore · S save workspace · d delete · esc back",
         Some(Screen::Hosts) => "i install bizik · r refresh · esc back",
         None => "",
     };
@@ -332,23 +345,24 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  tab / ⇧tab    switch screen  /     filter"),
         Line::from("  esc           back — always  q     detach (everything keeps running)"),
         Line::from("  Q             close the panes and the dashboard on this machine"),
+        Line::from("  F10           show / hide the project and session sidebar"),
         Line::from(""),
         Line::from(Span::styled(
             "sessions",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  enter         start and open a pane"),
+        Line::from("  enter         start and show beside the sidebar"),
         Line::from("  b             start in the background, stay here"),
-        Line::from("  space         select · then enter opens them all at once"),
+        Line::from("  space         select · then enter starts them all"),
         Line::from("  x             stop (conversation is kept)"),
         Line::from("  d             forget the record · unmark a folder"),
-        Line::from("  w             jump to the pane window"),
+        Line::from("  w             jump to the sidebar workspace"),
         Line::from(""),
         Line::from(Span::styled(
             "layouts and hosts",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  S             save the open panes as a layout"),
+        Line::from("  S             save the active workspace as a layout"),
         Line::from("  i             install bizik on the selected host"),
         Line::from("  r             refresh now"),
         Line::from(""),
@@ -373,7 +387,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Style::default().fg(ACCENT),
         )),
         Line::from(Span::styled(
-            "between panes: click, or tmux prefix then arrows · z zooms one full screen",
+            "click a top tab or sidebar session to switch · z zooms the agent",
             Style::default().fg(DIM),
         )),
         Line::from(Span::styled(

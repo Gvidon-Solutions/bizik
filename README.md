@@ -1,8 +1,8 @@
 # bizik
 
 Mark folders on the machines you work on. From one screen, launch Claude Code or
-Codex sessions in any of them, watch several at once, and see which one is
-waiting on you.
+Codex sessions in any of them, switch between them from a project sidebar, and
+see which one is waiting on you.
 
 The module boundaries, persistence invariants, quality gates, and current
 refactoring roadmap are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -28,7 +28,7 @@ viewer. Close the lid, lose the wifi, reboot — the work carries on, and a seco
 laptop is just another viewer.
 
 **tmux does the multiplexing.** bizik decides what to start and where to put it;
-tmux draws the panes. An agent's own full-screen interface keeps working
+tmux draws the sidebar and active viewer. An agent's own full-screen interface keeps working
 properly — scrollback, mouse, resize, copy mode — because nothing reimplements a
 terminal.
 
@@ -167,14 +167,15 @@ dashboard costs nothing.
 | `esc` | back — always, at every depth |
 | `q` | detach — hands the terminal back, everything keeps running |
 | `Q` | close the panes and the dashboard on this machine |
-| `enter` | start a session and open a pane |
+| `F10` | show or hide the project/session sidebar |
+| `enter` | start a session and show it beside the sidebar |
 | `b` | start it in the background and stay here |
-| `space` | select · then `enter` opens them all at once |
+| `space` | select · then `enter` starts them all; the sidebar lists each one |
 | `x` | stop a session (its conversation is kept) |
 | `d` | forget a session · unmark a folder |
 | `e` | rename a folder |
-| `w` | jump to the pane window |
-| `S` | save the open panes as a layout |
+| `w` | jump to the sidebar workspace |
+| `S` | save the active workspace as a layout |
 | `i` | install bizik on the selected host |
 | `r` | refresh now |
 | `?` | this list |
@@ -182,26 +183,31 @@ dashboard costs nothing.
 Starting happens off the drawing thread — the header shows `starting N…` and the
 list stays responsive while ssh does its work.
 
-Restoring a layout wants the pane window to itself: if panes are open that the
-layout does not know about, it offers to close them and replay the saved
-geometry exactly, rather than silently tiling everything together.
+The workspace lives in a window called `bzk-work`: a project/session tree on
+the left and one active agent on the right. Opening another session replaces
+only the viewer on the right; every agent keeps running in its own detached
+tmux session. Click a session in the tree to switch. Right-click it to rename or
+close it; closing stops the session but keeps the agent's conversation on disk.
+Click a project name to fold or unfold its sessions, and click
+`＋ New session` to choose Codex, Claude or a shell for that project. `F10`
+hides or restores the tree; `BIZIK_SIDEBAR_KEY=F9 bzk` picks another key and
+`BIZIK_SIDEBAR_WIDTH=36 bzk` changes its width.
 
-Panes open in a window called `bzk-work`, and the dashboard stays in its own
-window — so `S`, `x` and everything else are pressed there, not from inside a
-pane where the agent owns the keyboard.
+The dashboard stays in its own window, so `S`, `x` and everything else are
+pressed there, not from inside the agent where it owns the keyboard.
 
-**`F12` gets you back to the dashboard from any pane.** bizik binds it when it
+**`F12` gets you back to the dashboard from the workspace.** bizik binds it when it
 starts, and the binding is conditional: outside bizik's own tmux session the key
 passes straight through to whatever is running, so nothing else is affected.
 `BIZIK_RETURN_KEY=F9 bzk` picks a different one; tmux prefix then `0` always
 works too.
 
-Between panes: click one, or tmux prefix and an arrow key. `prefix z` zooms the
-current pane to the whole window and back — with four panes open that is the one
-worth remembering. From the dashboard, `enter` on a session that is already open
-jumps to its pane rather than opening a second copy of it.
+Click the sidebar or use tmux prefix plus an arrow key to move between the tree
+and the active agent. In the sidebar, `↑`/`↓` selects a project, new-session
+action or session, and `Enter` activates it. `prefix z` zooms the active agent
+to the whole window and back.
 
-Each pane carries a label along its bottom edge — ` back · anogem · claude ` —
+The active agent carries a label along its bottom edge — ` back · anogem · claude ` —
 the machine, the directory and the agent. That is the tmux session on the host
 drawing its own status line inside the pane; left alone it shows bizik's
 bookkeeping (`bzk-6aaaf1:claude*`), which tells the reader nothing.

@@ -390,8 +390,8 @@ impl App {
         });
     }
 
-    /// Open panes for a finished batch. Runs on the drawing thread, where every
-    /// call is a local tmux command and therefore fast.
+    /// Show a finished batch in the sidebar workspace. Runs on the drawing
+    /// thread, where every call is a local tmux command and therefore fast.
     fn finish_batch(&mut self, batch: LaunchBatch) {
         self.state.starting = self.state.starting.saturating_sub(batch.results.len());
 
@@ -430,7 +430,7 @@ impl App {
             let _ = actions::focus_work();
         }
 
-        // The moment panes open is the moment the dashboard goes off screen, so
+        // The moment the workspace opens is when the dashboard goes off screen, so
         // that is where the way back belongs — not only in the help overlay.
         let back = if batch.background {
             String::new()
@@ -446,7 +446,11 @@ impl App {
             self.info(format!(
                 "{opened} session{} {}{back}",
                 if opened == 1 { "" } else { "s" },
-                if batch.background { "started" } else { "open" }
+                if batch.background {
+                    "started"
+                } else {
+                    "available in sidebar"
+                }
             ));
         }
         self.kick_refresh();

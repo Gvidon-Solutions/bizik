@@ -25,6 +25,7 @@ mod model;
 mod probe;
 mod reconcile;
 mod remote;
+mod sidebar;
 mod store;
 mod tmux;
 mod tui;
