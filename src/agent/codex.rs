@@ -4,11 +4,11 @@
 //! The first record is `session_meta`, whose payload carries the working
 //! directory and the session id — cheaper to read than Claude's format.
 //!
-//! What Codex does *not* have is any equivalent of Claude's live registry or
-//! its generated titles. So [`Caps`] reports `titles: false` and
-//! `live_status: false`, liveness is recovered by walking `/proc`, and the UI
-//! shows those sessions as running-or-not rather than pretending to know
-//! whether one is waiting on input.
+//! Codex has no process registry or generated titles. So [`Caps`] still reports
+//! `titles: false` and `live_status: false`, and liveness is recovered by
+//! walking `/proc`. When bizik's lifecycle hooks are installed, their exact
+//! per-session reports refine that process-level view into working, waiting,
+//! and done.
 
 use anyhow::Result;
 use serde_json::Value;

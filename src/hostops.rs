@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::agent;
@@ -14,7 +15,7 @@ use crate::application::SessionTerminator;
 use crate::model::Session;
 use crate::store::HostStore;
 use crate::tmux::{self, SessionRef};
-use crate::util::{now_ms, proc_ppid};
+use crate::util::{now_ms, proc_ppid, shell_quote};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SpawnResult {
@@ -57,6 +58,13 @@ pub fn spawn(session_id: Uuid, host_label: Option<&str>) -> Result<SpawnResult> 
     }
 
     let raw = adapter.launch_cmd(session.agent_session_id.as_deref());
+    // Hooks inherit the agent process environment. Carrying bizik's stable UUID
+    // lets a hook identify the exact sidebar row even when several Codex
+    // processes share the same working directory.
+    let raw = format!(
+        "BZK_SESSION_ID={} {raw}",
+        shell_quote(&session.id.to_string())
+    );
     let wrapped = tmux::wrap_command(session.agent.as_str(), &raw, &folder.path);
     let name = SessionRef::new(session.tmux_name());
     let started = tmux::spawn_detached(&name, &folder.path, &wrapped)?;
@@ -162,6 +170,42 @@ pub fn relink_sessions(store: &mut HostStore) -> usize {
     fixed
 }
 
+/// Repair Codex conversation pointers from hook reports. Unlike process
+/// inspection, a hook carries both the agent-native thread id and bizik's UUID
+/// inherited through `BZK_SESSION_ID`, so it remains exact with several agents
+/// in the same directory.
+pub fn relink_sessions_from_hooks(
+    store: &mut HostStore,
+    marks: &HashMap<String, crate::attention::Mark>,
+) -> usize {
+    let ids: Vec<Uuid> = store
+        .live_sessions()
+        .iter()
+        .map(|session| session.id)
+        .collect();
+    let mut fixed = 0;
+    for id in ids {
+        let Some(agent_id) = marks
+            .get(&id.to_string())
+            .and_then(|mark| mark.agent_session_id.as_ref())
+        else {
+            continue;
+        };
+        let Some(session) = store.session(id) else {
+            continue;
+        };
+        if session.agent_session_id.as_ref() == Some(agent_id) {
+            continue;
+        }
+        if let Some(session) = store.session_mut(id) {
+            session.agent_session_id = Some(agent_id.clone());
+            session.updated_at = now_ms();
+            fixed += 1;
+        }
+    }
+    fixed
+}
+
 /// Whether `pid` sits under `root` in the process tree. The walk is bounded so
 /// a malformed `/proc` cannot spin here.
 fn is_descendant(pid: u32, root: u32) -> bool {
@@ -181,6 +225,7 @@ fn is_descendant(pid: u32, root: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::{Mark, State};
 
     #[test]
     fn a_process_is_its_own_descendant() {
@@ -199,5 +244,42 @@ mod tests {
         let me = std::process::id();
         let parent = proc_ppid(me).expect("this test needs /proc");
         assert!(is_descendant(me, parent));
+    }
+
+    #[test]
+    fn a_bizik_keyed_hook_repairs_the_codex_conversation_pointer() {
+        let session = Session::new(
+            Uuid::new_v4(),
+            crate::model::AgentKind::Codex,
+            "work".into(),
+        );
+        let session_id = session.id;
+        let mut store = HostStore::default();
+        store.sessions.push(session);
+        let marks = HashMap::from([(
+            session_id.to_string(),
+            Mark {
+                state: State::Working,
+                agent_session_id: Some("codex-thread-id".into()),
+                cwd: Some("/repo".into()),
+                message: None,
+                at: 1,
+            },
+        )]);
+
+        assert_eq!(relink_sessions_from_hooks(&mut store, &marks), 1);
+        assert_eq!(
+            store
+                .session(session_id)
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("codex-thread-id")
+        );
+        assert_eq!(
+            relink_sessions_from_hooks(&mut store, &marks),
+            0,
+            "an unchanged pointer is not rewritten"
+        );
     }
 }

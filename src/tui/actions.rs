@@ -21,6 +21,7 @@ pub const SIDEBAR_ROLE: &str = "sidebar";
 pub const VIEWER_ROLE: &str = "viewer";
 const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
 const SIDEBAR_HIDDEN: &str = "@bzk_sidebar_hidden";
+const SIDEBAR_WIDTH: &str = "@bzk_sidebar_width";
 
 fn work_window() -> Option<String> {
     tmux::find_window(WORK_WINDOW)
@@ -102,6 +103,12 @@ pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> 
     let cmd = remote::attach_command(host, tmux_name);
     let (window, panes, created) = if let Some(window) = work_window() {
         let panes = tmux::window_panes(&window)?;
+        if let Some(sidebar) = panes
+            .iter()
+            .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE))
+        {
+            remember_sidebar_width(&window, &sidebar.pane);
+        }
         (window, panes, None)
     } else {
         let viewer = tmux::new_window(WORK_WINDOW, &cmd)?;
@@ -158,6 +165,7 @@ pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> 
         let _ = ensure_sidebar(&window, &viewer)?;
     }
     fit_workspace(&window)?;
+    tmux::style_app_window(&window);
     tmux::select_pane(&viewer)?;
     Ok(viewer)
 }
@@ -169,7 +177,11 @@ fn ensure_sidebar(window: &str, viewer: &str) -> Result<String> {
     {
         return Ok(sidebar.pane.clone());
     }
-    let sidebar = tmux::split_window_left(viewer, sidebar_width(), &navigator_command()?)?;
+    let sidebar = tmux::split_window_left(
+        viewer,
+        remembered_sidebar_width(window),
+        &navigator_command()?,
+    )?;
     tmux::tag_pane_role(&sidebar, SIDEBAR_ROLE)?;
     Ok(sidebar)
 }
@@ -183,12 +195,25 @@ fn navigator_command() -> Result<String> {
     ))
 }
 
-fn sidebar_width() -> u16 {
+fn configured_sidebar_width() -> u16 {
     std::env::var("BIZIK_SIDEBAR_WIDTH")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_SIDEBAR_WIDTH)
         .clamp(20, 60)
+}
+
+fn remembered_sidebar_width(window: &str) -> u16 {
+    tmux::window_option(window, SIDEBAR_WIDTH)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(configured_sidebar_width)
+        .max(20)
+}
+
+fn remember_sidebar_width(window: &str, pane: &str) {
+    if let Some(width) = tmux::pane_width(pane) {
+        let _ = tmux::set_window_option(window, SIDEBAR_WIDTH, &width.to_string());
+    }
 }
 
 fn sidebar_hidden(window: &str) -> bool {
@@ -206,6 +231,7 @@ pub fn toggle_sidebar() -> Result<()> {
         .iter()
         .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE))
     {
+        remember_sidebar_width(&window, &sidebar.pane);
         tmux::set_window_option(&window, SIDEBAR_HIDDEN, "1")?;
         tmux::kill_pane(&sidebar.pane)?;
     } else {
@@ -217,6 +243,38 @@ pub fn toggle_sidebar() -> Result<()> {
         ensure_sidebar(&window, &viewer.pane)?;
     }
     fit_workspace(&window)
+}
+
+/// Show the sidebar when necessary and move keyboard focus into it.
+pub fn focus_sidebar() -> Result<()> {
+    let window = work_window().context("the workspace is not open yet")?;
+    let panes = tmux::window_panes(&window)?;
+    let sidebar = if let Some(sidebar) = panes
+        .iter()
+        .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE))
+    {
+        sidebar.pane.clone()
+    } else {
+        let viewer = panes
+            .iter()
+            .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
+            .context("open a session before focusing the sidebar")?;
+        tmux::set_window_option(&window, SIDEBAR_HIDDEN, "0")?;
+        ensure_sidebar(&window, &viewer.pane)?
+    };
+    tmux::select_window(&window)?;
+    tmux::select_pane(&sidebar)
+}
+
+/// Move keyboard focus from the sidebar back to the active agent.
+pub fn focus_viewer() -> Result<()> {
+    let window = work_window().context("the workspace is not open yet")?;
+    let viewer = tmux::window_panes(&window)?
+        .into_iter()
+        .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
+        .context("no active session is open")?;
+    tmux::select_window(&window)?;
+    tmux::select_pane(&viewer.pane)
 }
 
 /// Whether this pane is showing that session, by tag or by what it was started
@@ -329,7 +387,7 @@ fn fit_workspace(window: &str) -> Result<()> {
         .iter()
         .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE))
     {
-        let _ = tmux::resize_pane_width(&sidebar.pane, sidebar_width());
+        let _ = tmux::resize_pane_width(&sidebar.pane, remembered_sidebar_width(window));
     }
     Ok(())
 }

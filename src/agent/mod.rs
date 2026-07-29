@@ -3,7 +3,8 @@
 //! Every agent stores its conversations differently, and — importantly — they
 //! do not offer the same information. Claude Code writes a generated title into
 //! its transcript and maintains a live registry with a busy/idle status; Codex
-//! has neither. Rather than reduce both to a lowest common denominator, each
+//! has neither. Lifecycle hooks provide finer per-session states when
+//! configured. Rather than reduce both to a lowest common denominator, each
 //! adapter declares [`Caps`] and the UI degrades *visibly*: a missing status is
 //! shown as unknown, never invented.
 //!

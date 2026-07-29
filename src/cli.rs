@@ -30,6 +30,14 @@ enum Cmd {
     #[command(hide = true)]
     ToggleSidebar,
 
+    /// Move focus to the project/session sidebar
+    #[command(hide = true)]
+    FocusSidebar,
+
+    /// Move focus to the active session viewer
+    #[command(hide = true)]
+    FocusViewer,
+
     /// Start and show one session in the workspace
     #[command(hide = true)]
     View {
@@ -124,11 +132,11 @@ enum Cmd {
     /// Record an agent hook firing. Called by the agent; reads JSON on stdin.
     #[command(hide = true)]
     Hook {
-        /// notification, permission, stop, prompt or end
+        /// notification, permission, stop, prompt, start or end
         event: String,
     },
 
-    /// Install, remove or inspect the hooks that report "waiting on you"
+    /// Install, remove or inspect Claude Code and Codex status hooks
     #[command(subcommand)]
     Hooks(HooksCmd),
 
@@ -184,7 +192,7 @@ enum EnvCmd {
 
 #[derive(Subcommand)]
 enum HooksCmd {
-    /// Add the hooks to a machine's Claude Code settings
+    /// Add status hooks to Claude Code and Codex
     Install {
         /// Host names; omit for this machine
         hosts: Vec<String>,
@@ -222,6 +230,8 @@ pub fn run() -> Result<()> {
         None | Some(Cmd::Tui) => cmd_tui(),
         Some(Cmd::Sidebar) => crate::sidebar::run(),
         Some(Cmd::ToggleSidebar) => tui::actions::toggle_sidebar(),
+        Some(Cmd::FocusSidebar) => tui::actions::focus_sidebar(),
+        Some(Cmd::FocusViewer) => tui::actions::focus_viewer(),
         Some(Cmd::View { host, session }) => cmd_view(&host, session),
         Some(Cmd::Mark(a)) => cmd_mark(a, false),
         Some(Cmd::MarkRepo(a)) => cmd_mark(a, true),
@@ -323,12 +333,24 @@ fn session_ref() -> tmux::SessionRef {
 
 fn bind_workspace_keys(session: &tmux::SessionRef) -> Result<()> {
     let exe = util::own_exe()?;
-    let command = format!(
+    let toggle = format!(
         "{}{} toggle-sidebar",
         util::config_env(),
         util::shell_quote(&exe.to_string_lossy())
     );
-    tmux::bind_workspace_key(session, &tui::actions::sidebar_key(), &command)
+    let focus_sidebar = format!(
+        "{}{} focus-sidebar",
+        util::config_env(),
+        util::shell_quote(&exe.to_string_lossy())
+    );
+    let focus_viewer = format!(
+        "{}{} focus-viewer",
+        util::config_env(),
+        util::shell_quote(&exe.to_string_lossy())
+    );
+    tmux::bind_workspace_key(session, &tui::actions::sidebar_key(), &toggle)?;
+    tmux::bind_workspace_key(session, "C-h", &focus_sidebar)?;
+    tmux::bind_workspace_key(session, "C-l", &focus_viewer)
 }
 
 fn cmd_view(host_name: &str, session: Uuid) -> Result<()> {
@@ -601,7 +623,7 @@ fn cmd_install(host: Option<String>) -> Result<()> {
 /// the exit status stays zero.
 fn cmd_hook(event: &str) -> Result<()> {
     let payload = std::io::read_to_string(std::io::stdin()).unwrap_or_default();
-    let outcome = if event == "end" {
+    let outcome = if matches!(event, "start" | "end") {
         attention::clear(&payload)
     } else {
         attention::record(event, &payload)
@@ -617,8 +639,10 @@ fn cmd_hooks(cmd: HooksCmd) -> Result<()> {
         HooksCmd::Install { hosts } if hosts.is_empty() => {
             let report = hooks::install()?;
             println!("installed on this machine: {}", report.added.join(", "));
-            println!("settings: {}", hooks::settings_path().display());
-            println!("a running session picks these up on its next start");
+            println!("Claude: {}", hooks::claude_settings_path().display());
+            println!("Codex:  {}", hooks::codex_hook_source_path().display());
+            println!("restart agent sessions to load hooks");
+            println!("Codex: run /hooks once to review and trust the installed commands");
         }
         HooksCmd::Uninstall { hosts } if hosts.is_empty() => {
             let report = hooks::uninstall()?;
@@ -931,7 +955,11 @@ fn cmd_doctor() -> Result<()> {
                     p.bzk_version,
                     p.folders.len(),
                     agents,
-                    if p.hooks_installed { "on" } else { "off" }
+                    if p.hooks_installed {
+                        "configured"
+                    } else {
+                        "missing"
+                    }
                 );
                 // A stale binary is invisible until something behaves oddly, and
                 // it is easy to leave behind after a rebuild.

@@ -431,6 +431,14 @@ pub fn resize_pane_width(pane: &str, width: u16) -> Result<()> {
     tmux(&["resize-pane", "-t", pane, "-x", &width]).map(|_| ())
 }
 
+pub fn pane_width(pane: &str) -> Option<u16> {
+    tmux(&["display-message", "-p", "-t", pane, "#{pane_width}"])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// The key that jumps back to the dashboard from inside any pane.
 pub fn return_key() -> String {
     std::env::var("BIZIK_RETURN_KEY").unwrap_or_else(|_| "F12".to_string())
@@ -503,6 +511,19 @@ pub fn set_window_option(window: &str, name: &str, value: &str) -> Result<()> {
     tmux(&["set-option", "-w", "-t", window, name, value]).map(|_| ())
 }
 
+/// Keep tmux's pane separator visually subordinate to the application.
+pub fn style_app_window(window: &str) {
+    for (option, value) in [
+        ("pane-border-status", "off"),
+        ("pane-border-style", "fg=colour250"),
+        ("pane-active-border-style", "fg=colour134"),
+        ("window-style", "fg=colour237,bg=colour255"),
+        ("window-active-style", "fg=colour237,bg=colour255"),
+    ] {
+        let _ = set_window_option(window, option, value);
+    }
+}
+
 pub fn window_option(window: &str, name: &str) -> Option<String> {
     tmux(&["show-options", "-w", "-v", "-t", window, name])
         .ok()
@@ -523,27 +544,37 @@ pub fn apply_session_options(session: &SessionRef) {
     if mouse_wanted() {
         let _ = set_session_option(session, "mouse", "on");
     }
+    // The application draws its own chrome. tmux's window list duplicates it
+    // and creates a second status bar beneath attached agent sessions.
+    for (option, value) in [
+        ("status", "off"),
+        ("message-style", "fg=colour237,bg=colour255"),
+        ("mode-style", "fg=colour255,bg=colour134"),
+    ] {
+        let _ = set_session_option(session, option, value);
+    }
 }
 
-/// Label the status bar a pane's session draws at its own bottom edge.
+/// Hide the status bar drawn by an attached agent session.
 ///
 /// Each pane is attached to a tmux session on the host, and that tmux paints a
-/// status line inside the pane. Left alone it shows its own session name and
-/// window list — `bzk-6aaaf1:claude*` — which is bizik's bookkeeping, not
-/// anything the reader needs. With six panes open the useful thing to see is
-/// which machine, which directory and which agent, so that is what goes there.
+/// second status line inside the pane. The sidebar already carries the project,
+/// session, agent and state, so the extra line is visual noise.
 ///
-/// `BIZIK_PANE_STATUS=off` leaves the remote session's status line alone.
+/// Set `BIZIK_PANE_STATUS=label` to restore the compact legacy label.
 pub fn label_session(session: &SessionRef, host: &str, folder: &str, agent: &str) {
-    if matches!(
+    let labelled = matches!(
         std::env::var("BIZIK_PANE_STATUS").as_deref(),
-        Ok("off") | Ok("0") | Ok("false")
-    ) {
+        Ok("label") | Ok("on") | Ok("1") | Ok("true")
+    );
+    if !labelled {
+        let _ = set_session_option(session, "status", "off");
         return;
     }
     let left = format!(" #[bold]{host}#[nobold] · {folder} · #[fg=colour109]{agent}#[default] ");
 
     for (option, value) in [
+        ("status", "on"),
         ("status-left", left.as_str()),
         ("status-left-length", "200"),
         // The window list and the clock are noise in a pane that only ever has

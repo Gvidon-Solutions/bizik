@@ -36,10 +36,10 @@ terminal.
 machine holds what is marked there. The laptop stores only its host list and its
 layouts. That is why a second laptop needs no synchronisation to see everything.
 
-**Status is never invented.** Claude Code publishes a busy/idle status; its
-hooks say whether idle means *blocked on you* or *finished*. Codex publishes
-nothing, so its sessions show *running* and nothing more. Where two agents share
-a folder and cannot be told apart, the status stays vague on purpose.
+**Status is never invented.** Lifecycle hooks attach every event to bizik's
+exact session id, so both Codex and Claude sessions can show *working*,
+*needs you*, and *done* even when several agents share one project. Without
+hooks, the status stays vague on purpose.
 
 ## Install
 
@@ -103,12 +103,12 @@ bzk hooks status               # where they are installed
 bzk hooks uninstall back       # removes exactly what was added
 ```
 
-This edits `~/.claude/settings.json` on that machine. It merges — every hook and
-setting already there is kept — and the original is copied to
-`settings.json.bzk-backup` the first time. Four events are added
-(`Notification`, `Stop`, `UserPromptSubmit`, `SessionEnd`), each running a
-fire-and-forget command that writes one small file. A session picks the hooks up
-when it next starts.
+This merges into `~/.claude/settings.json` and Codex's existing hook
+representation (`~/.codex/config.toml` or `~/.codex/hooks.json`) on that
+machine; every hook and setting already there is kept, and each original is
+backed up once. The handlers only write a small local state file. Restart agent
+sessions after installing. Codex also asks you to review and trust the exact
+commands before it will run them.
 
 `bzk doctor` reports which hosts have them, and flags a host still running an
 older binary after you rebuild.
@@ -168,6 +168,7 @@ dashboard costs nothing.
 | `q` | detach — hands the terminal back, everything keeps running |
 | `Q` | close the panes and the dashboard on this machine |
 | `F10` | show or hide the project/session sidebar |
+| `Ctrl+h` / `Ctrl+l` | focus the sidebar / active session |
 | `enter` | start a session and show it beside the sidebar |
 | `b` | start it in the background and stay here |
 | `space` | select · then `enter` starts them all; the sidebar lists each one |
@@ -202,16 +203,18 @@ passes straight through to whatever is running, so nothing else is affected.
 `BIZIK_RETURN_KEY=F9 bzk` picks a different one; tmux prefix then `0` always
 works too.
 
-Click the sidebar or use tmux prefix plus an arrow key to move between the tree
-and the active agent. In the sidebar, `↑`/`↓` selects a project, new-session
-action or session, and `Enter` activates it. `prefix z` zooms the active agent
-to the whole window and back.
+Click the sidebar, use `Ctrl+h` / `Ctrl+l`, or use tmux prefix plus an arrow key
+to move between the tree and the active agent. In the sidebar, `j`/`k` moves,
+`h` collapses or moves to the parent project, and `l` expands or opens. The same
+physical keys work in Russian layout: `о`/`л` and `р`/`д`. `e` (`у`) changes a
+project's display label or renames a session without touching its directory;
+`n` (`т`) creates a session. Arrow keys and `Enter` work too. `prefix z` zooms
+the active agent to the whole window and back.
 
-The active agent carries a label along its bottom edge — ` back · anogem · claude ` —
-the machine, the directory and the agent. That is the tmux session on the host
-drawing its own status line inside the pane; left alone it shows bizik's
-bookkeeping (`bzk-6aaaf1:claude*`), which tells the reader nothing.
-`BIZIK_PANE_STATUS=off` leaves that status line as tmux would have drawn it.
+The workspace and attached agent sessions hide tmux's own status bars: the
+sidebar already shows the project, session, agent and state, so duplicated
+window lists only add visual noise. `BIZIK_PANE_STATUS=label` restores the
+compact legacy label inside agent panes if you prefer it.
 
 The mouse is enabled for bizik's own tmux session only — clicking a pane selects
 it and the wheel scrolls its history, while every other session on your tmux

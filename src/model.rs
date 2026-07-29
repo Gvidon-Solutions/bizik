@@ -107,7 +107,7 @@ impl Folder {
 /// return to over days.
 ///
 /// `agent_session_id` is a *pointer* that gets repaired after each run — never
-/// a primary key. Claude keeps its session id stable across `--resume`, but the
+/// a primary key. Agents keep their session ids stable across resume, but the
 /// pointer can still be empty (session never started) or stale (transcript
 /// deleted), and the record must survive both.
 #[derive(Serialize, Deserialize, Clone, Debug)]

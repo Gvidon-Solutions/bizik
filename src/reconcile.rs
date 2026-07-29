@@ -20,6 +20,7 @@
 //! combination becomes a compile error in the `match` rather than a bug report.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::model::{AgentKind, LiveAgent, Session, TmuxSession};
 
@@ -57,18 +58,6 @@ impl State {
             State::Up => "running",
             State::Exited => "exited",
             State::Down => "stopped",
-        }
-    }
-
-    pub fn glyph(self) -> &'static str {
-        match self {
-            State::NeedsYou => "▲",
-            State::Done => "◆",
-            State::Working => "●",
-            State::YourTurn => "◇",
-            State::Up => "○",
-            State::Exited => "✕",
-            State::Down => "·",
         }
     }
 
@@ -129,6 +118,9 @@ pub struct Inputs<'a> {
     pub folder_path: &'a dyn Fn(uuid::Uuid) -> Option<String>,
     pub tmux: &'a [TmuxSession],
     pub live: &'a [LiveAgent],
+    /// Hook states keyed either by bizik's session UUID (new installs) or the
+    /// agent-native conversation id (backward compatibility).
+    pub hook_states: &'a HashMap<String, String>,
 }
 
 /// Join every source into one answer per session, plus whatever is running
@@ -146,13 +138,24 @@ pub fn reconcile(input: Inputs<'_>) -> (Vec<SessionView>, Vec<Orphan>) {
             // saying so beats claiming the agent died.
             None => Attribution::Ambiguous,
         };
-        let attention = match &agent {
+        let session_key = session.id.to_string();
+        let hook_attention = input
+            .hook_states
+            .get(&session_key)
+            .or_else(|| {
+                session
+                    .agent_session_id
+                    .as_ref()
+                    .and_then(|id| input.hook_states.get(id))
+            })
+            .cloned();
+        let attention = hook_attention.or_else(|| match &agent {
             Attribution::Agent(a) => a.attention.clone(),
             _ => None,
-        };
+        });
 
         views.push(SessionView {
-            state: decide(tmux.is_some(), &agent, session.agent),
+            state: decide(tmux.is_some(), &agent, session.agent, attention.as_deref()),
             preview: tmux.and_then(|t| t.preview.clone()),
             attention,
             session: session.clone(),
@@ -221,26 +224,35 @@ enum Attribution<'a> {
 }
 
 /// The whole decision, in one exhaustive place.
-fn decide(tmux_alive: bool, agent: &Attribution<'_>, kind: AgentKind) -> State {
-    match (tmux_alive, agent) {
-        (false, _) => State::Down,
+fn decide(
+    tmux_alive: bool,
+    agent: &Attribution<'_>,
+    kind: AgentKind,
+    hook_state: Option<&str>,
+) -> State {
+    if !tmux_alive {
+        return State::Down;
+    }
+    // Never let a stale marker hide a process that has actually exited.
+    if matches!(agent, Attribution::Absent) && kind != AgentKind::Shell {
+        return State::Exited;
+    }
+    match hook_state {
+        Some("waiting") => return State::NeedsYou,
+        Some("working") => return State::Working,
+        Some("done") => return State::Done,
+        _ => {}
+    }
+    match agent {
         // A plain shell has no agent process by design — the shell *is* what is
-        // running. Only a session that was supposed to hold an agent can be
-        // said to have lost it.
-        (true, Attribution::Absent) if kind == AgentKind::Shell => State::Up,
-        // Alive with no agent process anywhere in the folder: the agent exited
-        // and the wrapper left a shell behind. Reporting this as "running" is
-        // how a crashed session used to hide in plain sight.
-        (true, Attribution::Absent) => State::Exited,
+        // running.
+        Attribution::Absent if kind == AgentKind::Shell => State::Up,
+        Attribution::Absent => State::Exited,
         // Running, but which process is this session's cannot be known.
-        (true, Attribution::Ambiguous) => State::Up,
-        (true, Attribution::Agent(a)) => match (a.attention.as_deref(), a.status.as_str()) {
-            // `attention` reaches us only when the hook was the fresher report,
-            // so where it exists it is the better account.
-            (Some("waiting"), _) => State::NeedsYou,
-            (_, "busy") => State::Working,
-            (Some("done"), "idle") => State::Done,
-            (_, "idle") => State::YourTurn,
+        Attribution::Ambiguous => State::Up,
+        Attribution::Agent(a) => match a.status.as_str() {
+            "busy" => State::Working,
+            "idle" => State::YourTurn,
             _ => State::Up,
         },
     }
@@ -285,11 +297,21 @@ mod tests {
         tmux: &[TmuxSession],
         live: &[LiveAgent],
     ) -> (Vec<SessionView>, Vec<Orphan>) {
+        run_with_hooks(sessions, tmux, live, &HashMap::new())
+    }
+
+    fn run_with_hooks(
+        sessions: &[Session],
+        tmux: &[TmuxSession],
+        live: &[LiveAgent],
+        hook_states: &HashMap<String, String>,
+    ) -> (Vec<SessionView>, Vec<Orphan>) {
         reconcile(Inputs {
             sessions,
             folder_path: &|_| Some("/repo".to_string()),
             tmux,
             live,
+            hook_states,
         })
     }
 
@@ -359,6 +381,18 @@ mod tests {
         ];
         let (views, _) = run(std::slice::from_ref(&s), &[tmux_for(&s)], &live);
         assert_eq!(views[0].state, State::Up, "ambiguity must not be resolved");
+    }
+
+    #[test]
+    fn a_bizik_keyed_hook_disambiguates_codex_in_a_shared_folder() {
+        let s = session(AgentKind::Codex, None);
+        let live = [
+            agent(AgentKind::Codex, "/repo", None, "unknown"),
+            agent(AgentKind::Codex, "/repo", None, "unknown"),
+        ];
+        let hooks = HashMap::from([(s.id.to_string(), "working".to_string())]);
+        let (views, _) = run_with_hooks(std::slice::from_ref(&s), &[tmux_for(&s)], &live, &hooks);
+        assert_eq!(views[0].state, State::Working);
     }
 
     #[test]

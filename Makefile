@@ -78,8 +78,8 @@ hosts:
 push:
 	$(PREFIX)/bzk install
 
-# Edits ~/.claude/settings.json on each host, merging rather than replacing.
-# Without these, an idle session cannot be told apart from a blocked one.
+# Installs lifecycle hooks for supported agents on each host, merging rather
+# than replacing. Without them, idle and blocked cannot be told apart.
 hooks:
 	@names=""; for h in $(HOSTS); do names="$$names $${h%%=*}"; done; \
 	$(PREFIX)/bzk hooks install $$names

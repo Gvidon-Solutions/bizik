@@ -16,14 +16,29 @@ use super::{App, InputKind, Overlay, Screen, ToastKind};
 use crate::reconcile::State;
 use crate::util::one_line;
 
-const DIM: Color = Color::DarkGray;
-const ACCENT: Color = Color::Magenta;
+const BG: Color = Color::Rgb(239, 241, 245);
+const SURFACE: Color = Color::Rgb(230, 233, 239);
+const SELECTED: Color = Color::Rgb(220, 224, 232);
+const FG: Color = Color::Rgb(76, 79, 105);
+const DIM: Color = Color::Rgb(140, 143, 161);
+const ACCENT: Color = Color::Rgb(136, 57, 239);
+const RED: Color = Color::Rgb(210, 15, 57);
+const GREEN: Color = Color::Rgb(64, 160, 43);
+const YELLOW: Color = Color::Rgb(223, 142, 29);
+const BLUE: Color = Color::Rgb(30, 102, 245);
+const BORDER: Color = Color::Rgb(188, 192, 204);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    frame.render_widget(Clear, frame.area());
+    frame.render_widget(
+        Block::default().style(Style::default().fg(FG).bg(BG)),
+        frame.area(),
+    );
+
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Min(3),
-        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .areas(frame.area());
 
@@ -48,17 +63,18 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let active = current.tab_index();
 
     let mut spans = vec![Span::styled(
-        " bizik ",
+        "  🧭 BIZIK  ",
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )];
     for (i, tab) in Screen::TABS.iter().enumerate() {
         let selected = active == Some(i);
         let style = if selected {
             Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(DIM).bg(SURFACE)
         };
         spans.push(Span::styled(format!(" {} ", tab.title()), style));
     }
@@ -69,8 +85,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             format!(" › {} ", current.title()),
             Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -78,14 +95,23 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     // otherwise a slow ssh looks like a key that did nothing.
     if app.state.starting > 0 {
         spans.push(Span::styled(
-            format!("  starting {}…", app.state.starting),
+            format!("  🚀 starting {}…", app.state.starting),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     } else if app.state.refreshing {
-        spans.push(Span::styled("  refreshing…", Style::default().fg(DIM)));
+        spans.push(Span::styled("  🔄 refreshing…", Style::default().fg(DIM)));
     }
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .style(Style::default().fg(FG).bg(SURFACE))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(BORDER)),
+            ),
+        area,
+    );
 }
 
 fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -98,9 +124,15 @@ fn draw_body(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let list = List::new(items)
+        .style(Style::default().fg(FG).bg(BG))
         .block(Block::default().borders(Borders::NONE))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▌");
+        .highlight_style(
+            Style::default()
+                .fg(FG)
+                .bg(SELECTED)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("  ");
 
     frame.render_stateful_widget(list, area, &mut app.state.list);
 }
@@ -117,28 +149,26 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
         } => {
             let mut spans = vec![
                 Span::styled(format!("{:<10}", trunc(host, 10)), Style::default().fg(DIM)),
-                Span::raw(format!("{:<24}", trunc(&folder.display_name(), 24))),
+                Span::raw(format!("📁 {:<21}", trunc(&folder.display_name(), 21))),
             ];
             if *blocked > 0 {
                 spans.push(Span::styled(
-                    format!("▲ {blocked} blocked  "),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    format!("🔔 {blocked} blocked  "),
+                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
                 ));
             } else if *attention > 0 {
                 spans.push(Span::styled(
-                    format!("◆ {attention} waiting  "),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
+                    format!("👀 {attention} waiting  "),
+                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                 ));
             } else if *running > 0 {
                 spans.push(Span::styled(
-                    format!("● {running} running  "),
-                    Style::default().fg(Color::Yellow),
+                    format!("🟢 {running} running  "),
+                    Style::default().fg(YELLOW),
                 ));
             } else if *sessions > 0 {
                 spans.push(Span::styled(
-                    format!("· {sessions} stopped  "),
+                    format!("⚫ {sessions} stopped  "),
                     Style::default().fg(DIM),
                 ));
             } else {
@@ -147,7 +177,7 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
             if let Some(branch) = &folder.git_branch {
                 spans.push(Span::styled(
                     format!("{} ", trunc(branch, 16)),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(ACCENT),
                 ));
             }
             spans.push(Span::styled(
@@ -158,7 +188,7 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
         }
 
         Row::NewSession { agent, .. } => ListItem::new(Line::from(vec![
-            Span::styled("＋ ", Style::default().fg(ACCENT)),
+            Span::styled("➕ ", Style::default().fg(ACCENT)),
             Span::styled(
                 format!("new {agent} session"),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -170,11 +200,11 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
             let picked = app.state.selected.contains(&(host.clone(), session.id));
             let mut spans = vec![
                 Span::styled(
-                    if picked { "✓ " } else { "  " },
+                    if picked { "✅ " } else { "   " },
                     Style::default().fg(ACCENT),
                 ),
                 Span::styled(
-                    format!("{} {:<10}", status.glyph(), status.label()),
+                    format!("{} {:<10}", status_emoji(status), status.label()),
                     status_style(status),
                 ),
                 Span::styled(format!("{:<9}", trunc(host, 9)), Style::default().fg(DIM)),
@@ -196,7 +226,7 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
         Row::Chat { chat, .. } => {
             let when = ago(chat.last_active);
             ListItem::new(Line::from(vec![
-                Span::styled("  ↺ ", Style::default().fg(DIM)),
+                Span::styled("  💬 ", Style::default().fg(DIM)),
                 Span::styled(
                     format!("{:<7}", chat.agent.as_str()),
                     Style::default().fg(DIM),
@@ -208,8 +238,8 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
 
         Row::HostEntry { host, detail, ok } => ListItem::new(Line::from(vec![
             Span::styled(
-                if *ok { "● " } else { "✕ " },
-                Style::default().fg(if *ok { Color::Green } else { Color::Red }),
+                if *ok { "🟢 " } else { "🔴 " },
+                Style::default().fg(if *ok { GREEN } else { RED }),
             ),
             Span::raw(format!("{:<16}", trunc(&host.name, 16))),
             Span::styled(
@@ -224,7 +254,7 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
 
         Row::LayoutEntry { layout, missing } => {
             let mut spans = vec![
-                Span::styled("▦ ", Style::default().fg(ACCENT)),
+                Span::styled("🗂️ ", Style::default().fg(ACCENT)),
                 Span::raw(format!("{:<24}", trunc(&layout.name, 24))),
                 Span::styled(
                     format!("{} panes", layout.panes.len()),
@@ -234,32 +264,42 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
             if *missing > 0 {
                 spans.push(Span::styled(
                     format!("  {missing} missing"),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(RED),
                 ));
             }
             ListItem::new(Line::from(spans))
         }
 
         Row::Note(text) => ListItem::new(Line::from(Span::styled(
-            format!("  {text}"),
-            Style::default().fg(Color::Yellow),
+            format!("  ℹ️ {text}"),
+            Style::default().fg(YELLOW),
         ))),
     }
 }
 
 fn status_style(status: State) -> Style {
     match status {
-        State::NeedsYou => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        State::Done => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        State::Working => Style::default().fg(Color::Yellow),
-        State::YourTurn => Style::default().fg(Color::Green),
+        State::NeedsYou => Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        State::Done => Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        State::Working => Style::default().fg(YELLOW),
+        State::YourTurn => Style::default().fg(GREEN),
         // The agent is gone and only the fallback shell is left. Red, because
         // it looked like "running" for as long as nobody distinguished them.
-        State::Exited => Style::default().fg(Color::Red),
-        State::Up => Style::default().fg(Color::Blue),
+        State::Exited => Style::default().fg(RED),
+        State::Up => Style::default().fg(BLUE),
         State::Down => Style::default().fg(DIM),
+    }
+}
+
+fn status_emoji(status: State) -> &'static str {
+    match status {
+        State::NeedsYou => "🔔",
+        State::Done => "✅",
+        State::Working => "🟡",
+        State::YourTurn => "👀",
+        State::Up => "🟢",
+        State::Exited => "🔴",
+        State::Down => "⚫",
     }
 }
 
@@ -269,14 +309,22 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some((text, kind, _)) = &app.state.toast {
         let style = match kind {
             ToastKind::Info => Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                .fg(GREEN)
+                .bg(SURFACE)
+                .add_modifier(Modifier::BOLD),
             ToastKind::Error => Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                .fg(RED)
+                .bg(SURFACE)
+                .add_modifier(Modifier::BOLD),
         };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(" {text} "), style))),
+            Paragraph::new(Line::from(Span::styled(format!("  {text} "), style)))
+                .style(Style::default().bg(SURFACE))
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(BORDER)),
+                ),
             area,
         );
         return;
@@ -288,12 +336,19 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     " filter: ",
                     Style::default()
-                        .fg(ACCENT)
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                        .fg(BG)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(" {}▏", app.state.filter)),
                 Span::styled("  enter keep · esc clear", Style::default().fg(DIM)),
-            ])),
+            ]))
+            .style(Style::default().fg(FG).bg(SURFACE))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(BORDER)),
+            ),
             area,
         );
         return;
@@ -325,10 +380,19 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if !app.state.filter.is_empty() {
         spans.push(Span::styled(
             format!("  filter “{}”", app.state.filter),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(YELLOW),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .style(Style::default().fg(FG).bg(SURFACE))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(BORDER)),
+            ),
+        area,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -367,15 +431,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  r             refresh now"),
         Line::from(""),
         Line::from(Span::styled(
-            "status  ▲ needs you   ◆ done   ● working   ◇ your turn   ✕ exited   ○ running   · stopped",
+            "status  🔔 needs you   ✅ done   🟡 working   👀 your turn   🔴 exited   🟢 running   ⚫ stopped",
             Style::default().fg(DIM),
         )),
         Line::from(Span::styled(
-            "▲ is blocked on a question and will wait forever. ◇ means idle with",
+            "🔔 is blocked on a question and will wait forever. 👀 means idle with",
             Style::default().fg(DIM),
         )),
         Line::from(Span::styled(
-            "no detail — run `bzk hooks install` on a host to get ▲ and ◆ there.",
+            "no detail — run `bzk hooks install` on a host for precise states.",
             Style::default().fg(DIM),
         )),
         Line::from(""),
@@ -402,12 +466,14 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let popup = centered(74, content_height, area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
-                .title(" keys "),
-        ),
+        Paragraph::new(lines)
+            .style(Style::default().fg(FG).bg(BG))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(" ⌨️ keys "),
+            ),
         popup,
     );
 }
@@ -425,13 +491,14 @@ fn draw_confirm(frame: &mut Frame, prompt: &str, area: Rect) {
                 Style::default().fg(DIM),
             )),
         ])
+        .style(Style::default().fg(FG).bg(BG))
         .wrap(Wrap { trim: true })
         .alignment(Alignment::Left)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" confirm "),
+                .border_style(Style::default().fg(YELLOW))
+                .title(" ⚠️ confirm "),
         ),
         popup,
     );
@@ -455,6 +522,7 @@ fn draw_input(frame: &mut Frame, prompt: &str, value: &str, kind: &InputKind, ar
                 Style::default().fg(DIM),
             )),
         ])
+        .style(Style::default().fg(FG).bg(BG))
         .block(
             Block::default()
                 .borders(Borders::ALL)

@@ -14,7 +14,9 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph,
+};
 use std::collections::HashSet;
 use std::io::stdout;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -33,14 +35,26 @@ use crate::util;
 const REFRESH_EVERY: Duration = Duration::from_secs(4);
 const MESSAGE_FOR: Duration = Duration::from_secs(5);
 const DASH_WINDOW: &str = "bzk-dash";
-const ACCENT: Color = Color::Magenta;
-const DIM: Color = Color::DarkGray;
+// Catppuccin Latte keeps the Neovim feel in a light palette. Every cell gets
+// an explicit background so stale tmux contents cannot show through redraws.
+const BG: Color = Color::Rgb(239, 241, 245);
+const SURFACE: Color = Color::Rgb(230, 233, 239);
+const SELECTED: Color = Color::Rgb(220, 224, 232);
+const FG: Color = Color::Rgb(76, 79, 105);
+const DIM: Color = Color::Rgb(140, 143, 161);
+const ACCENT: Color = Color::Rgb(136, 57, 239);
+const RED: Color = Color::Rgb(210, 15, 57);
+const GREEN: Color = Color::Rgb(64, 160, 43);
+const YELLOW: Color = Color::Rgb(223, 142, 29);
+const BLUE: Color = Color::Rgb(30, 102, 245);
+const BORDER: Color = Color::Rgb(188, 192, 204);
 
 #[derive(Clone, Debug)]
 enum TreeRow {
     Project {
         host: String,
         folder: Uuid,
+        path: String,
         name: String,
         attention: usize,
         collapsed: bool,
@@ -101,6 +115,13 @@ struct SessionTarget {
     title: String,
 }
 
+#[derive(Clone)]
+struct ProjectTarget {
+    host: String,
+    path: String,
+    name: String,
+}
+
 enum SessionOverlay {
     Menu {
         target: SessionTarget,
@@ -108,6 +129,10 @@ enum SessionOverlay {
     },
     Rename {
         target: SessionTarget,
+        value: String,
+    },
+    RenameProject {
+        target: ProjectTarget,
         value: String,
     },
     ConfirmClose {
@@ -123,6 +148,10 @@ enum Mutation {
 struct MutationResult {
     target: SessionTarget,
     mutation: Mutation,
+    result: Result<(), String>,
+}
+
+struct ProjectRenameResult {
     result: Result<(), String>,
 }
 
@@ -157,6 +186,8 @@ struct Sidebar {
     create_rx: Receiver<CreateResult>,
     mutation_tx: Sender<MutationResult>,
     mutation_rx: Receiver<MutationResult>,
+    project_rename_tx: Sender<ProjectRenameResult>,
+    project_rename_rx: Receiver<ProjectRenameResult>,
 }
 
 pub fn run() -> Result<()> {
@@ -179,6 +210,7 @@ impl Sidebar {
         let (launch_tx, launch_rx) = channel();
         let (create_tx, create_rx) = channel();
         let (mutation_tx, mutation_rx) = channel();
+        let (project_rename_tx, project_rename_rx) = channel();
         let now = Instant::now();
         let mut sidebar = Self {
             local,
@@ -203,6 +235,8 @@ impl Sidebar {
             create_rx,
             mutation_tx,
             mutation_rx,
+            project_rename_tx,
+            project_rename_rx,
         };
         sidebar.kick_refresh();
         Ok(sidebar)
@@ -222,13 +256,17 @@ impl Sidebar {
                 } else {
                     match event {
                         Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
-                            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
-                            KeyCode::Home | KeyCode::Char('g') => self.jump(true),
-                            KeyCode::End | KeyCode::Char('G') => self.jump(false),
+                            KeyCode::Up | KeyCode::Char('k' | 'л') => self.move_cursor(-1),
+                            KeyCode::Down | KeyCode::Char('j' | 'о') => self.move_cursor(1),
+                            KeyCode::Left | KeyCode::Char('h' | 'р') => self.collapse_or_parent(),
+                            KeyCode::Right | KeyCode::Char('l' | 'д') => self.expand_or_open(),
+                            KeyCode::Home | KeyCode::Char('g' | 'п') => self.jump(true),
+                            KeyCode::End | KeyCode::Char('G' | 'П') => self.jump(false),
                             KeyCode::Enter => self.open_selected(),
-                            KeyCode::Char('r') => self.kick_refresh(),
-                            KeyCode::Char('q') | KeyCode::Esc => {
+                            KeyCode::Char('n' | 'т') => self.begin_new_session(),
+                            KeyCode::Char('e' | 'у') => self.begin_rename(),
+                            KeyCode::Char('r' | 'к') => self.kick_refresh(),
+                            KeyCode::Char('q' | 'й') | KeyCode::Esc => {
                                 if let Some(window) = tmux::find_window(DASH_WINDOW) {
                                     let _ = tmux::select_window(&window);
                                 }
@@ -343,6 +381,17 @@ impl Sidebar {
                 }
             }
 
+            while let Ok(renamed) = self.project_rename_rx.try_recv() {
+                self.mutating = false;
+                match renamed.result {
+                    Ok(()) => {
+                        self.set_message("project renamed", false);
+                        self.kick_refresh();
+                    }
+                    Err(error) => self.set_message(error, true),
+                }
+            }
+
             if !self.refreshing && self.last_refresh.elapsed() >= REFRESH_EVERY {
                 self.kick_refresh();
             }
@@ -432,6 +481,127 @@ impl Sidebar {
         self.list.select(target.map(|(index, _)| index));
     }
 
+    /// Vim-style tree navigation: collapse a project, or move from one of its
+    /// children back to the project row.
+    fn collapse_or_parent(&mut self) {
+        let Some(selected) = self.list.selected() else {
+            return;
+        };
+        match self.rows.get(selected).and_then(TreeRow::key) {
+            Some(TreeKey::Project(host, folder)) => {
+                if self.collapsed.insert((host, folder)) {
+                    self.rebuild();
+                }
+            }
+            Some(TreeKey::Session(..) | TreeKey::NewSession(..)) => {
+                if let Some(parent) = self.rows[..selected]
+                    .iter()
+                    .rposition(|row| matches!(row, TreeRow::Project { .. }))
+                {
+                    self.list.select(Some(parent));
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Vim-style tree navigation: expand a project, descend into an already
+    /// expanded project, or open the selected session/action.
+    fn expand_or_open(&mut self) {
+        let Some(key) = self.current_key() else {
+            return;
+        };
+        match key {
+            TreeKey::Project(host, folder) => {
+                if self.collapsed.remove(&(host, folder)) {
+                    self.rebuild();
+                } else {
+                    self.move_cursor(1);
+                }
+            }
+            TreeKey::Session(..) | TreeKey::NewSession(..) => self.open_selected(),
+        }
+    }
+
+    /// Rename the selected project's display label or the selected session.
+    /// Neither operation renames a directory on disk.
+    fn begin_rename(&mut self) {
+        if self.mutating {
+            return;
+        }
+        let Some(index) = self.list.selected() else {
+            return;
+        };
+        self.session_overlay = match self.rows.get(index) {
+            Some(TreeRow::Session {
+                host, id, title, ..
+            }) => Some(SessionOverlay::Rename {
+                target: SessionTarget {
+                    host: host.clone(),
+                    id: *id,
+                    title: title.clone(),
+                },
+                value: String::new(),
+            }),
+            Some(TreeRow::Project {
+                host, path, name, ..
+            }) => Some(SessionOverlay::RenameProject {
+                target: ProjectTarget {
+                    host: host.clone(),
+                    path: path.clone(),
+                    name: name.clone(),
+                },
+                value: String::new(),
+            }),
+            _ => {
+                self.set_message("select a project or session to rename", true);
+                None
+            }
+        };
+    }
+
+    /// Create in the selected project, including when one of that project's
+    /// sessions currently owns the cursor.
+    fn begin_new_session(&mut self) {
+        if self.starting || self.creating || self.mutating {
+            return;
+        }
+        let Some(selected) = self.list.selected() else {
+            return;
+        };
+        let project = match self.rows.get(selected) {
+            Some(TreeRow::Project {
+                host, folder, name, ..
+            }) => Some((host.clone(), *folder, name.clone())),
+            Some(TreeRow::NewSession {
+                host,
+                folder,
+                project,
+            }) => Some((host.clone(), *folder, project.clone())),
+            Some(TreeRow::Session { .. }) => self.rows[..selected].iter().rev().find_map(|row| {
+                if let TreeRow::Project {
+                    host, folder, name, ..
+                } = row
+                {
+                    Some((host.clone(), *folder, name.clone()))
+                } else {
+                    None
+                }
+            }),
+            Some(TreeRow::Note(_)) | None => None,
+        };
+        let Some((host, folder, project)) = project else {
+            self.set_message("select a project to create a session", true);
+            return;
+        };
+        self.agent_picker = Some(AgentPicker {
+            host,
+            folder,
+            project,
+            selected: 0,
+        });
+    }
+
     fn open_selected(&mut self) {
         if self.starting || self.creating || self.mutating {
             return;
@@ -495,11 +665,11 @@ impl Sidebar {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up | KeyCode::Char('k' | 'л') => {
                     picker.selected = picker.selected.saturating_sub(1);
                     self.agent_picker = Some(picker);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down | KeyCode::Char('j' | 'о') => {
                     picker.selected = (picker.selected + 1).min(2);
                     self.agent_picker = Some(picker);
                 }
@@ -567,11 +737,11 @@ impl Sidebar {
             } => match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Esc => {}
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    KeyCode::Up | KeyCode::Char('k' | 'л') => {
                         selected = selected.saturating_sub(1);
                         self.session_overlay = Some(SessionOverlay::Menu { target, selected });
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down | KeyCode::Char('j' | 'о') => {
                         selected = (selected + 1).min(2);
                         self.session_overlay = Some(SessionOverlay::Menu { target, selected });
                     }
@@ -623,10 +793,43 @@ impl Sidebar {
                     self.session_overlay = Some(SessionOverlay::Rename { target, value });
                 }
             },
+            SessionOverlay::RenameProject { target, mut value } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter => self.submit_project_rename(target, &value),
+                    KeyCode::Backspace => {
+                        value.pop();
+                        self.session_overlay =
+                            Some(SessionOverlay::RenameProject { target, value });
+                    }
+                    KeyCode::Char(character) if value.chars().count() < 256 => {
+                        value.push(character);
+                        self.session_overlay =
+                            Some(SessionOverlay::RenameProject { target, value });
+                    }
+                    _ => {
+                        self.session_overlay =
+                            Some(SessionOverlay::RenameProject { target, value });
+                    }
+                },
+                Event::Paste(text) => {
+                    value.extend(
+                        text.chars()
+                            .filter(|character| !character.is_control())
+                            .take(256usize.saturating_sub(value.chars().count())),
+                    );
+                    self.session_overlay = Some(SessionOverlay::RenameProject { target, value });
+                }
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::RenameProject { target, value });
+                }
+            },
             SessionOverlay::ConfirmClose { target } => match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Enter | KeyCode::Char('y' | 'Y') => self.submit_close(target),
-                    KeyCode::Esc | KeyCode::Char('n' | 'N') => {}
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
+                        self.submit_close(target);
+                    }
+                    KeyCode::Esc | KeyCode::Char('n' | 'N' | 'т' | 'Т') => {}
                     _ => {
                         self.session_overlay = Some(SessionOverlay::ConfirmClose { target });
                     }
@@ -648,7 +851,7 @@ impl Sidebar {
     fn choose_session_menu(&mut self, target: SessionTarget, selected: usize) {
         self.session_overlay = match selected {
             0 => Some(SessionOverlay::Rename {
-                value: target.title.clone(),
+                value: String::new(),
                 target,
             }),
             1 => Some(SessionOverlay::ConfirmClose { target }),
@@ -680,6 +883,29 @@ impl Sidebar {
                 mutation: Mutation::Rename,
                 result,
             });
+        });
+    }
+
+    fn submit_project_rename(&mut self, target: ProjectTarget, value: &str) {
+        let label = value.trim().to_string();
+        if label.is_empty() {
+            self.set_message("project name cannot be empty", true);
+            self.session_overlay = Some(SessionOverlay::RenameProject {
+                target,
+                value: value.to_string(),
+            });
+            return;
+        }
+        let Some(host) = self.local.host_by_name(&target.host).cloned() else {
+            self.set_message(format!("unknown host {}", target.host), true);
+            return;
+        };
+        self.mutating = true;
+        let tx = self.project_rename_tx.clone();
+        std::thread::spawn(move || {
+            let result =
+                actions::relabel(&host, &target.path, &label).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(ProjectRenameResult { result });
         });
     }
 
@@ -735,6 +961,7 @@ fn build_tree(
             rows.push(TreeRow::Project {
                 host: host.name.clone(),
                 folder: folder.id,
+                path: folder.path.clone(),
                 name: folder.display_name(),
                 attention: sessions
                     .iter()
@@ -765,6 +992,14 @@ fn build_tree(
 }
 
 fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
+    // Clear first, then paint every cell. This prevents remnants of the
+    // previous tmux client from surviving a resize or session switch.
+    frame.render_widget(Clear, frame.area());
+    frame.render_widget(
+        Block::default().style(Style::default().fg(FG).bg(BG)),
+        frame.area(),
+    );
+
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
@@ -773,25 +1008,30 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
     .areas(frame.area());
 
     let activity = if sidebar.mutating {
-        " saving…"
+        "  saving…"
     } else if sidebar.creating {
-        " creating…"
+        "  creating…"
     } else if sidebar.starting {
-        " starting…"
+        "  starting…"
     } else if sidebar.refreshing {
-        " ↻"
+        "  refreshing…"
     } else {
         ""
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " projects",
+                " PROJECTS",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(activity, Style::default().fg(DIM)),
         ]))
-        .block(Block::default().borders(Borders::BOTTOM)),
+        .style(Style::default().fg(FG).bg(SURFACE))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER)),
+        ),
         header,
     );
 
@@ -807,8 +1047,15 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
             .map(|row| render_row(row, width, sidebar.active.as_ref()))
             .collect();
         let list = List::new(items)
-            .highlight_symbol("▌")
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            .style(Style::default().fg(FG).bg(BG))
+            .highlight_symbol("  ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(
+                Style::default()
+                    .fg(FG)
+                    .bg(SELECTED)
+                    .add_modifier(Modifier::BOLD),
+            );
         frame.render_stateful_widget(list, body, &mut sidebar.list);
     }
 
@@ -817,21 +1064,29 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
             format!(" {}", util::one_line(text, width.max(4))),
             if *error {
                 Style::default()
-                    .fg(Color::Red)
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    .fg(RED)
+                    .bg(SURFACE)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(GREEN)
+                    .bg(SURFACE)
                     .add_modifier(Modifier::BOLD)
             },
         )),
         None => Line::from(Span::styled(
-            " click open · right-click manage · F10 hide",
-            Style::default().fg(DIM),
+            " j/k move  h/l open  n new  e rename",
+            Style::default().fg(DIM).bg(SURFACE),
         )),
     };
     frame.render_widget(
-        Paragraph::new(footer_line).block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(footer_line)
+            .style(Style::default().fg(DIM).bg(SURFACE))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(BORDER)),
+            ),
         footer,
     );
 }
@@ -844,46 +1099,62 @@ fn draw_session_overlay(
     let lines = match overlay {
         SessionOverlay::Menu { target, selected } => vec![
             Line::styled(
-                format!(" {}", util::one_line(&target.title, 24)),
+                format!("  {}", util::one_line(&target.title, 24)),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-            menu_line(" Rename", *selected == 0),
-            menu_line(" Close session", *selected == 1),
-            menu_line(" Cancel", *selected == 2),
-            Line::styled(" click an action · Esc closes", Style::default().fg(DIM)),
+            menu_line("  Rename", *selected == 0),
+            menu_line("  Close session", *selected == 1),
+            menu_line("  Cancel", *selected == 2),
+            Line::styled("  Enter select · Esc close", Style::default().fg(DIM)),
         ],
         SessionOverlay::Rename { target, value } => vec![
             Line::styled(
-                format!(" Rename {}", util::one_line(&target.title, 18)),
+                format!("  Rename {}", util::one_line(&target.title, 18)),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Line::from(vec![
-                Span::styled(" Name: ", Style::default().fg(DIM)),
+                Span::styled("  Name: ", Style::default().fg(DIM)),
                 Span::styled(
                     util::one_line(value, usize::from(area.width.saturating_sub(8))),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::styled(" Enter saves · Esc cancels", Style::default().fg(DIM)),
+            Line::styled("  Enter save · Esc cancel", Style::default().fg(DIM)),
+        ],
+        SessionOverlay::RenameProject { target, value } => vec![
+            Line::styled(
+                format!("  Project {}", util::one_line(&target.name, 18)),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Line::from(vec![
+                Span::styled("  Label: ", Style::default().fg(DIM)),
+                Span::styled(
+                    util::one_line(value, usize::from(area.width.saturating_sub(9))),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::styled("  Folder path stays unchanged", Style::default().fg(DIM)),
+            Line::styled("  Enter save · Esc cancel", Style::default().fg(DIM)),
         ],
         SessionOverlay::ConfirmClose { target } => vec![
             Line::styled(
-                format!(" Close {}?", util::one_line(&target.title, 20)),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                format!("  Close {}?", util::one_line(&target.title, 20)),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
             ),
-            Line::styled(" Conversation stays on disk.", Style::default().fg(DIM)),
+            Line::styled("  Conversation stays on disk.", Style::default().fg(DIM)),
             Line::from(vec![
                 Span::styled(
-                    " [ Close ] ",
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                    "  [ Close ] ",
+                    Style::default().fg(BG).bg(RED).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" [ Cancel ] "),
             ]),
         ],
     };
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(FG).bg(BG)),
+        area,
+    );
 }
 
 fn menu_line(label: &str, selected: bool) -> Line<'static> {
@@ -891,10 +1162,11 @@ fn menu_line(label: &str, selected: bool) -> Line<'static> {
         label.to_string(),
         if selected {
             Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                .fg(BG)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(FG).bg(BG)
         },
     )
 }
@@ -909,7 +1181,7 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             ..
         } => {
             let suffix = if *attention > 0 {
-                format!(" ▲{attention}")
+                format!("  !{attention}")
             } else {
                 String::new()
             };
@@ -923,7 +1195,7 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
                     ),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(suffix, Style::default().fg(Color::Red)),
+                Span::styled(suffix, Style::default().fg(RED)),
                 Span::styled(
                     if host == "local" {
                         String::new()
@@ -943,28 +1215,23 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
         } => {
             let is_active = active
                 .is_some_and(|(active_host, active_id)| active_host == host && active_id == id);
-            let prefix = if is_active { "  ▸" } else { "   " };
-            let label = format!("{prefix}{} {}", state.glyph(), title);
+            let active_marker = if is_active { "›" } else { " " };
+            let agent = match agent {
+                AgentKind::Claude => "🧠",
+                AgentKind::Codex => "🤖",
+                AgentKind::Shell => "💻",
+            };
+            let title = util::one_line(title, width.saturating_sub(10).max(1));
+            let label = format!("  {active_marker} {} {agent} {title}", state_symbol(*state));
             let style = if is_active {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 state_style(*state)
             };
-            let agent = match agent {
-                AgentKind::Claude => " c",
-                AgentKind::Codex => " x",
-                AgentKind::Shell => " $",
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    util::one_line(&label, width.saturating_sub(2).max(1)),
-                    style,
-                ),
-                Span::styled(agent, Style::default().fg(DIM)),
-            ]))
+            ListItem::new(Line::from(Span::styled(label, style)))
         }
         TreeRow::NewSession { .. } => ListItem::new(Line::from(Span::styled(
-            "   ＋ New session",
+            "  + new session",
             Style::default().fg(ACCENT),
         ))),
         TreeRow::Note(text) => ListItem::new(Line::from(Span::styled(
@@ -980,32 +1247,48 @@ fn draw_agent_picker(
     picker: &AgentPicker,
 ) {
     let mut lines = vec![Line::styled(
-        format!(" New session in {}", util::one_line(&picker.project, 18)),
+        format!("  New in {}", util::one_line(&picker.project, 19)),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )];
-    for (index, label) in ["Codex", "Claude", "Shell"].iter().enumerate() {
+    for (index, label) in ["🤖 Codex", "🧠 Claude", "💻 Shell"].iter().enumerate() {
         lines.push(Line::styled(
-            format!(" {label}"),
+            format!("  {label}"),
             if picker.selected == index {
                 Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    .fg(BG)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(FG).bg(BG)
             },
         ));
     }
-    lines.push(Line::styled(" Esc cancels", Style::default().fg(DIM)));
-    frame.render_widget(Paragraph::new(lines), area);
+    lines.push(Line::styled("  Esc cancel", Style::default().fg(DIM)));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(FG).bg(BG)),
+        area,
+    );
 }
 
 fn state_style(state: State) -> Style {
     match state {
-        State::NeedsYou | State::Exited => Style::default().fg(Color::Red),
-        State::Done | State::YourTurn => Style::default().fg(Color::Green),
-        State::Working => Style::default().fg(Color::Yellow),
-        State::Up => Style::default().fg(Color::Blue),
+        State::NeedsYou | State::Exited => Style::default().fg(RED),
+        State::Done | State::YourTurn => Style::default().fg(GREEN),
+        State::Working => Style::default().fg(YELLOW),
+        State::Up => Style::default().fg(BLUE),
         State::Down => Style::default().fg(DIM),
+    }
+}
+
+fn state_symbol(state: State) -> &'static str {
+    match state {
+        State::NeedsYou => "!",
+        State::Done => "✓",
+        State::Working => "↻",
+        State::YourTurn => "→",
+        State::Up => "↑",
+        State::Exited => "×",
+        State::Down => "−",
     }
 }
 

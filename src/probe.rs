@@ -31,10 +31,13 @@ pub fn collect(with_preview: bool) -> Probe {
         }
     };
 
+    let marks = crate::attention::read_all();
     // A probe is the natural moment to reattach session records to the
     // conversation ids their agents ended up creating.
     if tmux::installed()
-        && crate::hostops::relink_sessions(&mut store) > 0
+        && (crate::hostops::relink_sessions(&mut store)
+            + crate::hostops::relink_sessions_from_hooks(&mut store, &marks)
+            > 0)
         && let Err(e) = store.save()
     {
         warnings.push(format!(
@@ -71,7 +74,11 @@ pub fn collect(with_preview: bool) -> Probe {
     }
 
     let chats = select_chats(&folders, all_chats, &mut warnings);
-    let live = live_agents();
+    let live = live_agents(&marks);
+    let hook_states: std::collections::HashMap<String, String> = marks
+        .iter()
+        .map(|(key, mark)| (key.clone(), mark.state.as_str().to_string()))
+        .collect();
 
     let tmux_sessions = if tmux::installed() {
         tmux::list_sessions(with_preview)
@@ -87,6 +94,7 @@ pub fn collect(with_preview: bool) -> Probe {
         folder_path: &|id| by_id.get(&id).cloned(),
         tmux: &tmux_sessions,
         live: &live,
+        hook_states: &hook_states,
     });
 
     if !orphans.is_empty() {
@@ -121,14 +129,15 @@ pub fn collect(with_preview: bool) -> Probe {
 /// line. The two can disagree — an agent showing a permission prompt is
 /// arguably still mid-turn — and rather than pick a winner by rule, the fresher
 /// of the two accounts is taken.
-fn live_agents() -> Vec<LiveAgent> {
+fn live_agents(
+    marks: &std::collections::HashMap<String, crate::attention::Mark>,
+) -> Vec<LiveAgent> {
     let mut live: Vec<LiveAgent> = agent::all()
         .iter()
         .filter(|a| a.installed())
         .flat_map(|a| a.live())
         .collect();
 
-    let marks = crate::attention::read_all();
     for l in &mut live {
         if let Some(id) = &l.agent_session_id
             && let Some(mark) = marks.get(id)

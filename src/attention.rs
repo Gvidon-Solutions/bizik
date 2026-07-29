@@ -5,14 +5,15 @@
 //! blocked on a question and will sit there forever. Launching five sessions in
 //! the background is only safe if those two can be told apart.
 //!
-//! The distinction comes from the agent's hooks. `Notification` fires when it
-//! wants the user, `Stop` when a turn ends, `UserPromptSubmit` when the user
-//! replies. Each writes a small file here; the probe reads them and refines the
-//! idle case. No hooks installed means no refinement — the status stays the
-//! honest, vaguer "your turn" rather than a guess.
+//! The distinction comes from agent lifecycle hooks. A prompt submission marks
+//! work as active, a permission request marks it as blocked, and `Stop` marks a
+//! completed turn. Each writes a small file here; the probe reads those files
+//! and refines the idle case. No hooks installed means no refinement — the
+//! status stays honestly vague rather than becoming a guess.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,12 @@ impl State {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Mark {
     pub state: State,
+    /// Native Claude/Codex conversation id from the hook payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    /// The directory is useful for diagnostics and migration of old records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub at: u64,
@@ -80,20 +87,34 @@ pub fn state_for_event(event: &str) -> Option<State> {
 
 /// Record a hook firing. `payload` is the JSON the agent wrote to stdin.
 pub fn record(event: &str, payload: &str) -> Result<Option<String>> {
-    record_in(&dir(), event, payload)
+    let bzk_session = std::env::var("BZK_SESSION_ID").ok();
+    record_for_in(&dir(), event, payload, bzk_session.as_deref())
 }
 
+#[cfg(test)]
 pub fn record_in(dir: &Path, event: &str, payload: &str) -> Result<Option<String>> {
+    record_for_in(dir, event, payload, None)
+}
+
+fn record_for_in(
+    dir: &Path,
+    event: &str,
+    payload: &str,
+    bzk_session_id: Option<&str>,
+) -> Result<Option<String>> {
     let Some(state) = state_for_event(event) else {
         anyhow::bail!("unknown hook event '{event}' (notification, permission, stop, prompt, end)");
     };
 
     let value: serde_json::Value = serde_json::from_str(payload.trim())
         .with_context(|| format!("hook payload was not JSON: {}", one_line(payload, 80)))?;
-    let Some(session_id) = value.get("session_id").and_then(|v| v.as_str()) else {
+    let Some(agent_session_id) = value.get("session_id").and_then(|v| v.as_str()) else {
         // Nothing to key on; drop it rather than write a file nobody can find.
         return Ok(None);
     };
+    let key = bzk_session_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(agent_session_id);
 
     let message = value
         .get("message")
@@ -102,25 +123,41 @@ pub fn record_in(dir: &Path, event: &str, payload: &str) -> Result<Option<String
 
     let mark = Mark {
         state,
+        agent_session_id: Some(agent_session_id.to_string()),
+        cwd: value.get("cwd").and_then(Value::as_str).map(str::to_string),
         message,
         at: now_ms(),
     };
-    atomic_write(&path_in(dir, session_id), &serde_json::to_vec(&mark)?)?;
-    Ok(Some(session_id.to_string()))
+    atomic_write(&path_in(dir, key), &serde_json::to_vec(&mark)?)?;
+    Ok(Some(key.to_string()))
 }
 
 /// Forget a session's marker, at session end.
 pub fn clear(payload: &str) -> Result<Option<String>> {
-    clear_in(&dir(), payload)
+    let bzk_session = std::env::var("BZK_SESSION_ID").ok();
+    clear_for_in(&dir(), payload, bzk_session.as_deref())
 }
 
+#[cfg(test)]
 pub fn clear_in(dir: &Path, payload: &str) -> Result<Option<String>> {
+    clear_for_in(dir, payload, None)
+}
+
+fn clear_for_in(dir: &Path, payload: &str, bzk_session_id: Option<&str>) -> Result<Option<String>> {
     let value: serde_json::Value = serde_json::from_str(payload.trim()).unwrap_or_default();
-    let Some(session_id) = value.get("session_id").and_then(|v| v.as_str()) else {
+    let Some(agent_session_id) = value.get("session_id").and_then(|v| v.as_str()) else {
         return Ok(None);
     };
-    let _ = std::fs::remove_file(path_in(dir, session_id));
-    Ok(Some(session_id.to_string()))
+    let key = bzk_session_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(agent_session_id);
+    let _ = std::fs::remove_file(path_in(dir, key));
+    // Remove a marker left by an older build that keyed the same conversation
+    // by the agent-native id.
+    if key != agent_session_id {
+        let _ = std::fs::remove_file(path_in(dir, agent_session_id));
+    }
+    Ok(Some(key.to_string()))
 }
 
 /// Every current marker, keyed by the agent's session id.
@@ -200,6 +237,22 @@ mod tests {
         record_in(&d, "notification", r#"{"session_id":"s1"}"#).unwrap();
         record_in(&d, "prompt", r#"{"session_id":"s1"}"#).unwrap();
         assert_eq!(read_all_in(&d).get("s1").unwrap().state, State::Working);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn bzk_session_id_keys_codex_without_losing_native_thread_id() {
+        let d = scratch("codex-key");
+        let payload = r#"{"session_id":"codex-thread","cwd":"/repo"}"#;
+        assert_eq!(
+            record_for_in(&d, "prompt", payload, Some("bzk-session"))
+                .unwrap()
+                .as_deref(),
+            Some("bzk-session")
+        );
+        let mark = read_all_in(&d).remove("bzk-session").unwrap();
+        assert_eq!(mark.agent_session_id.as_deref(), Some("codex-thread"));
+        assert_eq!(mark.cwd.as_deref(), Some("/repo"));
         std::fs::remove_dir_all(&d).ok();
     }
 
