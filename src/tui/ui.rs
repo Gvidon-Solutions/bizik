@@ -23,7 +23,7 @@ const FG: Color = Color::Rgb(76, 79, 105);
 const DIM: Color = Color::Rgb(140, 143, 161);
 const ACCENT: Color = Color::Rgb(136, 57, 239);
 const RED: Color = Color::Rgb(210, 15, 57);
-const GREEN: Color = Color::Rgb(64, 160, 43);
+const GREEN: Color = Color::Rgb(79, 122, 91);
 const YELLOW: Color = Color::Rgb(223, 142, 29);
 const BLUE: Color = Color::Rgb(30, 102, 245);
 const BORDER: Color = Color::Rgb(188, 192, 204);
@@ -149,7 +149,15 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
         } => {
             let mut spans = vec![
                 Span::styled(format!("{:<10}", trunc(host, 10)), Style::default().fg(DIM)),
-                Span::raw(format!("📁 {:<21}", trunc(&folder.display_name(), 21))),
+                Span::styled(
+                    if folder.pinned { "📌 " } else { "📁 " },
+                    if folder.pinned {
+                        Style::default().fg(ACCENT)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::raw(format!("{:<21}", trunc(&folder.display_name(), 21))),
             ];
             if *blocked > 0 {
                 spans.push(Span::styled(
@@ -184,7 +192,10 @@ fn render_row<'a>(row: &'a Row, width: usize, app: &App) -> ListItem<'a> {
                 trunc(&folder.path, width.saturating_sub(56)),
                 Style::default().fg(DIM),
             ));
-            ListItem::new(Line::from(spans))
+            if folder.hidden {
+                spans.push(Span::styled("  hidden", Style::default().fg(DIM)));
+            }
+            ListItem::new(vec![Line::from(spans), Line::default()])
         }
 
         Row::NewSession { agent, .. } => ListItem::new(Line::from(vec![
@@ -356,7 +367,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let keys = match app.state.stack.last() {
         Some(Screen::Folders) => {
-            "enter open · e rename · d unmark · / filter · w panes · q detach · ? keys"
+            "enter open · p pin · H hide · v hidden · d delete · e rename · ? keys"
         }
         Some(Screen::Folder { .. }) => {
             "enter start+view · b background · space select · x stop · d forget · esc back"
@@ -407,9 +418,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         )),
         Line::from("  ↑ ↓ / j k     move          g G   first / last"),
         Line::from("  tab / ⇧tab    switch screen  /     filter"),
-        Line::from("  esc           back — always  q     detach (everything keeps running)"),
+        Line::from("  esc           back — always  q     detach from dashboard"),
         Line::from("  Q             close the panes and the dashboard on this machine"),
         Line::from("  F10           show / hide the project and session sidebar"),
+        Line::from("  F11           detach immediately from anywhere in bizik"),
         Line::from(""),
         Line::from(Span::styled(
             "sessions",
@@ -420,6 +432,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  space         select · then enter starts them all"),
         Line::from("  x             stop (conversation is kept)"),
         Line::from("  d             forget the record · unmark a folder"),
+        Line::from("  p / H         pin · hide/restore the selected project"),
+        Line::from("  v             show or hide hidden projects"),
         Line::from("  w             jump to the sidebar workspace"),
         Line::from(""),
         Line::from(Span::styled(
@@ -445,8 +459,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             format!(
-                "from a pane back to here: {}  (or tmux prefix, then 0)",
-                crate::tmux::return_key()
+                "from a pane: {} back here · {} detach immediately",
+                crate::tmux::return_key(),
+                crate::tmux::detach_key()
             ),
             Style::default().fg(ACCENT),
         )),

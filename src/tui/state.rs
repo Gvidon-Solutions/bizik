@@ -87,6 +87,9 @@ pub enum Intent {
     FocusWork,
     InstallHost,
     Refresh,
+    ToggleHiddenProjects,
+    ToggleProjectHidden,
+    ToggleProjectPinned,
     RunConfirmed(Confirm),
     RunInput(InputKind, String),
 }
@@ -102,6 +105,7 @@ pub struct State {
     pub toast: Option<(String, ToastKind, Instant)>,
     pub refreshing: bool,
     pub starting: usize,
+    pub show_hidden_projects: bool,
 }
 
 impl Default for State {
@@ -117,6 +121,7 @@ impl Default for State {
             toast: None,
             refreshing: false,
             starting: 0,
+            show_hidden_projects: false,
         }
     }
 }
@@ -221,7 +226,10 @@ impl State {
             }
             KeyCode::Char('e') => Some(Intent::BeginRelabel),
             KeyCode::Char('x') => Some(Intent::AskStop),
-            KeyCode::Char('d') => Some(Intent::AskDelete),
+            KeyCode::Char('d') | KeyCode::Delete => Some(Intent::AskDelete),
+            KeyCode::Char('p') => Some(Intent::ToggleProjectPinned),
+            KeyCode::Char('H') => Some(Intent::ToggleProjectHidden),
+            KeyCode::Char('v') => Some(Intent::ToggleHiddenProjects),
             KeyCode::Char('i') => Some(Intent::InstallHost),
             _ => None,
         }
@@ -542,5 +550,26 @@ mod tests {
         state.overlay = Some(Overlay::Help);
         assert!(state.reduce_key(key(KeyCode::Char('z'))).is_none());
         assert!(state.overlay.is_none(), "any key closes help");
+    }
+
+    #[test]
+    fn every_project_management_shortcut_emits_its_intent() {
+        let mut state = State::default();
+        assert!(matches!(
+            state.reduce_key(key(KeyCode::Char('p'))),
+            Some(Intent::ToggleProjectPinned)
+        ));
+        assert!(matches!(
+            state.reduce_key(key(KeyCode::Char('H'))),
+            Some(Intent::ToggleProjectHidden)
+        ));
+        assert!(matches!(
+            state.reduce_key(key(KeyCode::Char('v'))),
+            Some(Intent::ToggleHiddenProjects)
+        ));
+        assert!(matches!(
+            state.reduce_key(key(KeyCode::Delete)),
+            Some(Intent::AskDelete)
+        ));
     }
 }

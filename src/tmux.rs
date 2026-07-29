@@ -444,6 +444,11 @@ pub fn return_key() -> String {
     std::env::var("BIZIK_RETURN_KEY").unwrap_or_else(|_| "F12".to_string())
 }
 
+/// The key that immediately detaches the client from bizik.
+pub fn detach_key() -> String {
+    std::env::var("BIZIK_DETACH_KEY").unwrap_or_else(|_| "F11".to_string())
+}
+
 /// Bind the return key on this tmux server.
 ///
 /// Bindings are server-wide, and bizik shares the server with whatever else the
@@ -462,6 +467,26 @@ pub fn bind_return_key(session: &SessionRef, window: &str) -> Result<()> {
         "-F",
         &format!("#{{==:#{{session_name}},{session}}}"),
         &format!("select-window -t {}{window}", session.pane()),
+        &format!("send-keys {key}"),
+    ])
+    .map(|_| ())
+}
+
+/// Bind a server-wide key that detaches only when pressed inside bizik.
+///
+/// Like the return binding, this must be conditional because tmux bindings are
+/// shared by every session on the server. Outside bizik the application still
+/// receives the original key.
+pub fn bind_detach_key(session: &SessionRef) -> Result<()> {
+    let key = detach_key();
+    tmux(&[
+        "bind-key",
+        "-n",
+        &key,
+        "if-shell",
+        "-F",
+        &format!("#{{==:#{{session_name}},{session}}}"),
+        "detach-client",
         &format!("send-keys {key}"),
     ])
     .map(|_| ())
@@ -519,8 +544,11 @@ pub fn style_app_window(window: &str) {
         // Focus belongs in the application header, not in a full-height strip
         // that visually cuts the workspace in two.
         ("pane-active-border-style", "fg=colour250"),
-        ("window-style", "fg=colour237,bg=colour255"),
-        ("window-active-style", "fg=colour237,bg=colour255"),
+        // Agent TUIs own their colours. A forced default foreground leaked
+        // into Codex's black insertion background and made the inserted text
+        // black-on-black. `default` also clears values left by older builds.
+        ("window-style", "default"),
+        ("window-active-style", "default"),
     ] {
         let _ = set_window_option(window, option, value);
     }

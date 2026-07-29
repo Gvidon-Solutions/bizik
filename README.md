@@ -64,6 +64,44 @@ finishes with `make doctor`. `make` on its own lists everything else.
 After changing the code, `make deploy` rebuilds and pushes to every host —
 `make doctor` says which hosts are still on an older binary.
 
+## Feature worktrees
+
+Development uses [Worktrunk](https://worktrunk.dev): every feature gets its own
+branch and sibling worktree, so several features and agent sessions can proceed
+without sharing a working directory.
+
+Install Worktrunk, then enable its shell integration once:
+
+```sh
+cargo install worktrunk
+wt config shell install zsh
+exec zsh
+```
+
+Start a feature from the default branch:
+
+```sh
+wt switch --create feature/session-export --base main
+```
+
+For this repository that creates a sibling directory such as
+`../bizik.feature-session-export` and changes into it. The project Worktrunk
+hook copies ignored local configuration such as `hosts.mk`, while deliberately
+leaving out the reproducible `target/` build directory.
+
+Useful lifecycle commands:
+
+```sh
+wt list                              # all feature worktrees and their state
+wt switch feature/session-export     # return to an existing feature
+wt switch main                       # return to the default branch worktree
+wt remove feature/session-export     # remove it after the feature is merged
+```
+
+The repository's `AGENTS.md` applies the same one-feature/one-worktree rule to
+automated coding sessions; `CLAUDE.md` is a symbolic link to the same file for
+Claude Code.
+
 <details>
 <summary>The same thing by hand</summary>
 
@@ -173,22 +211,32 @@ dashboard costs nothing.
 | `b` | start it in the background and stay here |
 | `space` | select · then `enter` starts them all; the sidebar lists each one |
 | `x` | stop a session (its conversation is kept) |
-| `d` | forget a session · unmark a folder |
+| `d` / `Delete` | forget a session · delete a project after confirmation |
 | `e` | rename a folder |
+| `p` | pin or unpin the selected project |
+| `H` | hide or restore the selected project |
+| `v` | show or hide hidden projects |
 | `w` | jump to the sidebar workspace |
 | `S` | save the active workspace as a layout |
 | `i` | install bizik on the selected host |
 | `r` | refresh now |
 | `?` | this list |
+| `F11` | detach immediately from anywhere in bizik |
 
 Starting happens off the drawing thread — the header shows `starting N…` and the
 list stays responsive while ssh does its work.
 
+Codex and Claude sessions started by bizik bypass their normal approval and
+sandbox checks by default (`--dangerously-bypass-approvals-and-sandbox` and
+`--dangerously-skip-permissions`). Only mark projects whose contents you trust.
+
 The workspace lives in a window called `bzk-work`: a project/session tree on
 the left and one active agent on the right. Opening another session replaces
 only the viewer on the right; every agent keeps running in its own detached
-tmux session. Click a session in the tree to switch. Right-click it to rename or
-close it; closing stops the session but keeps the agent's conversation on disk.
+tmux session. Click a session in the tree to switch. Right-click a session or
+project to open its management menu; every menu action displays its shortcut.
+Deleting a session keeps the agent's conversation on disk, while deleting a
+project removes it from bizik but leaves its files untouched.
 Click a project name to fold or unfold its sessions, and click
 `＋ New session` to choose Codex, Claude or a shell for that project. `F10`
 hides or restores the tree; `BIZIK_SIDEBAR_KEY=F9 bzk` picks another key and
@@ -203,14 +251,19 @@ passes straight through to whatever is running, so nothing else is affected.
 `BIZIK_RETURN_KEY=F9 bzk` picks a different one; tmux prefix then `0` always
 works too.
 
+**`F11` exits bizik immediately from any pane.** It only detaches the current
+tmux client: the dashboard and every agent keep running. Start `bzk` again to
+return exactly where you were. `BIZIK_DETACH_KEY=F8 bzk` picks another key.
+
 Click the sidebar, use `Ctrl+h` / `Ctrl+l`, or use tmux prefix plus an arrow key
 to move between the tree and the active agent. In the sidebar, `j`/`k` moves,
 `h` collapses or moves to the parent project, and `l` expands or opens. The same
 physical keys work in Russian layout: `о`/`л` and `р`/`д`. `e` (`у`) changes a
 project's display label or renames a session without touching its directory;
-`n` (`т`) creates a session, and `d` (`в`) deletes the selected session after
-confirmation while keeping its conversation on disk. Arrow keys and `Enter`
-work too. `prefix z` zooms the active agent to the whole window and back.
+`n` (`т`) creates a session, `p` pins a project, `H` hides or restores it, and
+`v` reveals hidden projects. `d` (`в`) deletes the selected project or session
+after confirmation. Arrow keys and `Enter` work too. `prefix z` zooms the
+active agent to the whole window and back.
 
 The workspace and attached agent sessions hide tmux's own status bars: the
 sidebar already shows the project, session, agent and state, so duplicated

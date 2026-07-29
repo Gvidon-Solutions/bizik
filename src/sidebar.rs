@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::hostops::SpawnResult;
-use crate::model::{AgentKind, Host, Session};
+use crate::model::{AgentKind, Folder, Host, Probe, Session};
 use crate::reconcile::State;
 use crate::remote::{self, HostProbe};
 use crate::store::LocalStore;
@@ -45,7 +45,7 @@ const FG: Color = Color::Rgb(76, 79, 105);
 const DIM: Color = Color::Rgb(140, 143, 161);
 const ACCENT: Color = Color::Rgb(136, 57, 239);
 const RED: Color = Color::Rgb(210, 15, 57);
-const GREEN: Color = Color::Rgb(64, 160, 43);
+const GREEN: Color = Color::Rgb(79, 122, 91);
 const YELLOW: Color = Color::Rgb(223, 142, 29);
 const BLUE: Color = Color::Rgb(30, 102, 245);
 const BORDER: Color = Color::Rgb(188, 192, 204);
@@ -59,6 +59,8 @@ enum TreeRow {
         name: String,
         attention: usize,
         collapsed: bool,
+        pinned: bool,
+        hidden: bool,
     },
     Session {
         host: String,
@@ -72,6 +74,7 @@ enum TreeRow {
         folder: Uuid,
         project: String,
     },
+    Gap,
     Note(String),
 }
 
@@ -90,7 +93,7 @@ impl TreeRow {
             Self::NewSession { host, folder, .. } => {
                 Some(TreeKey::NewSession(host.clone(), *folder))
             }
-            Self::Note(_) => None,
+            Self::Gap | Self::Note(_) => None,
         }
     }
 
@@ -119,8 +122,11 @@ struct SessionTarget {
 #[derive(Clone)]
 struct ProjectTarget {
     host: String,
+    folder: Uuid,
     path: String,
     name: String,
+    pinned: bool,
+    hidden: bool,
 }
 
 enum SessionOverlay {
@@ -136,8 +142,15 @@ enum SessionOverlay {
         target: ProjectTarget,
         value: String,
     },
+    ProjectMenu {
+        target: ProjectTarget,
+        selected: usize,
+    },
     ConfirmDelete {
         target: SessionTarget,
+    },
+    ConfirmDeleteProject {
+        target: ProjectTarget,
     },
 }
 
@@ -152,7 +165,15 @@ struct MutationResult {
     result: Result<(), String>,
 }
 
-struct ProjectRenameResult {
+enum ProjectMutation {
+    Rename(String),
+    Pin(bool),
+    Hide(bool),
+    Delete,
+}
+
+struct ProjectMutationResult {
+    mutation: ProjectMutation,
     result: Result<(), String>,
 }
 
@@ -172,6 +193,7 @@ struct Sidebar {
     active: Option<(String, Uuid)>,
     focused: bool,
     collapsed: HashSet<(String, Uuid)>,
+    show_hidden: bool,
     agent_picker: Option<AgentPicker>,
     session_overlay: Option<SessionOverlay>,
     refreshing: bool,
@@ -188,8 +210,8 @@ struct Sidebar {
     create_rx: Receiver<CreateResult>,
     mutation_tx: Sender<MutationResult>,
     mutation_rx: Receiver<MutationResult>,
-    project_rename_tx: Sender<ProjectRenameResult>,
-    project_rename_rx: Receiver<ProjectRenameResult>,
+    project_mutation_tx: Sender<ProjectMutationResult>,
+    project_mutation_rx: Receiver<ProjectMutationResult>,
 }
 
 pub fn run() -> Result<()> {
@@ -212,7 +234,7 @@ impl Sidebar {
         let (launch_tx, launch_rx) = channel();
         let (create_tx, create_rx) = channel();
         let (mutation_tx, mutation_rx) = channel();
-        let (project_rename_tx, project_rename_rx) = channel();
+        let (project_mutation_tx, project_mutation_rx) = channel();
         let now = Instant::now();
         let mut sidebar = Self {
             local,
@@ -222,6 +244,7 @@ impl Sidebar {
             active: actions::active_session(),
             focused: tmux::current_pane_active(),
             collapsed: HashSet::new(),
+            show_hidden: false,
             agent_picker: None,
             session_overlay: None,
             refreshing: false,
@@ -238,8 +261,8 @@ impl Sidebar {
             create_rx,
             mutation_tx,
             mutation_rx,
-            project_rename_tx,
-            project_rename_rx,
+            project_mutation_tx,
+            project_mutation_rx,
         };
         sidebar.kick_refresh();
         Ok(sidebar)
@@ -279,7 +302,10 @@ impl Sidebar {
                             KeyCode::Enter => self.open_selected(),
                             KeyCode::Char('n' | 'т') => self.begin_new_session(),
                             KeyCode::Char('e' | 'у') => self.begin_rename(),
-                            KeyCode::Char('d' | 'в') => self.begin_delete(),
+                            KeyCode::Char('d' | 'в') | KeyCode::Delete => self.begin_delete(),
+                            KeyCode::Char('p' | 'з') => self.toggle_project_pinned(),
+                            KeyCode::Char('H' | 'Р') => self.toggle_project_hidden(),
+                            KeyCode::Char('v' | 'м') => self.toggle_hidden_visibility(),
                             KeyCode::Char('r' | 'к') => self.kick_refresh(),
                             KeyCode::Char('q' | 'й') | KeyCode::Esc => {
                                 if let Some(window) = tmux::find_window(DASH_WINDOW) {
@@ -303,7 +329,7 @@ impl Sidebar {
                                 && mouse.row >= 2 =>
                         {
                             let index = self.row_at(mouse.row);
-                            self.show_session_menu(index);
+                            self.show_context_menu(index);
                         }
                         Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::ScrollUp) => {
                             self.move_cursor(-1);
@@ -396,11 +422,21 @@ impl Sidebar {
                 }
             }
 
-            while let Ok(renamed) = self.project_rename_rx.try_recv() {
+            while let Ok(mutation) = self.project_mutation_rx.try_recv() {
                 self.mutating = false;
-                match renamed.result {
+                match mutation.result {
                     Ok(()) => {
-                        self.set_message("project renamed", false);
+                        self.set_message(
+                            match mutation.mutation {
+                                ProjectMutation::Rename(_) => "project renamed",
+                                ProjectMutation::Pin(true) => "project pinned",
+                                ProjectMutation::Pin(false) => "project unpinned",
+                                ProjectMutation::Hide(true) => "project hidden",
+                                ProjectMutation::Hide(false) => "project restored",
+                                ProjectMutation::Delete => "project deleted",
+                            },
+                            false,
+                        );
                         self.kick_refresh();
                     }
                     Err(error) => self.set_message(error, true),
@@ -443,7 +479,12 @@ impl Sidebar {
                 .clone()
                 .map(|(host, session)| TreeKey::Session(host, session))
         });
-        self.rows = build_tree(&self.hosts(), &self.probes, &self.collapsed);
+        self.rows = build_tree(
+            &self.hosts(),
+            &self.probes,
+            &self.collapsed,
+            self.show_hidden,
+        );
         let target = selected
             .and_then(|key| self.rows.iter().position(|row| row.matches_key(&key)))
             .or_else(|| self.rows.iter().position(|row| row.key().is_some()));
@@ -559,12 +600,21 @@ impl Sidebar {
                 value: String::new(),
             }),
             Some(TreeRow::Project {
-                host, path, name, ..
+                host,
+                folder,
+                path,
+                name,
+                pinned,
+                hidden,
+                ..
             }) => Some(SessionOverlay::RenameProject {
                 target: ProjectTarget {
                     host: host.clone(),
+                    folder: *folder,
                     path: path.clone(),
                     name: name.clone(),
+                    pinned: *pinned,
+                    hidden: *hidden,
                 },
                 value: String::new(),
             }),
@@ -594,11 +644,82 @@ impl Sidebar {
                     title: title.clone(),
                 },
             }),
+            Some(TreeRow::Project {
+                host,
+                folder,
+                path,
+                name,
+                pinned,
+                hidden,
+                ..
+            }) => Some(SessionOverlay::ConfirmDeleteProject {
+                target: ProjectTarget {
+                    host: host.clone(),
+                    folder: *folder,
+                    path: path.clone(),
+                    name: name.clone(),
+                    pinned: *pinned,
+                    hidden: *hidden,
+                },
+            }),
             _ => {
-                self.set_message("select a session to delete", true);
+                self.set_message("select a project or session to delete", true);
                 None
             }
         };
+    }
+
+    fn selected_project(&self) -> Option<ProjectTarget> {
+        let index = self.list.selected()?;
+        let TreeRow::Project {
+            host,
+            folder,
+            path,
+            name,
+            pinned,
+            hidden,
+            ..
+        } = self.rows.get(index)?
+        else {
+            return None;
+        };
+        Some(ProjectTarget {
+            host: host.clone(),
+            folder: *folder,
+            path: path.clone(),
+            name: name.clone(),
+            pinned: *pinned,
+            hidden: *hidden,
+        })
+    }
+
+    fn toggle_project_pinned(&mut self) {
+        let Some(target) = self.selected_project() else {
+            self.set_message("select a project to pin or unpin", true);
+            return;
+        };
+        self.submit_project_mutation(target.clone(), ProjectMutation::Pin(!target.pinned));
+    }
+
+    fn toggle_project_hidden(&mut self) {
+        let Some(target) = self.selected_project() else {
+            self.set_message("select a project to hide or restore", true);
+            return;
+        };
+        self.submit_project_mutation(target.clone(), ProjectMutation::Hide(!target.hidden));
+    }
+
+    fn toggle_hidden_visibility(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.rebuild();
+        self.set_message(
+            if self.show_hidden {
+                "hidden projects are visible"
+            } else {
+                "hidden projects are hidden"
+            },
+            false,
+        );
     }
 
     /// Create in the selected project, including when one of that project's
@@ -629,7 +750,7 @@ impl Sidebar {
                     None
                 }
             }),
-            Some(TreeRow::Note(_)) | None => None,
+            Some(TreeRow::Gap | TreeRow::Note(_)) | None => None,
         };
         let Some((host, folder, project)) = project else {
             self.set_message("select a project to create a session", true);
@@ -714,6 +835,18 @@ impl Sidebar {
                     picker.selected = (picker.selected + 1).min(2);
                     self.agent_picker = Some(picker);
                 }
+                KeyCode::Char('1') => {
+                    picker.selected = 0;
+                    self.create_from_picker(picker);
+                }
+                KeyCode::Char('2') => {
+                    picker.selected = 1;
+                    self.create_from_picker(picker);
+                }
+                KeyCode::Char('3') => {
+                    picker.selected = 2;
+                    self.create_from_picker(picker);
+                }
                 KeyCode::Enter => self.create_from_picker(picker),
                 _ => self.agent_picker = Some(picker),
             },
@@ -746,25 +879,44 @@ impl Sidebar {
         });
     }
 
-    fn show_session_menu(&mut self, index: usize) {
+    fn show_context_menu(&mut self, index: usize) {
         if self.mutating {
             return;
         }
-        let Some(TreeRow::Session {
-            host, id, title, ..
-        }) = self.rows.get(index)
-        else {
-            return;
+        let overlay = match self.rows.get(index) {
+            Some(TreeRow::Session {
+                host, id, title, ..
+            }) => SessionOverlay::Menu {
+                target: SessionTarget {
+                    host: host.clone(),
+                    id: *id,
+                    title: title.clone(),
+                },
+                selected: 0,
+            },
+            Some(TreeRow::Project {
+                host,
+                folder,
+                path,
+                name,
+                pinned,
+                hidden,
+                ..
+            }) => SessionOverlay::ProjectMenu {
+                target: ProjectTarget {
+                    host: host.clone(),
+                    folder: *folder,
+                    path: path.clone(),
+                    name: name.clone(),
+                    pinned: *pinned,
+                    hidden: *hidden,
+                },
+                selected: 0,
+            },
+            _ => return,
         };
         self.list.select(Some(index));
-        self.session_overlay = Some(SessionOverlay::Menu {
-            target: SessionTarget {
-                host: host.clone(),
-                id: *id,
-                title: title.clone(),
-            },
-            selected: 0,
-        });
+        self.session_overlay = Some(overlay);
     }
 
     fn handle_session_overlay(&mut self, event: Event) {
@@ -786,6 +938,10 @@ impl Sidebar {
                         selected = (selected + 1).min(2);
                         self.session_overlay = Some(SessionOverlay::Menu { target, selected });
                     }
+                    KeyCode::Char('e' | 'у') => self.choose_session_menu(target, 0),
+                    KeyCode::Char('d' | 'в') | KeyCode::Delete => {
+                        self.choose_session_menu(target, 1);
+                    }
                     KeyCode::Enter => self.choose_session_menu(target, selected),
                     _ => {
                         self.session_overlay = Some(SessionOverlay::Menu { target, selected });
@@ -804,6 +960,53 @@ impl Sidebar {
                     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) => {}
                 _ => {
                     self.session_overlay = Some(SessionOverlay::Menu { target, selected });
+                }
+            },
+            SessionOverlay::ProjectMenu {
+                target,
+                mut selected,
+            } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Up | KeyCode::Char('k' | 'л') => {
+                        selected = selected.saturating_sub(1);
+                        self.session_overlay =
+                            Some(SessionOverlay::ProjectMenu { target, selected });
+                    }
+                    KeyCode::Down | KeyCode::Char('j' | 'о') => {
+                        selected = (selected + 1).min(4);
+                        self.session_overlay =
+                            Some(SessionOverlay::ProjectMenu { target, selected });
+                    }
+                    KeyCode::Char('e' | 'у') => self.choose_project_menu(target, 0),
+                    KeyCode::Char('p' | 'з') => self.choose_project_menu(target, 1),
+                    KeyCode::Char('h' | 'H' | 'р' | 'Р') => {
+                        self.choose_project_menu(target, 2);
+                    }
+                    KeyCode::Char('d' | 'в') | KeyCode::Delete => {
+                        self.choose_project_menu(target, 3);
+                    }
+                    KeyCode::Enter => self.choose_project_menu(target, selected),
+                    _ => {
+                        self.session_overlay =
+                            Some(SessionOverlay::ProjectMenu { target, selected });
+                    }
+                },
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    match mouse.row {
+                        3 => self.choose_project_menu(target, 0),
+                        4 => self.choose_project_menu(target, 1),
+                        5 => self.choose_project_menu(target, 2),
+                        6 => self.choose_project_menu(target, 3),
+                        _ => {}
+                    }
+                }
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) => {}
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::ProjectMenu { target, selected });
                 }
             },
             SessionOverlay::Rename { target, mut value } => match event {
@@ -886,6 +1089,28 @@ impl Sidebar {
                     self.session_overlay = Some(SessionOverlay::ConfirmDelete { target });
                 }
             },
+            SessionOverlay::ConfirmDeleteProject { target } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
+                        self.submit_project_mutation(target, ProjectMutation::Delete);
+                    }
+                    KeyCode::Esc | KeyCode::Char('n' | 'N' | 'т' | 'Т') => {}
+                    _ => {
+                        self.session_overlay =
+                            Some(SessionOverlay::ConfirmDeleteProject { target });
+                    }
+                },
+                Event::Mouse(mouse)
+                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                {
+                    if mouse.row == 6 && mouse.column < 12 {
+                        self.submit_project_mutation(target, ProjectMutation::Delete);
+                    }
+                }
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::ConfirmDeleteProject { target });
+                }
+            },
         }
     }
 
@@ -898,6 +1123,29 @@ impl Sidebar {
             1 => Some(SessionOverlay::ConfirmDelete { target }),
             _ => None,
         };
+    }
+
+    fn choose_project_menu(&mut self, target: ProjectTarget, selected: usize) {
+        match selected {
+            0 => {
+                self.session_overlay = Some(SessionOverlay::RenameProject {
+                    value: String::new(),
+                    target,
+                });
+            }
+            1 => {
+                let pinned = !target.pinned;
+                self.submit_project_mutation(target, ProjectMutation::Pin(pinned));
+            }
+            2 => {
+                let hidden = !target.hidden;
+                self.submit_project_mutation(target, ProjectMutation::Hide(hidden));
+            }
+            3 => {
+                self.session_overlay = Some(SessionOverlay::ConfirmDeleteProject { target });
+            }
+            _ => {}
+        }
     }
 
     fn submit_rename(&mut self, target: SessionTarget, value: &str) {
@@ -937,16 +1185,32 @@ impl Sidebar {
             });
             return;
         }
+        self.submit_project_mutation(target, ProjectMutation::Rename(label));
+    }
+
+    fn submit_project_mutation(&mut self, target: ProjectTarget, mutation: ProjectMutation) {
+        if self.mutating {
+            return;
+        }
         let Some(host) = self.local.host_by_name(&target.host).cloned() else {
             self.set_message(format!("unknown host {}", target.host), true);
             return;
         };
         self.mutating = true;
-        let tx = self.project_rename_tx.clone();
+        let tx = self.project_mutation_tx.clone();
         std::thread::spawn(move || {
-            let result =
-                actions::relabel(&host, &target.path, &label).map_err(|e| format!("{e:#}"));
-            let _ = tx.send(ProjectRenameResult { result });
+            let result = match &mutation {
+                ProjectMutation::Rename(label) => actions::relabel(&host, &target.path, label),
+                ProjectMutation::Pin(pinned) => {
+                    actions::set_project_pinned(&host, target.folder, *pinned)
+                }
+                ProjectMutation::Hide(hidden) => {
+                    actions::set_project_hidden(&host, target.folder, *hidden)
+                }
+                ProjectMutation::Delete => actions::unmark(&host, &target.path),
+            }
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(ProjectMutationResult { mutation, result });
         });
     }
 
@@ -980,52 +1244,79 @@ fn build_tree(
     hosts: &[Host],
     probes: &[HostProbe],
     collapsed: &HashSet<(String, Uuid)>,
+    show_hidden: bool,
 ) -> Vec<TreeRow> {
     let mut rows = Vec::new();
-    for host in hosts {
+    let mut projects: Vec<(&Host, &Folder, &Probe, usize, usize)> = Vec::new();
+    let mut unavailable = Vec::new();
+
+    for (host_index, host) in hosts.iter().enumerate() {
         let Some(probed) = probes.iter().find(|probe| probe.host.name == host.name) else {
             continue;
         };
         let Some(probe) = &probed.probe else {
-            rows.push(TreeRow::Note(format!("{} offline", host.name)));
+            unavailable.push(TreeRow::Note(format!("{} offline", host.name)));
             continue;
         };
-
-        for folder in &probe.folders {
-            let mut sessions: Vec<_> = probe
-                .sessions
+        projects.extend(
+            probe
+                .folders
                 .iter()
-                .filter(|view| view.session.folder_id == folder.id)
-                .collect();
-            sessions.sort_by_key(|view| view.session.created_at);
-            let is_collapsed = collapsed.contains(&(host.name.clone(), folder.id));
-            rows.push(TreeRow::Project {
+                .enumerate()
+                .filter(|(_, folder)| show_hidden || !folder.hidden)
+                .map(|(folder_index, folder)| (host, folder, probe, host_index, folder_index)),
+        );
+    }
+
+    projects.sort_by_key(|(_, folder, _, host_index, folder_index)| {
+        (
+            folder.hidden,
+            std::cmp::Reverse(folder.pinned),
+            *host_index,
+            *folder_index,
+        )
+    });
+
+    for (project_index, (host, folder, probe, _, _)) in projects.into_iter().enumerate() {
+        if project_index > 0 {
+            rows.push(TreeRow::Gap);
+        }
+        let mut sessions: Vec<_> = probe
+            .sessions
+            .iter()
+            .filter(|view| view.session.folder_id == folder.id)
+            .collect();
+        sessions.sort_by_key(|view| view.session.created_at);
+        let is_collapsed = collapsed.contains(&(host.name.clone(), folder.id));
+        rows.push(TreeRow::Project {
+            host: host.name.clone(),
+            folder: folder.id,
+            path: folder.path.clone(),
+            name: folder.display_name(),
+            attention: sessions
+                .iter()
+                .filter(|view| view.state.wants_you())
+                .count(),
+            collapsed: is_collapsed,
+            pinned: folder.pinned,
+            hidden: folder.hidden,
+        });
+        if !is_collapsed {
+            rows.push(TreeRow::NewSession {
                 host: host.name.clone(),
                 folder: folder.id,
-                path: folder.path.clone(),
-                name: folder.display_name(),
-                attention: sessions
-                    .iter()
-                    .filter(|view| view.state.wants_you())
-                    .count(),
-                collapsed: is_collapsed,
+                project: folder.display_name(),
             });
-            if !is_collapsed {
-                rows.push(TreeRow::NewSession {
-                    host: host.name.clone(),
-                    folder: folder.id,
-                    project: folder.display_name(),
-                });
-                rows.extend(sessions.into_iter().map(|view| TreeRow::Session {
-                    host: host.name.clone(),
-                    id: view.session.id,
-                    agent: view.session.agent,
-                    title: view.session.title.clone(),
-                    state: view.state,
-                }));
-            }
+            rows.extend(sessions.into_iter().map(|view| TreeRow::Session {
+                host: host.name.clone(),
+                id: view.session.id,
+                agent: view.session.agent,
+                title: view.session.title.clone(),
+                state: view.state,
+            }));
         }
     }
+    rows.extend(unavailable);
     if rows.is_empty() {
         rows.push(TreeRow::Note("no marked projects".into()));
     }
@@ -1111,7 +1402,7 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
             },
         )),
         None => Line::from(Span::styled(
-            " j/k h/l  n new  e name  d delete",
+            " p pin  H hide  v hidden  d delete",
             Style::default().fg(DIM).bg(SURFACE),
         )),
     };
@@ -1145,10 +1436,35 @@ fn draw_session_overlay(
                 format!("  {}", util::one_line(&target.title, 24)),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-            menu_line("  Rename", *selected == 0),
-            menu_line("  Delete session", *selected == 1),
-            menu_line("  Cancel", *selected == 2),
+            menu_line("  [E] Rename", *selected == 0),
+            menu_line("  [D] Delete session", *selected == 1),
+            menu_line("  [Esc] Cancel", *selected == 2),
             Line::styled("  Enter select · Esc close", Style::default().fg(DIM)),
+        ],
+        SessionOverlay::ProjectMenu { target, selected } => vec![
+            Line::styled(
+                format!("  {}", util::one_line(&target.name, 24)),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            menu_line("  [E] Rename", *selected == 0),
+            menu_line(
+                if target.pinned {
+                    "  [P] Unpin"
+                } else {
+                    "  [P] Pin"
+                },
+                *selected == 1,
+            ),
+            menu_line(
+                if target.hidden {
+                    "  [H] Restore"
+                } else {
+                    "  [H] Hide"
+                },
+                *selected == 2,
+            ),
+            menu_line("  [D] Delete project", *selected == 3),
+            menu_line("  [Esc] Cancel", *selected == 4),
         ],
         SessionOverlay::Rename { target, value } => vec![
             Line::styled(
@@ -1187,10 +1503,25 @@ fn draw_session_overlay(
             Line::styled("  Conversation stays on disk.", Style::default().fg(DIM)),
             Line::from(vec![
                 Span::styled(
-                    "  [ Delete ] ",
+                    "  [Y] Delete ",
                     Style::default().fg(BG).bg(RED).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" [ Cancel ] "),
+                Span::raw(" [N] Cancel "),
+            ]),
+        ],
+        SessionOverlay::ConfirmDeleteProject { target } => vec![
+            Line::styled(
+                format!("  Delete {}?", util::one_line(&target.name, 19)),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled("  Sessions are forgotten.", Style::default().fg(DIM)),
+            Line::styled("  Project files stay on disk.", Style::default().fg(DIM)),
+            Line::from(vec![
+                Span::styled(
+                    "  [Y] Delete ",
+                    Style::default().fg(BG).bg(RED).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" [N] Cancel "),
             ]),
         ],
     };
@@ -1221,6 +1552,8 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             name,
             attention,
             collapsed,
+            pinned,
+            hidden,
             ..
         } => {
             let suffix = if *attention > 0 {
@@ -1232,9 +1565,11 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!(
-                        "{} {}",
+                        "{} {}{}{}",
                         if *collapsed { "▸" } else { "▾" },
-                        util::one_line(name, available.max(1))
+                        if *pinned { "📌 " } else { "" },
+                        util::one_line(name, available.max(1)),
+                        if *hidden { "  hidden" } else { "" }
                     ),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
@@ -1277,6 +1612,7 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             "  + new session",
             Style::default().fg(ACCENT),
         ))),
+        TreeRow::Gap => ListItem::new(Line::default()),
         TreeRow::Note(text) => ListItem::new(Line::from(Span::styled(
             util::one_line(text, width.max(1)),
             Style::default().fg(DIM),
@@ -1293,7 +1629,10 @@ fn draw_agent_picker(
         format!("  New in {}", util::one_line(&picker.project, 19)),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )];
-    for (index, label) in ["🤖 Codex", "🧠 Claude", "💻 Shell"].iter().enumerate() {
+    for (index, label) in ["[1] 🤖 Codex", "[2] 🧠 Claude", "[3] 💻 Shell"]
+        .iter()
+        .enumerate()
+    {
         lines.push(Line::styled(
             format!("  {label}"),
             if picker.selected == index {
@@ -1396,6 +1735,7 @@ mod tests {
             std::slice::from_ref(&host),
             std::slice::from_ref(&probe),
             &HashSet::new(),
+            false,
         );
         assert!(matches!(
             &rows[0],
@@ -1425,6 +1765,7 @@ mod tests {
             std::slice::from_ref(&host),
             std::slice::from_ref(&probe),
             &collapsed,
+            false,
         );
         assert_eq!(folded.len(), 1);
         assert!(matches!(
@@ -1433,6 +1774,55 @@ mod tests {
                 collapsed: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn tree_pins_projects_adds_air_and_hides_hidden_projects() {
+        let host = Host::new("local".into(), None);
+        let normal = Folder::new("/work/normal".into());
+        let mut pinned = Folder::new("/work/pinned".into());
+        pinned.pinned = true;
+        let mut hidden = Folder::new("/work/hidden".into());
+        hidden.hidden = true;
+        let probe = HostProbe {
+            host: host.clone(),
+            probe: Some(Probe {
+                folders: vec![normal, pinned, hidden],
+                ..Probe::default()
+            }),
+            error: None,
+        };
+
+        let visible = build_tree(
+            std::slice::from_ref(&host),
+            std::slice::from_ref(&probe),
+            &HashSet::new(),
+            false,
+        );
+        assert!(matches!(
+            &visible[0],
+            TreeRow::Project {
+                name,
+                pinned: true,
+                ..
+            } if name == "pinned"
+        ));
+        assert!(visible.iter().any(|row| matches!(row, TreeRow::Gap)));
+        assert!(
+            !visible
+                .iter()
+                .any(|row| matches!(row, TreeRow::Project { name, .. } if name == "hidden"))
+        );
+
+        let with_hidden = build_tree(
+            std::slice::from_ref(&host),
+            std::slice::from_ref(&probe),
+            &HashSet::new(),
+            true,
+        );
+        assert!(with_hidden.iter().any(
+            |row| matches!(row, TreeRow::Project { name, hidden: true, .. } if name == "hidden")
         ));
     }
 }

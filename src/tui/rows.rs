@@ -96,7 +96,7 @@ fn probe_of<'a>(probes: &'a [HostProbe], host: &str) -> Option<&'a Probe> {
 }
 
 /// The favourites screen: every marked folder on every host.
-pub fn folders(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
+pub fn folders(hosts: &[Host], probes: &[HostProbe], show_hidden: bool) -> Vec<Row> {
     let mut rows = Vec::new();
 
     for host in hosts {
@@ -112,7 +112,11 @@ pub fn folders(hosts: &[Host], probes: &[HostProbe]) -> Vec<Row> {
             continue;
         };
 
-        for folder in &probe.folders {
+        for folder in probe
+            .folders
+            .iter()
+            .filter(|folder| show_hidden || !folder.hidden)
+        {
             let here: Vec<&SessionView> = probe
                 .sessions
                 .iter()
@@ -359,8 +363,31 @@ mod tests {
     #[test]
     fn unreachable_host_becomes_a_note_not_a_silent_gap() {
         let host = Host::new("back".into(), Some("h".into()));
-        let rows = folders(&[host], &[probed("back", None, Some("connection refused"))]);
+        let rows = folders(
+            &[host],
+            &[probed("back", None, Some("connection refused"))],
+            false,
+        );
         assert!(matches!(&rows[0], Row::Note(t) if t.contains("connection refused")));
+    }
+
+    #[test]
+    fn hidden_projects_only_appear_when_requested() {
+        let host = Host::new("local".into(), None);
+        let visible = Folder::new("/visible".into());
+        let mut hidden = Folder::new("/hidden".into());
+        hidden.hidden = true;
+        let probe = Probe {
+            folders: vec![visible, hidden],
+            ..Probe::default()
+        };
+        let probes = [probed("local", Some(probe), None)];
+
+        assert_eq!(
+            folders(std::slice::from_ref(&host), &probes, false).len(),
+            1
+        );
+        assert_eq!(folders(std::slice::from_ref(&host), &probes, true).len(), 2);
     }
 
     #[test]

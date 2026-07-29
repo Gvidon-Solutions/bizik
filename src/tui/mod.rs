@@ -130,7 +130,7 @@ impl App {
     fn rebuild(&mut self) {
         let hosts = self.hosts();
         let mut rows = match self.screen().clone() {
-            Screen::Folders => rows::folders(&hosts, &self.probes),
+            Screen::Folders => rows::folders(&hosts, &self.probes, self.state.show_hidden_projects),
             Screen::Folder { host, folder, .. } => rows::folder_detail(&host, folder, &self.probes),
             Screen::Running => rows::running(&hosts, &self.probes),
             Screen::Layouts => {
@@ -249,6 +249,17 @@ impl App {
             }
             Intent::InstallHost => self.install_host(),
             Intent::Refresh => self.kick_refresh(),
+            Intent::ToggleHiddenProjects => {
+                self.state.show_hidden_projects = !self.state.show_hidden_projects;
+                self.rebuild();
+                self.info(if self.state.show_hidden_projects {
+                    "hidden projects are visible"
+                } else {
+                    "hidden projects are hidden"
+                });
+            }
+            Intent::ToggleProjectHidden => self.toggle_project_hidden(),
+            Intent::ToggleProjectPinned => self.toggle_project_pinned(),
             Intent::RunConfirmed(action) => self.run_confirmed(action),
             Intent::RunInput(kind, value) => self.run_input(kind, value),
         }
@@ -435,7 +446,11 @@ impl App {
         let back = if batch.background {
             String::new()
         } else {
-            format!(" · {} returns here", tmux::return_key())
+            format!(
+                " · {} returns here · {} detaches",
+                tmux::return_key(),
+                tmux::detach_key()
+            )
         };
 
         if failed > 0 {
@@ -568,6 +583,56 @@ impl App {
                 })
             }
             _ => self.info("select a folder to rename it"),
+        }
+    }
+
+    fn toggle_project_pinned(&mut self) {
+        let Some(Row::Folder { host, folder, .. }) = self.current() else {
+            self.info("select a project to pin or unpin it");
+            return;
+        };
+        let pinned = !folder.pinned;
+        match self
+            .host(&host)
+            .ok_or_else(|| format!("unknown host {host}"))
+            .and_then(|host| {
+                actions::set_project_pinned(&host, folder.id, pinned)
+                    .map_err(|error| format!("{error:#}"))
+            }) {
+            Ok(()) => {
+                self.info(if pinned {
+                    "project pinned"
+                } else {
+                    "project unpinned"
+                });
+                self.kick_refresh();
+            }
+            Err(error) => self.error(error),
+        }
+    }
+
+    fn toggle_project_hidden(&mut self) {
+        let Some(Row::Folder { host, folder, .. }) = self.current() else {
+            self.info("select a project to hide or restore it");
+            return;
+        };
+        let hidden = !folder.hidden;
+        match self
+            .host(&host)
+            .ok_or_else(|| format!("unknown host {host}"))
+            .and_then(|host| {
+                actions::set_project_hidden(&host, folder.id, hidden)
+                    .map_err(|error| format!("{error:#}"))
+            }) {
+            Ok(()) => {
+                self.info(if hidden {
+                    "project hidden"
+                } else {
+                    "project restored"
+                });
+                self.kick_refresh();
+            }
+            Err(error) => self.error(error),
         }
     }
 

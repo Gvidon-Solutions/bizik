@@ -69,6 +69,12 @@ pub struct Folder {
     pub visits: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_visit: Option<u64>,
+    /// Pinned projects stay ahead of the normal recency ordering.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// Hidden projects remain available without cluttering the default list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
 }
 
 impl Folder {
@@ -85,6 +91,8 @@ impl Folder {
             deleted_at: None,
             visits: 0,
             last_visit: None,
+            pinned: false,
+            hidden: false,
         }
     }
 

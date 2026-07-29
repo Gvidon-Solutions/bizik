@@ -94,6 +94,7 @@ impl Agent for CodexAgent {
 
     fn launch_cmd(&self, resume: Option<&str>) -> String {
         let bin = super::program(self, "codex");
+        let bin = format!("{bin} --dangerously-bypass-approvals-and-sandbox");
         match resume {
             Some(id) => format!("{bin} resume {}", crate::util::shell_quote(id)),
             None => bin,
@@ -251,5 +252,15 @@ mod tests {
         collect_rollouts(&dir, 0, &mut out);
         assert_eq!(out.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn launch_always_bypasses_approvals_and_sandbox() {
+        let agent = CodexAgent;
+        let fresh = agent.launch_cmd(None);
+        let resumed = agent.launch_cmd(Some("thread id"));
+
+        assert!(fresh.contains(" --dangerously-bypass-approvals-and-sandbox"));
+        assert!(resumed.contains(" --dangerously-bypass-approvals-and-sandbox resume 'thread id'"));
     }
 }

@@ -93,6 +93,26 @@ pub fn relabel(host: &Host, path: &str, label: &str) -> Result<()> {
     remote::run_bzk(host, &["mark", path, "--label", label]).map(|_| ())
 }
 
+pub fn set_project_pinned(host: &Host, folder: Uuid, pinned: bool) -> Result<()> {
+    let folder = folder.to_string();
+    let pinned = pinned.to_string();
+    remote::run_bzk(
+        host,
+        &["update-folder", "--folder", &folder, "--pinned", &pinned],
+    )
+    .map(|_| ())
+}
+
+pub fn set_project_hidden(host: &Host, folder: Uuid, hidden: bool) -> Result<()> {
+    let folder = folder.to_string();
+    let hidden = hidden.to_string();
+    remote::run_bzk(
+        host,
+        &["update-folder", "--folder", &folder, "--hidden", &hidden],
+    )
+    .map(|_| ())
+}
+
 /// Put one viewer for `tmux_name` beside the project sidebar.
 ///
 /// There is deliberately only one viewer pane. Switching sessions respawns

@@ -160,6 +160,38 @@ pub fn marked_folders(repository: &impl HostStateRepository) -> Result<Vec<Folde
 }
 
 #[derive(Clone, Debug)]
+pub struct UpdateFolderPreferences {
+    pub folder: uuid::Uuid,
+    pub pinned: Option<bool>,
+    pub hidden: Option<bool>,
+}
+
+pub fn update_folder_preferences(
+    repository: &impl HostStateRepository,
+    request: UpdateFolderPreferences,
+) -> Result<Folder> {
+    if request.pinned.is_none() && request.hidden.is_none() {
+        bail!("no project preference was supplied");
+    }
+
+    let mut store = repository.load()?;
+    let folder = store
+        .folder_mut(request.folder)
+        .filter(|folder| folder.deleted_at.is_none())
+        .with_context(|| format!("no live folder {}", request.folder))?;
+    if let Some(pinned) = request.pinned {
+        folder.pinned = pinned;
+    }
+    if let Some(hidden) = request.hidden {
+        folder.hidden = hidden;
+    }
+    folder.updated_at = now_ms();
+    let result = folder.clone();
+    repository.save(&store)?;
+    Ok(result)
+}
+
+#[derive(Clone, Debug)]
 pub struct CreateSession {
     pub folder: uuid::Uuid,
     pub agent: AgentKind,
@@ -372,6 +404,40 @@ mod tests {
         };
         unmark_folder(&repository, &terminator, "/repo").unwrap();
         assert!(marked_folders(&repository).unwrap().is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn project_preferences_are_persisted_without_changing_identity() {
+        let path = temp_path("project-preferences");
+        let repository = FsHostStateRepository::at(path.clone());
+        let folder = mark_folder(
+            &repository,
+            MarkFolder {
+                path: "/repo".into(),
+                label: None,
+                git_remote: None,
+                git_branch: None,
+            },
+        )
+        .unwrap();
+
+        let updated = update_folder_preferences(
+            &repository,
+            UpdateFolderPreferences {
+                folder: folder.id,
+                pinned: Some(true),
+                hidden: Some(true),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.id, folder.id);
+        assert!(updated.pinned);
+        assert!(updated.hidden);
+        let saved = marked_folders(&repository).unwrap();
+        assert!(saved[0].pinned);
+        assert!(saved[0].hidden);
         cleanup(&path);
     }
 

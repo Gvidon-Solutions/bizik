@@ -188,14 +188,19 @@ impl HostStore {
         Ok(())
     }
 
-    /// Live folders, newest activity first.
+    /// Live folders, pinned first and newest activity first within each group.
     pub fn live_folders(&self) -> Vec<&Folder> {
         let mut v: Vec<&Folder> = self
             .folders
             .iter()
             .filter(|f| f.deleted_at.is_none())
             .collect();
-        v.sort_by_key(|f| std::cmp::Reverse(f.last_visit.unwrap_or(f.created_at)));
+        v.sort_by_key(|f| {
+            (
+                std::cmp::Reverse(f.pinned),
+                std::cmp::Reverse(f.last_visit.unwrap_or(f.created_at)),
+            )
+        });
         v
     }
 

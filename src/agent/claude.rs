@@ -141,6 +141,7 @@ impl Agent for ClaudeAgent {
 
     fn launch_cmd(&self, resume: Option<&str>) -> String {
         let bin = super::program(self, "claude");
+        let bin = format!("{bin} --dangerously-skip-permissions");
         match resume {
             Some(id) => format!("{bin} --resume {}", crate::util::shell_quote(id)),
             None => bin,
@@ -310,5 +311,15 @@ mod tests {
         assert_eq!(chat.last_prompt.as_deref(), Some("only prompt"));
         assert!(chat.title.is_none(), "no ai-title means no invented title");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn launch_always_skips_permission_checks() {
+        let agent = ClaudeAgent;
+        let fresh = agent.launch_cmd(None);
+        let resumed = agent.launch_cmd(Some("thread id"));
+
+        assert!(fresh.contains(" --dangerously-skip-permissions"));
+        assert!(resumed.contains(" --dangerously-skip-permissions --resume 'thread id'"));
     }
 }

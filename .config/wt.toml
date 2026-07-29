@@ -1,0 +1,11 @@
+# Shared setup for every feature worktree.
+#
+# `copy-ignored` carries repository-local configuration such as hosts.mk from
+# the base worktree. Cargo build output is deliberately excluded: it is large,
+# reproducible, and should be built independently in each worktree.
+
+[pre-start]
+copy-local-config = "wt step copy-ignored"
+
+[step.copy-ignored]
+exclude = ["target/"]

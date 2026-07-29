@@ -119,6 +119,17 @@ enum Cmd {
         title: String,
     },
 
+    /// Change project presentation preferences on this machine
+    #[command(hide = true)]
+    UpdateFolder {
+        #[arg(long)]
+        folder: Uuid,
+        #[arg(long)]
+        pinned: Option<bool>,
+        #[arg(long)]
+        hidden: Option<bool>,
+    },
+
     /// Manage the hosts this laptop drives
     #[command(subcommand)]
     Host(HostCmd),
@@ -251,6 +262,11 @@ pub fn run() -> Result<()> {
         Some(Cmd::Stop { session }) => cmd_stop(session),
         Some(Cmd::RmSession { session }) => cmd_rm_session(session),
         Some(Cmd::RenameSession { session, title }) => cmd_rename_session(session, &title),
+        Some(Cmd::UpdateFolder {
+            folder,
+            pinned,
+            hidden,
+        }) => cmd_update_folder(folder, pinned, hidden),
         Some(Cmd::Host(c)) => cmd_host(c),
         Some(Cmd::Install { host }) => cmd_install(host),
         Some(Cmd::Hook { event }) => cmd_hook(&event),
@@ -348,6 +364,7 @@ fn bind_workspace_keys(session: &tmux::SessionRef) -> Result<()> {
         util::config_env(),
         util::shell_quote(&exe.to_string_lossy())
     );
+    tmux::bind_detach_key(session)?;
     tmux::bind_workspace_key(session, &tui::actions::sidebar_key(), &toggle)?;
     tmux::bind_workspace_key(session, "C-h", &focus_sidebar)?;
     tmux::bind_workspace_key(session, "C-l", &focus_viewer)
@@ -542,6 +559,19 @@ fn cmd_rm_session(session: Uuid) -> Result<()> {
         session,
     )?;
     println!("{}", serde_json::json!({ "removed": removed }));
+    Ok(())
+}
+
+fn cmd_update_folder(folder: Uuid, pinned: Option<bool>, hidden: Option<bool>) -> Result<()> {
+    let folder = application::update_folder_preferences(
+        &FsHostStateRepository::default(),
+        application::UpdateFolderPreferences {
+            folder,
+            pinned,
+            hidden,
+        },
+    )?;
+    println!("{}", serde_json::to_string(&folder)?);
     Ok(())
 }
 
