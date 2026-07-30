@@ -204,6 +204,83 @@ fn several_sessions_in_one_folder_get_distinguishable_names() {
 }
 
 #[test]
+fn codex_sessions_adopt_native_titles_but_keep_manual_renames() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Sandbox::new("codex-auto-title");
+    let project = s.dir("project");
+    let folder = s.mark(&project);
+
+    // Make Codex discoverable without starting a real agent.
+    let codex_bin = s.root.join(".local/bin/codex");
+    std::fs::create_dir_all(codex_bin.parent().unwrap()).unwrap();
+    std::fs::write(&codex_bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&codex_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let thread_id = "codex-thread";
+    let sessions = s.root.join(".codex/sessions/2026/07/30");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let meta = serde_json::json!({
+        "type": "session_meta",
+        "payload": {
+            "session_id": thread_id,
+            "cwd": project,
+        }
+    });
+    std::fs::write(
+        sessions.join("rollout-2026-07-30T12-00-00-codex-thread.jsonl"),
+        format!("{meta}\n"),
+    )
+    .unwrap();
+    let title_index = s.root.join(".codex/session_index.jsonl");
+    let write_title = |title: &str| {
+        let entry = serde_json::json!({
+            "id": thread_id,
+            "thread_name": title,
+            "updated_at": "2026-07-30T12:00:00Z",
+        });
+        std::fs::write(&title_index, format!("{entry}\n")).unwrap();
+    };
+    write_title("Repair authentication");
+
+    let created = s.bzk(&[
+        "new-session",
+        "--folder",
+        &folder,
+        "--agent",
+        "codex",
+        "--resume",
+        thread_id,
+    ]);
+    created.ok();
+    let session: serde_json::Value = serde_json::from_str(created.stdout.trim()).unwrap();
+    let session_id = session["id"].as_str().unwrap();
+    assert_eq!(session["title"], "codex · project");
+
+    assert_eq!(
+        s.probe()["sessions"][0]["session"]["title"],
+        "Repair authentication",
+        "the next refresh should replace the placeholder"
+    );
+
+    s.bzk(&[
+        "rename-session",
+        "--session",
+        session_id,
+        "--title",
+        "release blocker",
+    ])
+    .ok();
+    write_title("A newer native title");
+
+    assert_eq!(
+        s.probe()["sessions"][0]["session"]["title"],
+        "release blocker",
+        "a manual rename must stop automatic updates"
+    );
+}
+
+#[test]
 fn removing_a_folder_stops_being_able_to_start_its_sessions() {
     let s = Sandbox::new("unmark");
     let dir = s.dir("project");

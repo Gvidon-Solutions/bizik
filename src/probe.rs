@@ -13,6 +13,7 @@ use crate::model::{AgentKind, Chat, Folder, LiveAgent, PROTOCOL, Probe};
 use crate::reconcile::{self, Inputs};
 use crate::store::HostStore;
 use crate::tmux;
+use crate::util::{now_ms, one_line};
 
 /// Most chats reported per marked folder. Old conversations pile up and the
 /// full list is neither useful nor cheap to ship over ssh.
@@ -33,20 +34,15 @@ pub fn collect(with_preview: bool) -> Probe {
 
     let marks = crate::attention::read_all();
     // A probe is the natural moment to reattach session records to the
-    // conversation ids their agents ended up creating.
-    if tmux::installed()
-        && (crate::hostops::relink_sessions(&mut store)
+    // conversation ids their agents ended up creating. Delay the save until
+    // chats have also been scanned, so a newly discovered Codex title lands in
+    // the same atomic store update as its thread id.
+    let relinked = if tmux::installed() {
+        crate::hostops::relink_sessions(&mut store)
             + crate::hostops::relink_sessions_from_hooks(&mut store, &marks)
-            > 0)
-        && let Err(e) = store.save()
-    {
-        warnings.push(format!(
-            "could not record resumable conversation ids: {e:#}"
-        ));
-    }
-
-    let folders: Vec<Folder> = store.live_folders().into_iter().cloned().collect();
-    let records: Vec<_> = store.live_sessions().into_iter().cloned().collect();
+    } else {
+        0
+    };
 
     let mut index = ChatIndex::load();
     let mut all_chats = Vec::new();
@@ -61,6 +57,18 @@ pub fn collect(with_preview: bool) -> Probe {
         all_chats.extend(a.scan_chats(&mut index, &mut warnings));
     }
 
+    let retitled = synchronize_codex_session_titles(&mut store, &all_chats, &mut index);
+    if relinked + retitled > 0
+        && let Err(e) = store.save()
+    {
+        warnings.push(format!(
+            "could not record resumable conversation ids or automatic titles: {e:#}"
+        ));
+    }
+
+    let folders: Vec<Folder> = store.live_folders().into_iter().cloned().collect();
+    let records: Vec<_> = store.live_sessions().into_iter().cloned().collect();
+
     // Keep the cache from growing without bound as transcripts are deleted.
     let still_there: Vec<String> = index
         .entries
@@ -69,6 +77,13 @@ pub fn collect(with_preview: bool) -> Probe {
         .cloned()
         .collect();
     index.prune(&still_there);
+    let live_session_ids: std::collections::HashSet<String> = records
+        .iter()
+        .map(|session| session.id.to_string())
+        .collect();
+    index
+        .automatic_session_titles
+        .retain(|id, _| live_session_ids.contains(id));
     if let Err(e) = index.save() {
         warnings.push(format!("chat index not saved: {e:#}"));
     }
@@ -121,6 +136,90 @@ pub fn collect(with_preview: bool) -> Probe {
         env_captured_at: crate::hostenv::load().map(|e| e.captured_at),
         warnings,
     }
+}
+
+/// Copy Codex's own generated thread names onto sessions that still follow
+/// automatic naming.
+///
+/// A generic legacy title is eligible for its first automatic rename. After
+/// that, the disposable chat cache remembers the last title copied. If the
+/// session still has that exact value, a later native rename may follow it; if
+/// the user changed the title in bizik, the values diverge and synchronization
+/// stops. The durable store needs no schema change and manual names always win.
+fn synchronize_codex_session_titles(
+    store: &mut HostStore,
+    chats: &[Chat],
+    index: &mut ChatIndex,
+) -> usize {
+    let native_titles: std::collections::HashMap<&str, String> = chats
+        .iter()
+        .filter(|chat| chat.agent == AgentKind::Codex)
+        .filter_map(|chat| {
+            let title = one_line(chat.title.as_deref()?, 160);
+            (!title.is_empty()).then_some((chat.id.as_str(), title))
+        })
+        .collect();
+
+    let candidates: Vec<_> = store
+        .live_sessions()
+        .iter()
+        .filter(|session| session.agent == AgentKind::Codex)
+        .filter_map(|session| {
+            let agent_id = session.agent_session_id.as_deref()?;
+            let native = native_titles.get(agent_id)?;
+            let folder_name = store
+                .folders
+                .iter()
+                .find(|folder| folder.id == session.folder_id)
+                .map(|folder| folder.display_name())?;
+            Some((
+                session.id,
+                session.title.clone(),
+                native.clone(),
+                folder_name,
+            ))
+        })
+        .collect();
+
+    let mut changed = 0;
+    for (id, current, native, folder_name) in candidates {
+        let key = id.to_string();
+        let followed_previous = index
+            .automatic_session_titles
+            .get(&key)
+            .is_some_and(|previous| previous == &current);
+        let eligible = current == native
+            || followed_previous
+            || is_legacy_default_title(&current, &folder_name);
+
+        if !eligible {
+            // A different value is a manual rename. Forget provenance so a
+            // future Codex title change can never overwrite it.
+            index.automatic_session_titles.remove(&key);
+            continue;
+        }
+
+        index.automatic_session_titles.insert(key, native.clone());
+        if current != native
+            && let Some(session) = store.session_mut(id)
+        {
+            session.title = native;
+            session.updated_at = now_ms();
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn is_legacy_default_title(title: &str, folder_name: &str) -> bool {
+    let base = format!("codex · {folder_name}");
+    if title == base {
+        return true;
+    }
+    title
+        .strip_prefix(&format!("{base} "))
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+        .is_some_and(|number| number >= 2)
 }
 
 /// Running agents, with whatever their hooks last reported joined in.
@@ -196,7 +295,7 @@ fn under(path: &str, root: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Folder;
+    use crate::model::{Folder, Session};
 
     fn chat(cwd: &str, id: &str, when: u64) -> Chat {
         Chat {
@@ -209,6 +308,123 @@ mod tests {
             last_active: when,
             size: 1,
         }
+    }
+
+    fn codex_chat(id: &str, title: &str) -> Chat {
+        Chat {
+            agent: AgentKind::Codex,
+            id: id.into(),
+            cwd: "/repo".into(),
+            title: Some(title.into()),
+            last_prompt: None,
+            git_branch: None,
+            last_active: 1,
+            size: 1,
+        }
+    }
+
+    fn codex_session_store(title: &str, thread: &str) -> (HostStore, uuid::Uuid) {
+        let folder = Folder::new("/repo".into());
+        let mut session = Session::new(folder.id, AgentKind::Codex, title.into());
+        session.agent_session_id = Some(thread.into());
+        let id = session.id;
+        let mut store = HostStore::default();
+        store.folders.push(folder);
+        store.sessions.push(session);
+        (store, id)
+    }
+
+    #[test]
+    fn legacy_codex_titles_follow_native_renames_until_the_user_renames_them() {
+        let (mut store, session_id) = codex_session_store("codex · repo 2", "thread");
+        let mut index = ChatIndex::default();
+
+        assert_eq!(
+            synchronize_codex_session_titles(
+                &mut store,
+                &[codex_chat("thread", "Fix login flow")],
+                &mut index,
+            ),
+            1
+        );
+        assert_eq!(store.session(session_id).unwrap().title, "Fix login flow");
+        assert_eq!(
+            index
+                .automatic_session_titles
+                .get(&session_id.to_string())
+                .map(String::as_str),
+            Some("Fix login flow")
+        );
+
+        assert_eq!(
+            synchronize_codex_session_titles(
+                &mut store,
+                &[codex_chat("thread", "Repair authentication")],
+                &mut index,
+            ),
+            1
+        );
+        assert_eq!(
+            store.session(session_id).unwrap().title,
+            "Repair authentication"
+        );
+
+        store.session_mut(session_id).unwrap().title = "my manual name".into();
+        assert_eq!(
+            synchronize_codex_session_titles(
+                &mut store,
+                &[codex_chat("thread", "Another native name")],
+                &mut index,
+            ),
+            0
+        );
+        assert_eq!(store.session(session_id).unwrap().title, "my manual name");
+        assert!(
+            !index
+                .automatic_session_titles
+                .contains_key(&session_id.to_string())
+        );
+    }
+
+    #[test]
+    fn a_custom_legacy_codex_title_is_never_replaced() {
+        let (mut store, session_id) = codex_session_store("release blocker", "thread");
+        let mut index = ChatIndex::default();
+
+        assert_eq!(
+            synchronize_codex_session_titles(
+                &mut store,
+                &[codex_chat("thread", "Generated title")],
+                &mut index,
+            ),
+            0
+        );
+        assert_eq!(store.session(session_id).unwrap().title, "release blocker");
+        assert!(index.automatic_session_titles.is_empty());
+    }
+
+    #[test]
+    fn an_adopted_codex_title_is_tracked_for_later_native_updates() {
+        let (mut store, session_id) = codex_session_store("Existing title", "thread");
+        let mut index = ChatIndex::default();
+
+        assert_eq!(
+            synchronize_codex_session_titles(
+                &mut store,
+                &[codex_chat("thread", "Existing title")],
+                &mut index,
+            ),
+            0
+        );
+        assert_eq!(
+            synchronize_codex_session_titles(
+                &mut store,
+                &[codex_chat("thread", "Updated title")],
+                &mut index,
+            ),
+            1
+        );
+        assert_eq!(store.session(session_id).unwrap().title, "Updated title");
     }
 
     #[test]

@@ -3,16 +3,21 @@
 //! Layout on disk: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`.
 //! The first record is `session_meta`, whose payload carries the working
 //! directory and the session id — cheaper to read than Claude's format.
+//! `~/.codex/session_index.jsonl` maps those ids to Codex's generated thread
+//! names. It is read separately because a title can change without touching
+//! the rollout file.
 //!
-//! Codex has no process registry or generated titles. So [`Caps`] still reports
-//! `titles: false` and `live_status: false`, and liveness is recovered by
-//! walking `/proc`. When bizik's lifecycle hooks are installed, their exact
-//! per-session reports refine that process-level view into working, waiting,
-//! and done.
+//! Codex has no process registry, so [`Caps`] still reports
+//! `live_status: false`, and liveness is recovered by walking `/proc`. When
+//! bizik's lifecycle hooks are installed, their exact per-session reports
+//! refine that process-level view into working, waiting, and done.
 
 use anyhow::Result;
+use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -27,8 +32,16 @@ pub struct CodexAgent;
 
 const DEFAULT_THEME: &str = "catppuccin-latte";
 
+fn codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME").map_or_else(|| home().join(".codex"), PathBuf::from)
+}
+
 fn sessions_root() -> PathBuf {
-    home().join(".codex/sessions")
+    codex_home().join("sessions")
+}
+
+fn session_index_path() -> PathBuf {
+    codex_home().join("session_index.jsonl")
 }
 
 /// Codex chooses a syntax-highlighting theme when its TUI starts. A bizik agent
@@ -62,9 +75,8 @@ fn valid_theme_name(theme: &str) -> bool {
 }
 
 fn config_has_theme() -> bool {
-    let codex_home =
-        std::env::var_os("CODEX_HOME").map_or_else(|| home().join(".codex"), PathBuf::from);
-    fs::read_to_string(codex_home.join("config.toml")).is_ok_and(|raw| config_text_has_theme(&raw))
+    fs::read_to_string(codex_home().join("config.toml"))
+        .is_ok_and(|raw| config_text_has_theme(&raw))
 }
 
 fn config_text_has_theme(raw: &str) -> bool {
@@ -93,7 +105,7 @@ impl Agent for CodexAgent {
 
     fn caps(&self) -> Caps {
         Caps {
-            titles: false,
+            titles: true,
             live_status: false,
             resume: true,
         }
@@ -104,6 +116,7 @@ impl Agent for CodexAgent {
     }
 
     fn scan_chats(&self, index: &mut ChatIndex, warnings: &mut Vec<String>) -> Vec<Chat> {
+        let native_titles = read_session_titles(&session_index_path(), warnings);
         let mut files = Vec::new();
         collect_rollouts(&sessions_root(), 0, &mut files);
 
@@ -113,12 +126,15 @@ impl Agent for CodexAgent {
             let (mtime, size) = (mtime_ms(&path), file_size(&path));
 
             if let Some(cached) = index.get(&key, mtime, size) {
-                chats.push(cached.clone());
+                let mut chat = cached.clone();
+                apply_native_title(&mut chat, &native_titles);
+                chats.push(chat);
                 continue;
             }
             match parse_rollout(&path, mtime, size) {
-                Ok(Some(chat)) => {
+                Ok(Some(mut chat)) => {
                     index.put(key, mtime, size, chat.clone());
+                    apply_native_title(&mut chat, &native_titles);
                     chats.push(chat);
                 }
                 // A rollout with no meta record is not a conversation; saying
@@ -163,6 +179,63 @@ impl Agent for CodexAgent {
             None => bin,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct SessionIndexEntry {
+    id: String,
+    thread_name: String,
+}
+
+/// Codex rewrites this small append-only index independently from rollouts.
+///
+/// Malformed entries are counted and skipped: one damaged line must not hide
+/// every healthy conversation. Later entries win if Codex ever writes the
+/// same id again.
+fn read_session_titles(path: &Path, warnings: &mut Vec<String>) -> HashMap<String, String> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(error) => {
+            warnings.push(format!(
+                "codex: cannot read session title index {}: {error}",
+                path.display()
+            ));
+            return HashMap::new();
+        }
+    };
+
+    let mut titles = HashMap::new();
+    let mut rejected = 0_usize;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            rejected += 1;
+            continue;
+        };
+        let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(&line) else {
+            rejected += 1;
+            continue;
+        };
+        let id = entry.id.trim();
+        let title = one_line(&entry.thread_name, 160);
+        if id.is_empty() || title.is_empty() {
+            rejected += 1;
+            continue;
+        }
+        titles.insert(id.to_string(), title);
+    }
+    if rejected > 0 {
+        warnings.push(format!(
+            "codex: skipped {rejected} invalid session title index entr{} in {}",
+            if rejected == 1 { "y" } else { "ies" },
+            path.display()
+        ));
+    }
+    titles
+}
+
+fn apply_native_title(chat: &mut Chat, titles: &HashMap<String, String>) {
+    chat.title = titles.get(&chat.id).cloned();
 }
 
 /// Walk the `YYYY/MM/DD` tree gathering rollout files. Depth is bounded so a
@@ -238,8 +311,8 @@ fn parse_rollout(path: &Path, mtime: u64, size: u64) -> Result<Option<Chat>> {
         agent: AgentKind::Codex,
         id,
         cwd,
-        // Codex generates no title; the UI falls back to the last prompt rather
-        // than displaying something invented here.
+        // Added from session_index.jsonl after parsing. Keeping it out of the
+        // rollout cache lets a renamed thread refresh immediately.
         title: None,
         last_prompt,
         git_branch: None,
@@ -292,6 +365,58 @@ mod tests {
         assert_eq!(chat.last_prompt.as_deref(), Some("проверь расчёты"));
         assert!(chat.title.is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reads_generated_titles_from_the_separate_session_index() {
+        let dir = std::env::temp_dir().join(format!("bzk-codex-titles-{}", std::process::id()));
+        let path = write(
+            &dir,
+            "session_index.jsonl",
+            &[
+                r#"{"id":"one","thread_name":"Initial name","updated_at":"2026-07-30T12:00:00Z"}"#,
+                "not json",
+                r#"{"id":"two","thread_name":"  Multi\nline\tname  ","updated_at":"2026-07-30T12:01:00Z"}"#,
+                r#"{"id":"one","thread_name":"Fresh name","updated_at":"2026-07-30T12:02:00Z"}"#,
+                r#"{"id":"","thread_name":"No identity","updated_at":"2026-07-30T12:03:00Z"}"#,
+            ],
+        );
+        let mut warnings = Vec::new();
+
+        let titles = read_session_titles(&path, &mut warnings);
+
+        assert_eq!(titles.get("one").map(String::as_str), Some("Fresh name"));
+        assert_eq!(
+            titles.get("two").map(String::as_str),
+            Some("Multi line name")
+        );
+        assert_eq!(titles.len(), 2);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("2 invalid"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_native_title_is_applied_without_losing_prompt_fallback_data() {
+        let mut chat = Chat {
+            agent: AgentKind::Codex,
+            id: "thread".into(),
+            cwd: "/repo".into(),
+            title: None,
+            last_prompt: Some("the user's latest request".into()),
+            git_branch: None,
+            last_active: 1,
+            size: 2,
+        };
+        let titles = HashMap::from([("thread".into(), "Generated title".into())]);
+
+        apply_native_title(&mut chat, &titles);
+
+        assert_eq!(chat.title.as_deref(), Some("Generated title"));
+        assert_eq!(
+            chat.last_prompt.as_deref(),
+            Some("the user's latest request")
+        );
     }
 
     #[test]

@@ -2,11 +2,12 @@
 //!
 //! Every agent stores its conversations differently, and — importantly — they
 //! do not offer the same information. Claude Code writes a generated title into
-//! its transcript and maintains a live registry with a busy/idle status; Codex
-//! has neither. Lifecycle hooks provide finer per-session states when
-//! configured. Rather than reduce both to a lowest common denominator, each
-//! adapter declares [`Caps`] and the UI degrades *visibly*: a missing status is
-//! shown as unknown, never invented.
+//! its transcript and maintains a live registry with a busy/idle status. Codex
+//! keeps generated thread names in a separate index but has no live registry.
+//! Lifecycle hooks provide finer per-session states when configured. Rather
+//! than reduce both to a lowest common denominator, each adapter declares
+//! [`Caps`] and the UI degrades *visibly*: a missing status is shown as unknown,
+//! never invented.
 //!
 //! Transcripts reach tens of megabytes, so no adapter may read a whole file.
 //! Parsing is bounded to a head and a tail slice, and results are cached in
@@ -217,6 +218,13 @@ pub struct ChatEntry {
 pub struct ChatIndex {
     #[serde(default)]
     pub entries: HashMap<String, ChatEntry>,
+    /// Last native title bizik copied onto each of its own session records.
+    ///
+    /// This provenance belongs in the disposable cache, not the durable host
+    /// store: losing it merely stops future automatic updates, while keeping it
+    /// lets a manual rename be distinguished from a native title change.
+    #[serde(default)]
+    pub automatic_session_titles: HashMap<String, String>,
 }
 
 impl ChatIndex {

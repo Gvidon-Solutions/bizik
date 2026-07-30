@@ -41,6 +41,12 @@ exact session id, so both Codex and Claude sessions can show *working*,
 *needs you*, and *done* even when several agents share one project. Without
 hooks, the status stays vague on purpose.
 
+**Codex sessions name themselves.** A fresh row starts with a predictable
+`codex · project` placeholder. Once Codex generates its native thread name,
+bizik adopts it automatically, including for placeholder rows created by older
+versions. Renaming the session with `e` makes that name yours and stops later
+automatic updates.
+
 ## Install
 
 Needs Rust, tmux, and ssh.
@@ -397,5 +403,8 @@ than an error. Registry entries outlive crashed processes, so every pid is
 checked against `/proc` — including its start time, to catch a recycled pid.
 
 Codex keeps `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, whose first record
-carries the working directory and session id. It has no live registry, so
-liveness comes from walking `/proc`.
+carries the working directory and session id, and maps those ids to generated
+thread names in `~/.codex/session_index.jsonl`. The title index is applied
+separately from the bounded transcript cache so a native rename appears without
+re-reading a rollout. Codex has no live registry, so liveness comes from walking
+`/proc`.
