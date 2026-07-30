@@ -114,11 +114,13 @@ pub fn set_project_hidden(host: &Host, folder: Uuid, hidden: bool) -> Result<()>
     .map(|_| ())
 }
 
-/// Put a viewer for `tmux_name` beside the project sidebar.
+/// Put one layout viewer for `tmux_name` beside the project sidebar.
 ///
-/// Viewers accumulate on the right-hand side so several sessions can be
-/// watched together and saved as a layout. Reopening a session focuses its
-/// existing viewer instead of duplicating it.
+/// This is the additive primitive used while restoring a layout or an explicit
+/// multi-selection. Ordinary session navigation must use `open_standalone` so
+/// switching sessions replaces the previous workspace instead of fragmenting
+/// it. Reopening a session focuses its existing viewer instead of duplicating
+/// it.
 pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> {
     let cmd = remote::attach_command(host, tmux_name);
     let (window, panes, created) = if let Some(window) = work_window() {
@@ -204,6 +206,57 @@ pub fn open_standalone(host: &Host, session: Uuid, tmux_name: &str) -> Result<St
         }
     }
     open_pane(host, session, tmux_name)
+}
+
+/// Focus an existing viewer without changing the workspace composition.
+///
+/// Layout children use this when their complete layout is already visible.
+/// Returning `false` tells the caller that the layout needs restoring first.
+pub fn focus_open_session(host: &str, session: Uuid) -> Result<bool> {
+    let Some(window) = work_window() else {
+        return Ok(false);
+    };
+    let session = session.to_string();
+    let Some(pane) = tmux::window_panes(&window)?.into_iter().find(|pane| {
+        pane.role.as_deref() == Some(VIEWER_ROLE)
+            && pane.host.as_deref() == Some(host)
+            && pane.session.as_deref() == Some(session.as_str())
+    }) else {
+        return Ok(false);
+    };
+    tmux::select_window(&window)?;
+    tmux::select_pane(&pane.pane)?;
+    Ok(true)
+}
+
+/// Whether the workspace currently contains exactly this layout's viewers.
+pub fn workspace_has_exact_panes(wanted: &[crate::model::PaneRef]) -> bool {
+    let Some(window) = work_window() else {
+        return false;
+    };
+    let Ok(panes) = tmux::window_panes(&window) else {
+        return false;
+    };
+    let wanted: std::collections::HashSet<(String, Uuid)> = wanted
+        .iter()
+        .map(|pane| (pane.host.clone(), pane.session))
+        .collect();
+    let viewers: Vec<_> = panes
+        .iter()
+        .filter(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
+        .collect();
+    if viewers.len() != wanted.len() {
+        return false;
+    }
+    viewers.iter().all(|pane| {
+        let Some(host) = pane.host.as_deref() else {
+            return false;
+        };
+        let Some(session) = pane.session.as_deref().and_then(|id| id.parse().ok()) else {
+            return false;
+        };
+        wanted.contains(&(host.to_string(), session))
+    })
 }
 
 /// Close viewer clients that do not belong to the layout being restored.

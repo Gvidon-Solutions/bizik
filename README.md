@@ -237,10 +237,14 @@ sandbox checks by default (`--dangerously-bypass-approvals-and-sandbox` and
 `--dangerously-skip-permissions`). Only mark projects whose contents you trust.
 
 The workspace lives in a window called `bzk-work`: a project/session/layout
-tree on the left and one or more agent panes on the right. Opening another
-session adds a viewer pane; reopening one focuses its existing pane. Every
-agent keeps running in its own detached tmux session. Press `S` in the sidebar
-or dashboard to save the exact arrangement.
+tree on the left and the active workspace on the right. Opening a regular
+session replaces the visible workspace with that one viewer. Opening a layout
+replaces it with exactly that layout's panes, and switching layouts removes the
+previous layout's viewers. Selecting a child of the active layout only focuses
+its existing pane. Every agent keeps running in its own detached tmux session,
+so replacing viewers never stops work. An explicit dashboard multi-selection
+can still open an ad-hoc group; press `S` in the sidebar or dashboard to save
+that exact arrangement.
 
 A layout whose sessions all belong to one project appears directly inside that
 project, beside its standalone sessions. A layout containing several projects

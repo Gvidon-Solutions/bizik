@@ -175,6 +175,7 @@ struct LaunchResult {
 
 struct LayoutLaunchResult {
     layout: SavedLayout,
+    focus: Option<(String, Uuid)>,
     results: Vec<(Host, Result<SpawnResult, String>)>,
 }
 
@@ -532,7 +533,11 @@ impl Sidebar {
                     {
                         actions::tile();
                     }
-                    let _ = actions::focus_work();
+                    if let Some((host, session)) = &batch.focus {
+                        let _ = actions::focus_open_session(host, *session);
+                    } else {
+                        let _ = actions::focus_work();
+                    }
                 }
                 if failed == 0 {
                     self.set_message(
@@ -1138,13 +1143,33 @@ impl Sidebar {
                 });
             }
             TreeKey::Session(host, session) => self.open_named(&host, session),
-            TreeKey::LayoutSession(_, host, session, _) => {
-                self.open_named(&host, session);
+            TreeKey::LayoutSession(layout, host, session, _) => {
+                let saved = self
+                    .local
+                    .live_layouts()
+                    .into_iter()
+                    .find(|saved| saved.id == layout)
+                    .cloned();
+                if let Some(saved) = saved
+                    && actions::workspace_has_exact_panes(&saved.panes)
+                {
+                    match actions::focus_open_session(&host, session) {
+                        Ok(true) => self.set_message("switched", false),
+                        Ok(false) => self.open_layout_with_focus(layout, Some((host, session))),
+                        Err(error) => self.set_message(format!("{error:#}"), true),
+                    }
+                } else {
+                    self.open_layout_with_focus(layout, Some((host, session)));
+                }
             }
         }
     }
 
     fn open_layout(&mut self, id: Uuid) {
+        self.open_layout_with_focus(id, None);
+    }
+
+    fn open_layout_with_focus(&mut self, id: Uuid, focus: Option<(String, Uuid)>) {
         let Some(layout) = self
             .local
             .live_layouts()
@@ -1179,7 +1204,11 @@ impl Sidebar {
                     (host, result)
                 })
                 .collect();
-            let _ = tx.send(LayoutLaunchResult { layout, results });
+            let _ = tx.send(LayoutLaunchResult {
+                layout,
+                focus,
+                results,
+            });
         });
     }
 
@@ -1214,16 +1243,12 @@ impl Sidebar {
             self.set_message(format!("unknown host {host_name}"), true);
             return false;
         };
-        self.open_with_focus(host, session, focus_sidebar);
+        self.open_with_mode(host, session, focus_sidebar, true);
         true
     }
 
     fn open(&mut self, host: Host, session: Uuid) {
-        self.open_with_focus(host, session, false);
-    }
-
-    fn open_with_focus(&mut self, host: Host, session: Uuid, focus_sidebar: bool) {
-        self.open_with_mode(host, session, focus_sidebar, false);
+        self.open_with_mode(host, session, false, true);
     }
 
     fn open_with_mode(&mut self, host: Host, session: Uuid, focus_sidebar: bool, standalone: bool) {

@@ -64,7 +64,6 @@ pub enum Confirm {
     Forget { host: String, session: Uuid },
     Unmark { host: String, path: String },
     DeleteLayout { id: Uuid },
-    RestoreLayout { id: Uuid, close: Vec<String> },
 }
 
 pub enum InputKind {

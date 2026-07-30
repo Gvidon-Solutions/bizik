@@ -406,6 +406,24 @@ impl App {
 
         let mut opened = 0;
         let mut failed = 0;
+        if !batch.background {
+            let wanted: Vec<PaneRef> = batch
+                .results
+                .iter()
+                .filter_map(|(host, result)| {
+                    result.as_ref().ok().map(|spawned| PaneRef {
+                        host: host.name.clone(),
+                        session: spawned.session.id,
+                    })
+                })
+                .collect();
+            if !wanted.is_empty()
+                && let Err(error) = actions::retain_layout_panes(&wanted)
+            {
+                failed += 1;
+                self.error(format!("{error:#}"));
+            }
+        }
         for (host, result) in &batch.results {
             match result {
                 Ok(spawned) => {
@@ -507,42 +525,13 @@ impl App {
 
     /// Restore a saved arrangement.
     ///
-    /// A saved geometry describes that layout's panes and no others, so
-    /// replaying it over unrelated panes would rearrange work the layout knows
-    /// nothing about. Rather than silently tile instead, the panes that do not
-    /// belong are named and closing them is offered as a choice.
+    /// Selecting a layout is an explicit workspace switch: its viewer set
+    /// replaces the previous standalone session or layout. Detached agent
+    /// sessions remain running; only their local attach clients are replaced.
     fn restore_layout(&mut self, layout: &Layout) {
         let open = actions::panes_in_work(&self.all_sessions());
         let close = panes_to_close(&open, &layout.panes);
-
-        if close.is_empty() {
-            // Say what was counted. "It offered to close nothing" and "it never
-            // looked" are indistinguishable otherwise, and telling them apart
-            // by reasoning about the code wasted an afternoon.
-            if open.len() > layout.panes.len() {
-                self.error(format!(
-                    "{} panes open, {} identified, none judged surplus — bzk panes shows why",
-                    tmux::find_window(actions::WORK_WINDOW)
-                        .and_then(|w| tmux::window_panes(&w).ok())
-                        .map_or(0, |panes| panes.len()),
-                    open.len()
-                ));
-            }
-            self.do_restore(layout, &[]);
-            return;
-        }
-        self.state.overlay = Some(Overlay::Confirm {
-            prompt: format!(
-                "“{}” wants the pane window to itself. Close {} pane{} that do not belong to it — duplicates and strangers — and restore its exact arrangement?",
-                layout.name,
-                close.len(),
-                if close.len() == 1 { "" } else { "s" }
-            ),
-            action: Confirm::RestoreLayout {
-                id: layout.id,
-                close,
-            },
-        });
+        self.do_restore(layout, &close);
     }
 
     fn do_restore(&mut self, layout: &Layout, close: &[String]) {
@@ -738,21 +727,6 @@ impl App {
                         .map(|_| String::new())
                         .map_err(|e| format!("{e:#}")),
                     None => Ok(String::new()),
-                }
-            }
-            Confirm::RestoreLayout { id, close } => {
-                match self
-                    .local
-                    .live_layouts()
-                    .into_iter()
-                    .find(|l| l.id == id)
-                    .cloned()
-                {
-                    Some(layout) => {
-                        self.do_restore(&layout, &close);
-                        return;
-                    }
-                    None => Err("that layout is gone".to_string()),
                 }
             }
         };

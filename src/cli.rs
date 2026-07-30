@@ -421,7 +421,7 @@ fn cmd_view(host_name: &str, session: Uuid) -> Result<()> {
         .host_by_name(host_name)
         .with_context(|| format!("no host named {host_name}"))?;
     let spawned = tui::actions::start(host, session)?;
-    tui::actions::open_pane(host, spawned.session.id, &spawned.tmux_name)?;
+    tui::actions::open_standalone(host, spawned.session.id, &spawned.tmux_name)?;
     Ok(())
 }
 

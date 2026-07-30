@@ -359,6 +359,105 @@ fn opening_a_layout_builds_multiple_viewers_beside_one_sidebar() {
 }
 
 #[test]
+fn opening_a_regular_session_replaces_the_active_layout() {
+    let s = Sandbox::new("layout-to-standalone");
+    let folder = s.mark(&s.dir("project"));
+    let first = s.new_session(&folder, "api");
+    let second = s.new_session(&folder, "tests");
+    let standalone = s.new_session(&folder, "logs");
+    s.bzk(&[
+        "layout",
+        "create",
+        "release",
+        "--pane",
+        &format!("local:{first}"),
+        "--pane",
+        &format!("local:{second}"),
+    ])
+    .ok();
+
+    s.bzk(&["layout", "open", "release"]).ok();
+    s.eventually("the layout viewers to open", || {
+        workspace_viewer_sessions(&s).len() == 2
+    });
+
+    s.bzk(&["view", "--host", "local", "--session", &standalone])
+        .ok();
+    s.eventually("the standalone viewer to replace the layout", || {
+        workspace_viewer_sessions(&s) == vec![standalone.clone()]
+    });
+
+    let tmux_sessions = s.tmux_sessions();
+    for session in [&first, &second, &standalone] {
+        assert!(
+            tmux_sessions.contains(&Sandbox::tmux_name(session)),
+            "switching viewers must not stop detached session {session}"
+        );
+    }
+}
+
+#[test]
+fn opening_another_layout_replaces_the_previous_layout() {
+    let s = Sandbox::new("layout-to-layout");
+    let folder = s.mark(&s.dir("project"));
+    let first = s.new_session(&folder, "api");
+    let second = s.new_session(&folder, "tests");
+    let third = s.new_session(&folder, "logs");
+    s.bzk(&[
+        "layout",
+        "create",
+        "development",
+        "--pane",
+        &format!("local:{first}"),
+        "--pane",
+        &format!("local:{second}"),
+    ])
+    .ok();
+    s.bzk(&[
+        "layout",
+        "create",
+        "operations",
+        "--pane",
+        &format!("local:{second}"),
+        "--pane",
+        &format!("local:{third}"),
+    ])
+    .ok();
+
+    s.bzk(&["layout", "open", "development"]).ok();
+    s.bzk(&["layout", "open", "operations"]).ok();
+
+    let mut expected = vec![second, third];
+    expected.sort();
+    s.eventually("the second layout to replace the first", || {
+        workspace_viewer_sessions(&s) == expected
+    });
+    assert!(
+        !workspace_viewer_sessions(&s).contains(&first),
+        "a pane from the previous layout must not remain visible"
+    );
+}
+
+fn workspace_viewer_sessions(s: &Sandbox) -> Vec<String> {
+    let mut sessions: Vec<String> = s
+        .tmux(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{window_name}\t#{@bzk_role}\t#{@bzk_session}",
+        ])
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split('\t');
+            (columns.next() == Some("bzk-work") && columns.next() == Some("viewer"))
+                .then(|| columns.next().unwrap_or_default().to_string())
+        })
+        .collect();
+    sessions.sort();
+    sessions
+}
+
+#[test]
 fn codex_sessions_adopt_native_titles_but_keep_manual_renames() {
     use std::os::unix::fs::PermissionsExt;
 
