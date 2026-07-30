@@ -160,11 +160,9 @@ impl App {
             .filter(|(_, r)| r.selectable())
             .map(|(i, _)| i)
             .collect();
-        match self.state.list.selected() {
-            _ if selectable.is_empty() => self.state.list.select(None),
-            Some(i) if selectable.contains(&i) => {}
-            _ => self.state.list.select(selectable.first().copied()),
-        }
+        self.state
+            .list
+            .select(selection_near(self.state.list.selected(), &selectable));
     }
 
     fn pump(&mut self) -> Result<()> {
@@ -855,6 +853,19 @@ fn fuzzy_filter(rows: Vec<Row>, needle: &str) -> Vec<Row> {
     scored.into_iter().map(|(_, row)| row).collect()
 }
 
+/// Prefer the same row, then the next actionable row, then the preceding one.
+/// This keeps the cursor beside a row that disappears after a deletion.
+fn selection_near(selected: Option<usize>, selectable: &[usize]) -> Option<usize> {
+    let Some(selected) = selected else {
+        return selectable.first().copied();
+    };
+    selectable
+        .iter()
+        .copied()
+        .find(|index| *index >= selected)
+        .or_else(|| selectable.last().copied())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +900,25 @@ mod tests {
         let rows = vec![Row::Note("some warning".into()), folder_row("app", "h")];
         let got = fuzzy_filter(rows, "app");
         assert!(got.iter().all(|r| r.selectable()));
+    }
+
+    #[test]
+    fn cursor_stays_near_a_row_removed_by_refresh() {
+        let selectable = vec![0, 2, 4];
+
+        assert_eq!(selection_near(Some(2), &selectable), Some(2));
+        assert_eq!(
+            selection_near(Some(1), &selectable),
+            Some(2),
+            "prefer the next row at the removed row's position",
+        );
+        assert_eq!(
+            selection_near(Some(5), &selectable),
+            Some(4),
+            "fall back to the preceding row when there is no next row",
+        );
+        assert_eq!(selection_near(None, &selectable), Some(0));
+        assert_eq!(selection_near(Some(0), &[]), None);
     }
 
     #[test]

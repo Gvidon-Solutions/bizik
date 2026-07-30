@@ -488,6 +488,10 @@ impl Sidebar {
     }
 
     fn rebuild(&mut self) {
+        let selected_position = self
+            .list
+            .selected()
+            .and_then(|selected| selectable_position(&self.rows, selected));
         let selected = self.current_key().or_else(|| {
             self.active
                 .clone()
@@ -499,9 +503,7 @@ impl Sidebar {
             &self.collapsed,
             self.show_hidden,
         );
-        let target = selected
-            .and_then(|key| self.rows.iter().position(|row| row.matches_key(&key)))
-            .or_else(|| self.rows.iter().position(|row| row.key().is_some()));
+        let target = selection_after_rebuild(&self.rows, selected.as_ref(), selected_position);
         self.list.select(target);
     }
 
@@ -1278,6 +1280,37 @@ impl Sidebar {
     }
 }
 
+fn selectable_position(rows: &[TreeRow], selected: usize) -> Option<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row.key().is_some())
+        .position(|(index, _)| index == selected)
+}
+
+/// Preserve identity across ordinary refreshes. If the selected row vanished,
+/// keep its ordinal position so deletion lands on the following row, or the
+/// preceding row when the deleted row was last.
+fn selection_after_rebuild(
+    rows: &[TreeRow],
+    preferred: Option<&TreeKey>,
+    previous_position: Option<usize>,
+) -> Option<usize> {
+    if let Some(index) = preferred.and_then(|key| rows.iter().position(|row| row.matches_key(key)))
+    {
+        return Some(index);
+    }
+
+    let selectable: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| row.key().map(|_| index))
+        .collect();
+    previous_position
+        .and_then(|position| selectable.get(position).or_else(|| selectable.last()))
+        .copied()
+        .or_else(|| selectable.first().copied())
+}
+
 fn build_tree(
     hosts: &[Host],
     probes: &[HostProbe],
@@ -1717,6 +1750,62 @@ mod tests {
     use super::*;
     use crate::model::{Folder, Probe, Session};
     use crate::reconcile::SessionView;
+
+    fn session_row(id: Uuid, title: &str) -> TreeRow {
+        TreeRow::Session {
+            host: "local".into(),
+            id,
+            agent: AgentKind::Codex,
+            title: title.into(),
+            state: State::Down,
+        }
+    }
+
+    #[test]
+    fn deleted_selection_stays_at_its_position_or_moves_to_previous_row() {
+        let first = Uuid::new_v4();
+        let middle = Uuid::new_v4();
+        let last = Uuid::new_v4();
+        let before = vec![
+            session_row(first, "first"),
+            TreeRow::Gap,
+            session_row(middle, "middle"),
+            session_row(last, "last"),
+        ];
+
+        let middle_position =
+            selectable_position(&before, 2).expect("middle session is selectable");
+        let after_middle = vec![
+            session_row(first, "first"),
+            TreeRow::Gap,
+            session_row(last, "last"),
+        ];
+        assert_eq!(
+            selection_after_rebuild(
+                &after_middle,
+                Some(&TreeKey::Session("local".into(), middle)),
+                Some(middle_position),
+            ),
+            Some(2),
+            "the following session should occupy the deleted session's position",
+        );
+
+        let last_position = selectable_position(&before, 3).expect("last session is selectable");
+        let after_last = vec![
+            session_row(first, "first"),
+            TreeRow::Gap,
+            session_row(middle, "middle"),
+        ];
+        assert_eq!(
+            selection_after_rebuild(
+                &after_last,
+                Some(&TreeKey::Session("local".into(), last)),
+                Some(last_position),
+            ),
+            Some(2),
+            "deleting the last session should move to the preceding session",
+        );
+    }
 
     #[test]
     fn selected_row_is_brighter_only_while_the_sidebar_is_focused() {
