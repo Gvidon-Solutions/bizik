@@ -310,12 +310,12 @@ fallback. Pick and persist another one with Codex's `/theme`, or use
 `BIZIK_CODEX_THEME=<theme-name>` on the host that starts the agent.
 `BIZIK_CODEX_THEME=inherit` leaves detection entirely to Codex.
 
-The mouse is enabled for bizik's own tmux session only — clicking a pane selects
-it and the wheel scrolls its history, while every other session on your tmux
-server keeps whatever you had. Two things follow from it: dragging selects into
-tmux's buffer instead of the terminal's, so hold `Shift` for the terminal's own
-selection; and a mouse-aware program inside a pane no longer sees the wheel,
-since the outer tmux takes it first. `BIZIK_MOUSE=off bzk` turns it back off.
+The mouse is enabled for bizik's own tmux session and its detached agent
+sessions. Clicking a pane selects it, and the wheel is relayed through the
+viewer to the host-side tmux that owns the agent's real scrollback; unrelated
+tmux sessions keep whatever you had. Dragging selects into tmux's buffer
+instead of the terminal's, so hold `Shift` for the terminal's own selection.
+`BIZIK_MOUSE=off bzk` disables mouse support in the outer dashboard session.
 
 ### Nesting
 

@@ -36,6 +36,7 @@ question unless the user asks for the complete list.
 | `Ctrl+h` / `Ctrl+l` | Focus sidebar / active session |
 | `F12` | Return from workspace to dashboard |
 | `F11` | Detach immediately from any bizik pane |
+| Mouse wheel | Scroll the active agent's host-side tmux history |
 | `j` / `k` | Move in the sidebar |
 | `h` / `l` | Collapse or move to parent / expand or open |
 | `n` | Create a session |

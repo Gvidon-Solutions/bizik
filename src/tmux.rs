@@ -613,14 +613,22 @@ pub fn apply_session_options(session: &SessionRef) {
     }
 }
 
-/// Hide the status bar drawn by an attached agent session.
+/// Options applied to a detached agent session.
 ///
 /// Each pane is attached to a tmux session on the host, and that tmux paints a
 /// second status line inside the pane. The sidebar already carries the project,
 /// session, agent and state, so the extra line is visual noise.
 ///
+/// Mouse support belongs on both tmux layers. The laptop's outer session relays
+/// wheel events through the viewer, while this host-side session owns the real
+/// agent scrollback and enters copy mode. Without mouse tracking here the
+/// relayed escape sequence falls through to the agent and scrolling does
+/// nothing.
+///
 /// Set `BIZIK_PANE_STATUS=label` to restore the compact legacy label.
-pub fn label_session(session: &SessionRef, host: &str, folder: &str, agent: &str) {
+pub fn style_agent_session(session: &SessionRef, host: &str, folder: &str, agent: &str) {
+    let _ = set_session_option(session, "mouse", "on");
+
     let labelled = matches!(
         std::env::var("BIZIK_PANE_STATUS").as_deref(),
         Ok("label") | Ok("on") | Ok("1") | Ok("true")

@@ -64,6 +64,29 @@ fn spawning_twice_does_not_start_a_second_copy() {
 }
 
 #[test]
+fn spawning_enables_mouse_on_the_agent_tmux_session() {
+    // The viewer is a tmux pane attached to another tmux session. The outer
+    // layer can relay a wheel event only when the agent-owning inner layer
+    // advertises mouse tracking; otherwise the escape sequence falls through
+    // to the agent and scrolling appears to do nothing.
+    let s = Sandbox::new("agent-mouse");
+    let folder = s.mark(&s.dir("project"));
+    let session = s.new_session(&folder, "one");
+    let name = Sandbox::tmux_name(&session);
+
+    s.spawn(&session).ok();
+    s.eventually("the tmux session to exist", || {
+        s.tmux_sessions().contains(&name)
+    });
+
+    assert_eq!(
+        s.tmux(&["show-options", "-v", "-t", &name, "mouse"]).trim(),
+        "on",
+        "the host-side tmux must own viewer scrollback"
+    );
+}
+
+#[test]
 fn a_forgotten_session_cannot_be_started_again() {
     // The defect: `spawn` looked sessions up without checking for a tombstone,
     // so a layout referring to deleted sessions quietly brought them back —

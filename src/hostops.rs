@@ -73,9 +73,9 @@ pub fn spawn(session_id: Uuid, host_label: Option<&str>) -> Result<SpawnResult> 
     let _ = tmux::tag_session(&name, &session.id.to_string());
 
     // Applied every time, not only on creation, so an existing session picks up
-    // a corrected label rather than keeping a stale one forever.
+    // corrected viewer options rather than keeping stale ones forever.
     let host = host_label.map_or_else(crate::util::hostname, str::to_string);
-    tmux::label_session(&name, &host, &folder.display_name(), session.agent.as_str());
+    tmux::style_agent_session(&name, &host, &folder.display_name(), session.agent.as_str());
 
     // Bump the folder's recency so the dashboard floats what you actually use.
     let now = now_ms();
