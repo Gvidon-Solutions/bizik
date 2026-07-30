@@ -45,6 +45,10 @@ for an operation, run it through completion and keep the user informed.
   or reuse the exact directory, register it with bizik, configure visibility
   hooks when appropriate, create the requested Codex/Claude/shell session,
   start it, and verify its state.
+- **Reload:** when the user invokes `$bzk reload`, read and follow “Safe local
+  reload” in [references/operations.md](references/operations.md). Build and
+  check first, replace only the installed binary, and prove every captured bzk
+  process survived on its original executable inode.
 - **Monitor:** keep polling at a reasonable interval, report state changes and
   questions from the agent, and yield control when user input is needed. A
   running session is progress, not completion.
@@ -54,11 +58,9 @@ for an operation, run it through completion and keep the user informed.
 Use this path when all three conditions hold: the host is local, the project is
 already marked, and the user explicitly chose `codex`, `claude`, or `shell`.
 
-1. Reuse the folder UUID if it is already known; otherwise get it with
-   `bzk marks --json`.
-2. Run `bzk new-session` for that folder and agent, parse the returned session
-   ID, then run `bzk spawn`.
-3. Run `bzk probe --json --preview` exactly once to verify the result.
+1. Create it with `bzk s new PROJECT --agent AGENT --title TITLE --json`.
+2. Open the returned session with `bzk s open SESSION_ID`.
+3. Run `bzk s list --json` exactly once to verify the result.
 
 Do not run `bzk doctor`, `bzk hooks status`, `bzk host ls`, `bzk env capture`,
 any `--help`, or extra probes on this path. Use targeted recovery after an

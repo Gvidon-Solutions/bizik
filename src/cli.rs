@@ -76,6 +76,10 @@ enum Cmd {
         preview: bool,
     },
 
+    /// List, create and manage sessions by title or short id
+    #[command(visible_alias = "s")]
+    Session(crate::session_cli::SessionArgs),
+
     /// Create a session record on this machine
     NewSession {
         #[arg(long)]
@@ -293,6 +297,7 @@ pub fn run() -> Result<()> {
         Some(Cmd::Unmark { path }) => cmd_unmark(path),
         Some(Cmd::Marks { json }) => cmd_marks(json),
         Some(Cmd::Probe { json, preview }) => cmd_probe(json, preview),
+        Some(Cmd::Session(args)) => crate::session_cli::run(args),
         Some(Cmd::NewSession {
             folder,
             agent,

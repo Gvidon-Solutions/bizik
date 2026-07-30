@@ -338,6 +338,34 @@ A **session** is a long-lived, named thing you come back to: one agent, one
 folder, one conversation. Several per folder is normal — one doing the work,
 one for questions.
 
+Routine session work has a compact command group; `s` is an alias for
+`session`:
+
+```sh
+bzk s list [--json]
+bzk s current [--json]
+bzk s new FOLDER [--agent claude|codex|shell] [--title TITLE] [--json]
+bzk s open [TARGET] [--json]
+bzk s rename TITLE [--session TARGET] [--json]
+bzk s stop [TARGET] [--json]
+bzk s remove [TARGET] [--json]
+```
+
+`FOLDER` is an exact project label/path or a unique UUID prefix. `TARGET` is an
+exact session title or a unique UUID prefix of at least four hexadecimal
+digits; ambiguous titles and prefixes are rejected with the matching short
+IDs. When `TARGET` is omitted, `open`, `rename`, `stop`, and `remove` use
+`BZK_SESSION_ID`, which bizik puts into every agent session it starts.
+`current` shows that record directly. `open` starts or resumes the detached
+tmux session without moving the caller's terminal; use the dashboard to view
+it.
+
+Commands operate on this machine unless `--host NAME` names a configured Bizik
+host, for example `bzk s list --host back` or
+`bzk s rename "fix OAuth callback" --session a31f --host back`. A remote
+mutation always requires an explicit target. Bizik never sends the caller's
+local `BZK_SESSION_ID` to another host, and `current` is local-only.
+
 Opening a folder shows what you can start, the sessions bizik already tracks,
 and the agent's own past conversations in that directory. Picking one of those
 adopts it: the record is created and the conversation resumed, with its history
@@ -381,6 +409,7 @@ bzk mark [--repo] [-l]  mark a directory here
 bzk unmark [path]       unmark it
 bzk marks [--json]      list this machine's marks
 bzk probe [--json]      what this machine has: folders, sessions, chats, status
+bzk session|s ...       concise list/current/new/open/rename/stop/remove commands
 bzk host add|rm|ls      manage the hosts this laptop drives
 bzk install [host]      copy this binary to a host
 bzk hooks install|uninstall|status [hosts...]
@@ -395,8 +424,10 @@ bzk export|import       move a configuration between machines
 bzk doctor              check the local setup and every host
 ```
 
-`bzk new-session`, `bzk spawn`, `bzk stop` and `bzk rm-session` also exist; the
-dashboard calls them over ssh, and they are useful by hand or from a script.
+The original machine-facing `bzk new-session`, `bzk spawn`, `bzk stop`,
+`bzk rm-session`, and hidden `bzk rename-session` commands remain unchanged.
+The dashboard and compact group call them over SSH, and scripts can continue to
+use their exact UUID protocol.
 
 `BIZIK_CONFIG_DIR` and `BIZIK_CACHE_DIR` override where state is kept, which is
 handy for keeping two independent profiles on one machine.

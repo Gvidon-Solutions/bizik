@@ -12,6 +12,11 @@ bzk mark --repo [PATH]               # mark enclosing git repository
 bzk unmark [PATH]                    # remove from bizik, not from disk
 bzk marks --json                     # list local marked folders with IDs
 bzk probe --json --preview           # local projects, sessions, chats, states
+bzk session|s list [--json]          # concise session operations
+bzk s current --json                 # BZK_SESSION_ID on this machine
+bzk s new FOLDER --agent AGENT       # exact folder name or UUID prefix
+bzk s open|stop|remove [TARGET]      # exact title or unique UUID prefix
+bzk s rename TITLE [-s TARGET]       # current session when TARGET is omitted
 bzk host add NAME [SSH_TARGET]       # add/update remote or local host
 bzk host ls                          # list configured hosts
 bzk install [NAME]                   # deploy current binary to one/all hosts
@@ -25,7 +30,11 @@ bzk layout open NAME                # start and restore all layout sessions
 bzk doctor                           # check local setup and every host
 ```
 
-For machine-readable work, also use:
+Add `--host NAME` to compact commands for a configured remote host. Remote
+mutations require an explicit target and `current` is local-only; never treat a
+local `BZK_SESSION_ID` as a remote identity.
+
+The exact UUID protocol remains available for scripts and compatibility:
 
 ```sh
 bzk new-session --folder UUID --agent codex --title TITLE
@@ -39,8 +48,8 @@ bzk layout rename NAME NEW_NAME
 bzk layout rm NAME
 ```
 
-`new-session` prints the session record as JSON. Extract its `id` from JSON and
-pass it to `spawn`; never scrape the human dashboard.
+`new-session` prints the session record as JSON. Existing scripts may continue
+to extract its `id` and pass it to `spawn`; never scrape the human dashboard.
 
 Layouts are local viewing records; project sessions remain owned by their
 hosts. A one-project layout is shown inline inside that project in the sidebar,
@@ -54,24 +63,18 @@ Use this path only when the host is local, the project is already marked, and
 the user explicitly requested `codex`, `claude`, or `shell`. Do not perform the
 full preflight.
 
-1. Reuse a folder UUID already established in the current context. If it is not
-   known, make the only discovery call:
+1. Create the session by exact project label/path (or a known UUID prefix), then
+   parse the returned JSON `id`:
 
    ```sh
-   bzk marks --json
+   bzk s new PROJECT --agent AGENT --title TITLE --json
+   bzk s open SESSION_UUID
    ```
 
-2. Create the session, parse its JSON `id`, and spawn it locally:
+2. Verify once:
 
    ```sh
-   bzk new-session --folder FOLDER_UUID --agent AGENT --title TITLE
-   bzk spawn --session SESSION_UUID --host-label local
-   ```
-
-3. Verify once:
-
-   ```sh
-   bzk probe --json --preview
+   bzk s list --json
    ```
 
 Do not run `bzk doctor`, `bzk hooks status`, `bzk host ls`, `bzk env capture`,
@@ -164,11 +167,14 @@ fields and redact secrets from output.
    "$HOME/.local/bin/bzk" mark "/absolute/project/path" --label "project label"
    ```
 
-5. Retrieve the folder UUID from remote `bzk marks --json`. Over the same SSH
-   target, run remote `bzk new-session`, parse the returned JSON ID, then run
-   remote `bzk spawn --host-label HOST_NAME`.
+5. Create and open the session through the configured logical host name:
 
-6. Verify remote `bzk probe --json --preview`, then run local `bzk doctor`.
+   ```sh
+   bzk s new PROJECT --agent AGENT --title TITLE --host HOST_NAME --json
+   bzk s open SESSION_UUID --host HOST_NAME
+   ```
+
+6. Verify with `bzk s list --host HOST_NAME --json`, then run local `bzk doctor`.
    Report both the session state and how to open it from the dashboard.
 
 ## Choosing the agent
@@ -195,6 +201,43 @@ on an unfamiliar repository.
   the response to the session.
 - Stop or forget a session only when explicitly requested. `stop` preserves the
   conversation; `rm-session` forgets the bizik record.
+
+## Safe local reload
+
+Use this low-level workflow only for an explicit `$bzk reload`. It updates the
+local installed executable without signaling, restarting, detaching, or killing
+the dashboard, sidebar, agent tmux sessions, or any unrelated process.
+
+1. Resolve the source checkout and installed executable with `pwd`,
+   `git status --short --branch`, and `command -v bzk`. Refuse a remote target,
+   a directory, or a path outside the user's local binary location. Do not run
+   `make deploy`, `bzk install`, hook commands, tmux kill commands, `pkill`, or
+   `kill`.
+2. Before building, capture the installed binary's canonical path, SHA-256,
+   device/inode from `stat -Lc '%d:%i'`, and version. Capture every exact
+   `bzk` PID from `pgrep -x bzk`; for each existing `/proc/PID`, record its
+   `/proc/PID/stat` start time plus the device/inode and link target of
+   `/proc/PID/exe`. Keep the snapshot in a temporary directory created with
+   `mktemp -d`.
+3. Run `make check`, then `make build`. Building must finish before anything at
+   the installed path changes. Verify the release artifact exists, is
+   executable, and runs `--version`.
+4. Stage the release artifact in the installed binary's directory with
+   `mktemp`, mode `0755`, and the same owner. Compare the staged file to the
+   build artifact. Atomically rename that one staged file over the installed
+   binary. Do not alter configuration, hooks, tmux state, or any other file.
+5. Verify the installed file has the staged SHA-256 and a different inode from
+   the captured installed inode. Run the installed path with `--version` and
+   compare it with the build artifact's output; also compare the two files byte
+   for byte so the invocation path is proven to contain the new build.
+6. Verify every captured PID still exists with the same `/proc/PID/stat` start
+   time and the same executable device/inode captured before replacement.
+   Linux may append ` (deleted)` to its `/proc/PID/exe` link after the atomic
+   rename; that is expected and proves the live process kept its old image.
+   Treat a missing/reused PID, changed executable inode, or mismatched new
+   binary as failure and report it without stopping anything.
+7. Remove only the temporary snapshot/staging files and report old/new
+   inode/hash/version plus the surviving PID count.
 
 ## Recovery
 

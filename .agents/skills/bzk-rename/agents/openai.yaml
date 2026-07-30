@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rename BZK Session"
+  short_description: "Rename the current Bizik session precisely"
+  default_prompt: "Use $bzk-rename to give this Bizik session a concise title based on our actual task."

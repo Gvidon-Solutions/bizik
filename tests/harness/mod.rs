@@ -61,6 +61,9 @@ impl Sandbox {
                 ),
             )
             .env("BIZIK_PANE_STATUS", "off")
+            // A test runner may itself be inside a bizik session. Never let
+            // that ambient identity target the disposable store by accident.
+            .env_remove("BZK_SESSION_ID")
             .current_dir(&self.root)
             .output()
             .expect("running bzk");
@@ -88,7 +91,36 @@ impl Sandbox {
                 ),
             )
             .env("BIZIK_PANE_STATUS", "off")
+            .env_remove("BZK_SESSION_ID")
             .current_dir(dir)
+            .output()
+            .expect("running bzk");
+        Output {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    /// Run a command as though it were issued inside one tracked session.
+    pub fn bzk_as_session(&self, session: &str, args: &[&str]) -> Output {
+        let out = Command::new(Self::bin())
+            .args(args)
+            .env("BIZIK_TMUX_SOCKET", &self.socket)
+            .env("BIZIK_CONFIG_DIR", self.root.join("config"))
+            .env("BIZIK_CACHE_DIR", self.root.join("cache"))
+            .env("BZK_SESSION_ID", session)
+            .env("HOME", &self.root)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join(".local/bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("BIZIK_PANE_STATUS", "off")
+            .current_dir(&self.root)
             .output()
             .expect("running bzk");
         Output {

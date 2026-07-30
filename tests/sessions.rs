@@ -359,6 +359,94 @@ fn opening_a_layout_builds_multiple_viewers_beside_one_sidebar() {
 }
 
 #[test]
+fn compact_session_commands_cover_the_local_lifecycle_and_current_session() {
+    let s = Sandbox::new("session-cli");
+    let folder = s.mark(&s.dir("project"));
+
+    let created = s.bzk(&[
+        "s",
+        "new",
+        "project",
+        "--agent",
+        "shell",
+        "--title",
+        "operator CLI",
+        "--json",
+    ]);
+    created.ok();
+    let created: serde_json::Value = serde_json::from_str(created.stdout.trim()).unwrap();
+    let session = created["id"].as_str().unwrap();
+    assert_eq!(created["folder_id"], folder);
+    assert_eq!(created["state"], "down");
+
+    let listed = s.bzk(&["session", "list", "--json"]);
+    listed.ok();
+    let listed: serde_json::Value = serde_json::from_str(listed.stdout.trim()).unwrap();
+    assert_eq!(listed[0]["title"], "operator CLI");
+    assert_eq!(
+        listed[0]["path"],
+        s.root.join("project").to_string_lossy().as_ref()
+    );
+
+    let current = s.bzk_as_session(session, &["s", "current", "--json"]);
+    current.ok();
+    let current: serde_json::Value = serde_json::from_str(current.stdout.trim()).unwrap();
+    assert_eq!(current["id"], session);
+
+    s.bzk_as_session(
+        session,
+        &["s", "rename", "compact session commands", "--json"],
+    )
+    .ok();
+    assert_eq!(
+        s.bzk_as_session(session, &["s", "current", "--json"])
+            .stdout
+            .parse::<serde_json::Value>()
+            .unwrap()["title"],
+        "compact session commands"
+    );
+
+    s.bzk(&["s", "open", "compact session commands", "--json"])
+        .ok();
+    s.eventually("the compact command to start tmux", || {
+        s.tmux_sessions().contains(&Sandbox::tmux_name(session))
+    });
+
+    s.bzk(&["s", "stop", &session[..8], "--json"]).ok();
+    assert!(!s.tmux_sessions().contains(&Sandbox::tmux_name(session)));
+
+    s.bzk(&["s", "remove", "compact session commands", "--json"])
+        .ok();
+    assert!(s.probe()["sessions"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn compact_session_targets_refuse_ambiguous_titles() {
+    let s = Sandbox::new("session-cli-ambiguous");
+    let folder = s.mark(&s.dir("project"));
+    s.new_session(&folder, "same title");
+    s.new_session(&folder, "same title");
+
+    let out = s.bzk(&[
+        "session",
+        "rename",
+        "should not happen",
+        "--session",
+        "same title",
+    ]);
+
+    out.failed();
+    assert!(out.stderr.contains("ambiguous"), "{}", out.stderr);
+    assert!(
+        s.probe()["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|view| view["session"]["title"] == "same title")
+    );
+}
+
+#[test]
 fn opening_a_regular_session_replaces_the_active_layout() {
     let s = Sandbox::new("layout-to-standalone");
     let folder = s.mark(&s.dir("project"));
@@ -478,6 +566,39 @@ fn workspace_viewer_sessions(s: &Sandbox) -> Vec<String> {
         .collect();
     sessions.sort();
     sessions
+}
+
+#[test]
+fn compact_current_requires_a_session_environment() {
+    let s = Sandbox::new("session-cli-no-current");
+    let out = s.bzk(&["s", "current"]);
+    out.failed();
+    assert!(out.stderr.contains("BZK_SESSION_ID is not set"));
+}
+
+#[test]
+fn compact_remote_commands_never_reuse_the_local_current_session() {
+    let s = Sandbox::new("session-cli-remote-current");
+    s.bzk(&["host", "add", "remote", "unreachable.invalid"])
+        .ok();
+
+    let implicit = s.bzk(&["s", "stop", "--host", "remote"]);
+    implicit.failed();
+    assert!(
+        implicit.stderr.contains("requires an explicit session"),
+        "{}",
+        implicit.stderr
+    );
+
+    let current = s.bzk(&["s", "current", "--host", "remote"]);
+    current.failed();
+    assert!(
+        current
+            .stderr
+            .contains("current-session lookup is local only"),
+        "{}",
+        current.stderr
+    );
 }
 
 #[test]
