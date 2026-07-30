@@ -210,6 +210,15 @@ pub struct ChatEntry {
     pub chat: Chat,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CodexTitleSource {
+    pub database_path: String,
+    pub database_mtime: u64,
+    pub database_size: u64,
+    pub wal_mtime: u64,
+    pub wal_size: u64,
+}
+
 /// Cache of parsed transcripts, keyed by absolute file path.
 ///
 /// A transcript is re-parsed only when its mtime or size changed, which keeps a
@@ -225,6 +234,17 @@ pub struct ChatIndex {
     /// lets a manual rename be distinguished from a native title change.
     #[serde(default)]
     pub automatic_session_titles: HashMap<String, String>,
+    /// Current Codex titles obtained through its app-server API.
+    #[serde(default)]
+    pub codex_titles: HashMap<String, String>,
+    /// State database fingerprint used to avoid starting app-server again on
+    /// every dashboard refresh when no thread metadata changed.
+    #[serde(default)]
+    pub codex_title_source: Option<CodexTitleSource>,
+    /// Last app-server title refresh. Active Codex turns update the WAL often,
+    /// so fingerprint changes alone would make every dashboard tick expensive.
+    #[serde(default)]
+    pub codex_titles_checked_at: u64,
 }
 
 impl ChatIndex {

@@ -52,6 +52,14 @@ impl Sandbox {
             .env("BIZIK_CACHE_DIR", self.root.join("cache"))
             // Nothing here should reach the user's real agent state.
             .env("HOME", &self.root)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join(".local/bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env("BIZIK_PANE_STATUS", "off")
             .current_dir(&self.root)
             .output()
@@ -71,6 +79,14 @@ impl Sandbox {
             .env("BIZIK_CONFIG_DIR", self.root.join("config"))
             .env("BIZIK_CACHE_DIR", self.root.join("cache"))
             .env("HOME", &self.root)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join(".local/bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env("BIZIK_PANE_STATUS", "off")
             .current_dir(dir)
             .output()

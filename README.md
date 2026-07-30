@@ -405,8 +405,10 @@ than an error. Registry entries outlive crashed processes, so every pid is
 checked against `/proc` — including its start time, to catch a recycled pid.
 
 Codex keeps `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, whose first record
-carries the working directory and session id, and maps those ids to generated
-thread names in `~/.codex/session_index.jsonl`. The title index is applied
-separately from the bounded transcript cache so a native rename appears without
-re-reading a rollout. Codex has no live registry, so liveness comes from walking
-`/proc`.
+carries the working directory and session id. Current versions map those ids to
+thread names in the versioned `~/.codex/state_*.sqlite` store; bizik reads them
+through Codex's read-only `thread/list` app-server API and caches them against
+the database/WAL fingerprint. Older versions used
+`~/.codex/session_index.jsonl`, which remains a fallback. Titles stay separate
+from the bounded transcript cache so a native rename appears without re-reading
+a rollout. Codex has no live registry, so liveness comes from walking `/proc`.

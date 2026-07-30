@@ -3,25 +3,31 @@
 //! Layout on disk: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`.
 //! The first record is `session_meta`, whose payload carries the working
 //! directory and the session id — cheaper to read than Claude's format.
-//! `~/.codex/session_index.jsonl` maps those ids to Codex's generated thread
-//! names. It is read separately because a title can change without touching
-//! the rollout file.
+//! Modern Codex stores thread names in `~/.codex/state_<version>.sqlite`;
+//! bizik reads them through Codex's app-server API. Older releases used
+//! `~/.codex/session_index.jsonl`, which remains a fallback. Both are read
+//! separately because a title can change without touching the rollout file.
 //!
 //! Codex has no process registry, so [`Caps`] still reports
 //! `live_status: false`, and liveness is recovered by walking `/proc`. When
 //! bizik's lifecycle hooks are installed, their exact per-session reports
 //! refine that process-level view into working, waiting, and done.
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::{
-    Agent, Caps, ChatIndex, HEAD_BYTES, TAIL_BYTES, extract_text, looks_synthetic, parse_lines,
+    Agent, Caps, ChatIndex, CodexTitleSource, HEAD_BYTES, TAIL_BYTES, extract_text,
+    looks_synthetic, parse_lines,
 };
 use crate::model::{AgentKind, Chat, LiveAgent};
 use crate::util::{
@@ -31,6 +37,7 @@ use crate::util::{
 pub struct CodexAgent;
 
 const DEFAULT_THEME: &str = "github";
+const TITLE_REFRESH_INTERVAL_MS: u64 = 30_000;
 
 fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME").map_or_else(|| home().join(".codex"), PathBuf::from)
@@ -38,10 +45,6 @@ fn codex_home() -> PathBuf {
 
 fn sessions_root() -> PathBuf {
     codex_home().join("sessions")
-}
-
-fn session_index_path() -> PathBuf {
-    codex_home().join("session_index.jsonl")
 }
 
 /// Codex chooses a syntax-highlighting theme when its TUI starts. A bizik agent
@@ -118,7 +121,8 @@ impl Agent for CodexAgent {
     }
 
     fn scan_chats(&self, index: &mut ChatIndex, warnings: &mut Vec<String>) -> Vec<Chat> {
-        let native_titles = read_session_titles(&session_index_path(), warnings);
+        let binary = self.binary();
+        let native_titles = read_native_titles(&codex_home(), binary.as_deref(), index, warnings);
         let mut files = Vec::new();
         collect_rollouts(&sessions_root(), 0, &mut files);
 
@@ -194,7 +198,238 @@ struct SessionIndexEntry {
 /// Malformed entries are counted and skipped: one damaged line must not hide
 /// every healthy conversation. Later entries win if Codex ever writes the
 /// same id again.
-fn read_session_titles(path: &Path, warnings: &mut Vec<String>) -> HashMap<String, String> {
+fn read_native_titles(
+    home: &Path,
+    codex_binary: Option<&Path>,
+    index: &mut ChatIndex,
+    warnings: &mut Vec<String>,
+) -> HashMap<String, String> {
+    let legacy_path = home.join("session_index.jsonl");
+    let mut titles = read_legacy_session_titles(&legacy_path, warnings);
+
+    let Some(database_path) = newest_state_database(home) else {
+        return titles;
+    };
+    let source = codex_title_source(&database_path);
+    let now = crate::util::now_ms();
+    let recently_checked = index.codex_titles_checked_at != 0
+        && now.saturating_sub(index.codex_titles_checked_at) < TITLE_REFRESH_INTERVAL_MS;
+    if index.codex_title_source.as_ref() == Some(&source) || recently_checked {
+        titles.extend(index.codex_titles.clone());
+        return titles;
+    }
+
+    let Some(codex_binary) = codex_binary else {
+        titles.extend(index.codex_titles.clone());
+        return titles;
+    };
+    index.codex_titles_checked_at = now;
+    match read_app_server_titles(codex_binary) {
+        Ok(app_server_titles) => {
+            index.codex_titles = app_server_titles;
+            index.codex_title_source = Some(source);
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "codex: cannot read current session titles through app-server: {error:#}"
+            ));
+        }
+    }
+    titles.extend(index.codex_titles.clone());
+    titles
+}
+
+/// Find the newest versioned Codex state database without depending on the
+/// current schema number. Files such as `state_5.sqlite-wal` are ignored.
+fn newest_state_database(home: &Path) -> Option<PathBuf> {
+    fs::read_dir(home)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let version = name
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u32>()
+                .ok()?;
+            entry.path().is_file().then_some((version, entry.path()))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+}
+
+fn codex_title_source(database_path: &Path) -> CodexTitleSource {
+    let mut wal_name = database_path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal_path = PathBuf::from(wal_name);
+    CodexTitleSource {
+        database_path: database_path.to_string_lossy().into_owned(),
+        database_mtime: mtime_ms(database_path),
+        database_size: file_size(database_path),
+        wal_mtime: mtime_ms(&wal_path),
+        wal_size: file_size(&wal_path),
+    }
+}
+
+/// Ask Codex for its current titles instead of parsing its private SQLite
+/// schema. The child is bounded and killed after the metadata response.
+fn read_app_server_titles(codex_binary: &Path) -> Result<HashMap<String, String>> {
+    let mut command = Command::new(codex_binary);
+    command
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(binary_dir) = codex_binary.parent() {
+        command.env(
+            "PATH",
+            format!(
+                "{}:{}",
+                binary_dir.to_string_lossy(),
+                crate::hostenv::effective_path()
+            ),
+        );
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting {}", codex_binary.display()))?;
+    let stdout = child.stdout.take().context("capturing app-server stdout")?;
+    let mut stdin = child.stdin.take().context("opening app-server stdin")?;
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().take(4096) {
+            let Ok(line) = line else {
+                break;
+            };
+            if let Ok(message) = serde_json::from_str::<Value>(&line)
+                && sender.send(message).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let result = (|| {
+        write_app_server_message(
+            &mut stdin,
+            &serde_json::json!({
+                "method": "initialize",
+                "id": 0,
+                "params": {
+                    "clientInfo": {
+                        "name": "bizik",
+                        "title": "bizik",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                }
+            }),
+        )?;
+        response_result(receive_app_server_response(&receiver, 0)?)?;
+        write_app_server_message(
+            &mut stdin,
+            &serde_json::json!({"method": "initialized", "params": {}}),
+        )?;
+
+        let mut request_id = 1_u64;
+        let mut cursor: Option<String> = None;
+        let mut titles = HashMap::new();
+        loop {
+            write_app_server_message(
+                &mut stdin,
+                &serde_json::json!({
+                    "method": "thread/list",
+                    "id": request_id,
+                    "params": {
+                        "cursor": cursor,
+                        "limit": 1000,
+                        "useStateDbOnly": true,
+                    }
+                }),
+            )?;
+            let result = response_result(receive_app_server_response(&receiver, request_id)?)?;
+            let (page_titles, next_cursor) = parse_thread_page(result)?;
+            titles.extend(page_titles);
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+            request_id += 1;
+            if request_id > 64 {
+                bail!("thread list exceeded 64 pages");
+            }
+        }
+        Ok(titles)
+    })();
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    result
+}
+
+fn write_app_server_message(stdin: &mut impl Write, message: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *stdin, message)?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn receive_app_server_response(receiver: &Receiver<Value>, id: u64) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = receiver
+            .recv_timeout(remaining)
+            .map_err(|error| anyhow!("waiting for app-server response {id}: {error}"))?;
+        if message.get("id").and_then(Value::as_u64) == Some(id) {
+            return Ok(message);
+        }
+    }
+}
+
+fn response_result(response: Value) -> Result<Value> {
+    if let Some(error) = response.get("error")
+        && !error.is_null()
+    {
+        bail!("app-server returned {error}");
+    }
+    response
+        .get("result")
+        .cloned()
+        .context("app-server response has no result")
+}
+
+fn parse_thread_page(result: Value) -> Result<(HashMap<String, String>, Option<String>)> {
+    let threads = result
+        .get("data")
+        .and_then(Value::as_array)
+        .context("thread/list result has no data array")?;
+    let mut titles = HashMap::new();
+    for thread in threads {
+        let Some(id) = thread.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        let raw_title = thread
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| thread.get("preview").and_then(Value::as_str))
+            .unwrap_or("");
+        let title = one_line(raw_title, 160);
+        if !id.is_empty() && !title.is_empty() {
+            titles.insert(id.to_string(), title);
+        }
+    }
+    let next_cursor = result
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((titles, next_cursor))
+}
+
+fn read_legacy_session_titles(path: &Path, warnings: &mut Vec<String>) -> HashMap<String, String> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
@@ -313,7 +548,7 @@ fn parse_rollout(path: &Path, mtime: u64, size: u64) -> Result<Option<Chat>> {
         agent: AgentKind::Codex,
         id,
         cwd,
-        // Added from session_index.jsonl after parsing. Keeping it out of the
+        // Added from Codex's title store after parsing. Keeping it out of the
         // rollout cache lets a renamed thread refresh immediately.
         title: None,
         last_prompt,
@@ -370,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_generated_titles_from_the_separate_session_index() {
+    fn reads_generated_titles_from_the_legacy_session_index() {
         let dir = std::env::temp_dir().join(format!("bzk-codex-titles-{}", std::process::id()));
         let path = write(
             &dir,
@@ -385,7 +620,7 @@ mod tests {
         );
         let mut warnings = Vec::new();
 
-        let titles = read_session_titles(&path, &mut warnings);
+        let titles = read_legacy_session_titles(&path, &mut warnings);
 
         assert_eq!(titles.get("one").map(String::as_str), Some("Fresh name"));
         assert_eq!(
@@ -396,6 +631,52 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("2 invalid"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fingerprints_the_newest_codex_database_and_its_wal() {
+        let dir = std::env::temp_dir().join(format!("bzk-codex-sqlite-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale_path = dir.join("state_4.sqlite");
+        std::fs::write(&stale_path, b"older").unwrap();
+        let current_path = dir.join("state_5.sqlite");
+        std::fs::write(&current_path, b"database").unwrap();
+        std::fs::write(dir.join("state_5.sqlite-wal"), b"wal").unwrap();
+
+        assert_eq!(
+            newest_state_database(&dir).as_deref(),
+            Some(current_path.as_path())
+        );
+        let source = codex_title_source(&current_path);
+        assert_eq!(source.database_size, 8);
+        assert_eq!(source.wal_size, 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn app_server_pages_prefer_names_and_fall_back_to_previews() {
+        let result = serde_json::json!({
+            "data": [
+                {"id": "generated", "name": null, "preview": "  Generated\n  title "},
+                {"id": "named", "name": "My Codex name", "preview": "Generated fallback"},
+                {"id": "", "name": null, "preview": "No identity"},
+                {"id": "empty", "name": null, "preview": ""},
+            ],
+            "nextCursor": "next-page",
+        });
+
+        let (titles, cursor) = parse_thread_page(result).unwrap();
+
+        assert_eq!(
+            titles.get("generated").map(String::as_str),
+            Some("Generated title")
+        );
+        assert_eq!(
+            titles.get("named").map(String::as_str),
+            Some("My Codex name")
+        );
+        assert_eq!(titles.len(), 2);
+        assert_eq!(cursor.as_deref(), Some("next-page"));
     }
 
     #[test]

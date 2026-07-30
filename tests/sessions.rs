@@ -210,14 +210,26 @@ fn codex_sessions_adopt_native_titles_but_keep_manual_renames() {
     let s = Sandbox::new("codex-auto-title");
     let project = s.dir("project");
     let folder = s.mark(&project);
+    let thread_id = "codex-thread";
 
-    // Make Codex discoverable without starting a real agent.
+    // Make Codex discoverable and provide the small app-server protocol slice
+    // the adapter uses, without starting a real agent.
     let codex_bin = s.root.join(".local/bin/codex");
     std::fs::create_dir_all(codex_bin.parent().unwrap()).unwrap();
-    std::fs::write(&codex_bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(
+        &codex_bin,
+        r#"#!/bin/sh
+IFS= read -r _
+printf '%s\n' '{"id":0,"result":{}}'
+IFS= read -r _
+IFS= read -r _
+title=$(cat "$HOME/.codex/test-title")
+printf '{"id":1,"result":{"data":[{"id":"codex-thread","name":null,"preview":"%s"}],"nextCursor":null}}\n' "$title"
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(&codex_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let thread_id = "codex-thread";
     let sessions = s.root.join(".codex/sessions/2026/07/30");
     std::fs::create_dir_all(&sessions).unwrap();
     let meta = serde_json::json!({
@@ -232,14 +244,11 @@ fn codex_sessions_adopt_native_titles_but_keep_manual_renames() {
         format!("{meta}\n"),
     )
     .unwrap();
-    let title_index = s.root.join(".codex/session_index.jsonl");
+    let title_store = s.root.join(".codex/state_5.sqlite");
+    let title_value = s.root.join(".codex/test-title");
     let write_title = |title: &str| {
-        let entry = serde_json::json!({
-            "id": thread_id,
-            "thread_name": title,
-            "updated_at": "2026-07-30T12:00:00Z",
-        });
-        std::fs::write(&title_index, format!("{entry}\n")).unwrap();
+        std::fs::write(&title_value, title).unwrap();
+        std::fs::write(&title_store, title).unwrap();
     };
     write_title("Repair authentication");
 
