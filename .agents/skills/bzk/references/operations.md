@@ -19,6 +19,9 @@ bzk hooks install [NAME...]          # install precise status hooks
 bzk hooks status [NAME...]           # inspect hook coverage
 bzk env capture [NAME...]            # capture agent/tool PATH
 bzk env show                         # show captured environments
+bzk layout ls --json                # list saved terminal layouts
+bzk layout save NAME                # save panes and exact geometry
+bzk layout open NAME                # start and restore all layout sessions
 bzk doctor                           # check local setup and every host
 ```
 
@@ -29,10 +32,21 @@ bzk new-session --folder UUID --agent codex --title TITLE
 bzk spawn --session UUID --host-label HOST_NAME
 bzk stop --session UUID
 bzk rm-session --session UUID
+bzk layout create NAME --pane HOST:SESSION_UUID [--pane ...]
+bzk layout add NAME --host HOST --session SESSION_UUID
+bzk layout remove NAME --host HOST --session SESSION_UUID
+bzk layout rename NAME NEW_NAME
+bzk layout rm NAME
 ```
 
 `new-session` prints the session record as JSON. Extract its `id` from JSON and
 pass it to `spawn`; never scrape the human dashboard.
+
+Layouts are local viewing records; project sessions remain owned by their
+hosts. A one-project layout is shown inline inside that project in the sidebar,
+while a cross-project layout is shown in the global tree below all projects.
+Removing a session from a layout or deleting the layout never stops or forgets
+the session.
 
 ## FAST PATH: existing marked local project
 

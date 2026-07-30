@@ -803,11 +803,14 @@ impl App {
             .collect();
         let count = refs.len();
 
-        self.local
-            .layouts
-            .push(Layout::new(name.clone(), refs, actions::work_layout()));
-        match self.local.save() {
-            Ok(()) => self.info(format!("saved “{name}” with {count} panes")),
+        match self
+            .local
+            .create_layout(name.clone(), refs, actions::work_layout())
+        {
+            Ok(_) => match self.local.save() {
+                Ok(()) => self.info(format!("saved “{name}” with {count} panes")),
+                Err(e) => self.error(format!("{e:#}")),
+            },
             Err(e) => self.error(format!("{e:#}")),
         }
     }

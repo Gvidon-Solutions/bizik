@@ -134,6 +134,10 @@ enum Cmd {
     #[command(subcommand)]
     Host(HostCmd),
 
+    /// Create, edit, inspect and open saved terminal layouts
+    #[command(subcommand)]
+    Layout(LayoutCmd),
+
     /// Copy this binary to a host
     Install {
         /// Host name, or all hosts when omitted
@@ -235,6 +239,46 @@ enum HostCmd {
     Ls,
 }
 
+#[derive(Subcommand)]
+enum LayoutCmd {
+    /// List saved layouts
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a layout from explicit host/session references
+    Create {
+        name: String,
+        /// Pane reference in HOST:SESSION_UUID form; repeat for each pane
+        #[arg(long = "pane")]
+        panes: Vec<String>,
+    },
+    /// Save the viewers currently open beside the sidebar
+    Save { name: String },
+    /// Add one existing session to a layout
+    Add {
+        layout: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        session: Uuid,
+    },
+    /// Remove one session reference from a layout without stopping it
+    Remove {
+        layout: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        session: Uuid,
+    },
+    /// Rename a layout
+    Rename { layout: String, name: String },
+    /// Delete a layout without stopping any session
+    Rm { layout: String },
+    /// Start every session and restore the layout in the workspace
+    Open { layout: String },
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -268,6 +312,7 @@ pub fn run() -> Result<()> {
             hidden,
         }) => cmd_update_folder(folder, pinned, hidden),
         Some(Cmd::Host(c)) => cmd_host(c),
+        Some(Cmd::Layout(c)) => cmd_layout(c),
         Some(Cmd::Install { host }) => cmd_install(host),
         Some(Cmd::Hook { event }) => cmd_hook(&event),
         Some(Cmd::Hooks(c)) => cmd_hooks(c),
@@ -607,6 +652,251 @@ fn cmd_host(cmd: HostCmd) -> Result<()> {
                     h.ssh.as_deref().unwrap_or("(this machine)")
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Layouts
+// ---------------------------------------------------------------------------
+
+fn cmd_layout(cmd: LayoutCmd) -> Result<()> {
+    let mut local = LocalStore::load()?;
+    if local.ensure_local_host() {
+        local.save()?;
+    }
+    match cmd {
+        LayoutCmd::Ls { json } => cmd_layout_ls(json),
+        LayoutCmd::Create { name, panes } => {
+            if panes.is_empty() {
+                bail!("a layout needs at least one --pane HOST:SESSION_UUID");
+            }
+            let panes = panes
+                .iter()
+                .map(|value| parse_pane_ref(value))
+                .collect::<Result<Vec<_>>>()?;
+            let mut store = LocalStore::load()?;
+            verify_layout_panes(&store, &panes)?;
+            let id = store.create_layout(name.clone(), panes, None)?;
+            store.save()?;
+            println!("created layout “{name}” ({id})");
+            Ok(())
+        }
+        LayoutCmd::Save { name } => {
+            let mut store = LocalStore::load()?;
+            let known = known_sessions(&store);
+            let panes: Vec<model::PaneRef> = tui::actions::panes_in_work(&known)
+                .into_iter()
+                .map(|pane| model::PaneRef {
+                    host: pane.host,
+                    session: pane.session,
+                })
+                .collect();
+            if panes.is_empty() {
+                bail!("no bizik viewers are open — open sessions before saving a layout");
+            }
+            let count = panes.len();
+            let id = store.create_layout(name.clone(), panes, tui::actions::work_layout())?;
+            store.save()?;
+            println!("saved layout “{name}” with {count} panes ({id})");
+            Ok(())
+        }
+        LayoutCmd::Add {
+            layout,
+            host,
+            session,
+        } => {
+            let pane = model::PaneRef { host, session };
+            let mut store = LocalStore::load()?;
+            verify_layout_panes(&store, std::slice::from_ref(&pane))?;
+            let changed = store.add_layout_pane(&layout, pane)?;
+            store.save()?;
+            println!(
+                "{}",
+                if changed {
+                    "session added"
+                } else {
+                    "session is already in that layout"
+                }
+            );
+            Ok(())
+        }
+        LayoutCmd::Remove {
+            layout,
+            host,
+            session,
+        } => {
+            let mut store = LocalStore::load()?;
+            let changed = store.remove_layout_pane(&layout, &model::PaneRef { host, session })?;
+            store.save()?;
+            println!(
+                "{}",
+                if changed {
+                    "session removed from layout; the session is still running"
+                } else {
+                    "that session is not in the layout"
+                }
+            );
+            Ok(())
+        }
+        LayoutCmd::Rename { layout, name } => {
+            let mut store = LocalStore::load()?;
+            let id = store.rename_layout(&layout, name.clone())?;
+            store.save()?;
+            println!("renamed layout to “{name}” ({id})");
+            Ok(())
+        }
+        LayoutCmd::Rm { layout } => {
+            let mut store = LocalStore::load()?;
+            let saved = store.layout(&layout)?.clone();
+            store.remove_layout(saved.id);
+            store.save()?;
+            println!(
+                "deleted layout “{}”; its {} sessions were not stopped",
+                saved.name,
+                saved.panes.len()
+            );
+            Ok(())
+        }
+        LayoutCmd::Open { layout } => cmd_layout_open(&layout),
+    }
+}
+
+fn cmd_layout_ls(json: bool) -> Result<()> {
+    let store = LocalStore::load()?;
+    let layouts = store.live_layouts();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&layouts)?);
+        return Ok(());
+    }
+    if layouts.is_empty() {
+        println!("no layouts");
+        return Ok(());
+    }
+    for layout in layouts {
+        let hosts: std::collections::HashSet<&str> =
+            layout.panes.iter().map(|pane| pane.host.as_str()).collect();
+        println!(
+            "{}\t{}\t{} pane{}\t{} host{}",
+            layout.id,
+            layout.name,
+            layout.panes.len(),
+            if layout.panes.len() == 1 { "" } else { "s" },
+            hosts.len(),
+            if hosts.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+fn cmd_layout_open(selector: &str) -> Result<()> {
+    let store = LocalStore::load()?;
+    let layout = store.layout(selector)?.clone();
+    if layout.panes.is_empty() {
+        bail!("layout “{}” has no sessions", layout.name);
+    }
+    verify_layout_panes(&store, &layout.panes)?;
+
+    let mut spawned = Vec::with_capacity(layout.panes.len());
+    for pane in &layout.panes {
+        let host = store
+            .host_by_name(&pane.host)
+            .with_context(|| format!("no host named {}", pane.host))?
+            .clone();
+        let result = tui::actions::start(&host, pane.session)
+            .with_context(|| format!("starting {} on {}", pane.session, pane.host))?;
+        spawned.push((host, result));
+    }
+
+    tui::actions::retain_layout_panes(&layout.panes)?;
+    for (host, result) in &spawned {
+        tui::actions::open_pane(host, result.session.id, &result.tmux_name)?;
+    }
+    if layout
+        .tmux_layout
+        .as_deref()
+        .is_none_or(|geometry| tui::actions::apply_geometry(geometry).is_err())
+    {
+        tui::actions::tile();
+    }
+    let _ = tui::actions::focus_work();
+    println!(
+        "opened layout “{}” with {} panes; run bzk to view it",
+        layout.name,
+        spawned.len()
+    );
+    Ok(())
+}
+
+fn parse_pane_ref(value: &str) -> Result<model::PaneRef> {
+    let (host, session) = value
+        .split_once(':')
+        .with_context(|| format!("pane “{value}” must be HOST:SESSION_UUID"))?;
+    if host.is_empty() {
+        bail!("pane “{value}” has an empty host");
+    }
+    Ok(model::PaneRef {
+        host: host.to_string(),
+        session: session
+            .parse()
+            .with_context(|| format!("pane “{value}” has an invalid session UUID"))?,
+    })
+}
+
+fn known_sessions(store: &LocalStore) -> Vec<(String, model::Session)> {
+    let hosts: Vec<model::Host> = store.live_hosts().into_iter().cloned().collect();
+    remote::probe_all(&hosts)
+        .into_iter()
+        .filter_map(|probed| probed.probe.map(|probe| (probed.host.name, probe)))
+        .flat_map(|(host, probe)| {
+            probe
+                .records()
+                .map(|session| (host.clone(), session.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn verify_layout_panes(store: &LocalStore, panes: &[model::PaneRef]) -> Result<()> {
+    let mut unique = std::collections::HashSet::new();
+    let mut host_names = Vec::new();
+    for pane in panes {
+        if !unique.insert((pane.host.as_str(), pane.session)) {
+            bail!(
+                "session {} on {} appears more than once",
+                pane.session,
+                pane.host
+            );
+        }
+        if !host_names.contains(&pane.host) {
+            host_names.push(pane.host.clone());
+        }
+    }
+
+    let hosts = host_names
+        .iter()
+        .map(|name| {
+            store
+                .host_by_name(name)
+                .cloned()
+                .with_context(|| format!("no host named {name}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let probes = remote::probe_all(&hosts);
+    for pane in panes {
+        let probed = probes
+            .iter()
+            .find(|probed| probed.host.name == pane.host)
+            .with_context(|| format!("host {} was not probed", pane.host))?;
+        let probe = probed.probe.as_ref().with_context(|| {
+            probed
+                .error
+                .clone()
+                .unwrap_or_else(|| "probe failed".into())
+        })?;
+        if !probe.records().any(|session| session.id == pane.session) {
+            bail!("host {} has no session {}", pane.host, pane.session);
         }
     }
     Ok(())

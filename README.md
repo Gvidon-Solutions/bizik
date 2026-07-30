@@ -213,7 +213,7 @@ dashboard costs nothing.
 | `Q` | close the panes and the dashboard on this machine |
 | `F10` | show or hide the project/session sidebar |
 | `Ctrl+h` / `Ctrl+l` | focus the sidebar / active session |
-| `enter` | start a session and show it beside the sidebar |
+| `enter` | start/open a session; additional sessions become layout panes |
 | `b` | start it in the background and stay here |
 | `space` | select · then `enter` starts them all; the sidebar lists each one |
 | `x` | stop a session (its conversation is kept) |
@@ -223,7 +223,7 @@ dashboard costs nothing.
 | `H` | hide or restore the selected project |
 | `v` | show or hide hidden projects |
 | `w` | jump to the sidebar workspace |
-| `S` | save the active workspace as a layout |
+| `S` | save the active workspace and exact pane geometry as a layout |
 | `i` | install bizik on the selected host |
 | `r` | refresh now |
 | `?` | this list |
@@ -236,10 +236,23 @@ Codex and Claude sessions started by bizik bypass their normal approval and
 sandbox checks by default (`--dangerously-bypass-approvals-and-sandbox` and
 `--dangerously-skip-permissions`). Only mark projects whose contents you trust.
 
-The workspace lives in a window called `bzk-work`: a project/session tree on
-the left and one active agent on the right. Opening another session replaces
-only the viewer on the right; every agent keeps running in its own detached
-tmux session. Click a session in the tree to switch. Right-click a session or
+The workspace lives in a window called `bzk-work`: a project/session/layout
+tree on the left and one or more agent panes on the right. Opening another
+session adds a viewer pane; reopening one focuses its existing pane. Every
+agent keeps running in its own detached tmux session. Press `S` in the sidebar
+or dashboard to save the exact arrangement.
+
+A layout whose sessions all belong to one project appears directly inside that
+project, beside its standalone sessions. A layout containing several projects
+appears in the global `LAYOUTS` tree below all projects and groups references
+by project. Adding a cross-project session promotes a project layout to that
+global tree automatically; removing the last cross-project reference moves it
+back.
+
+In the sidebar, `a` adds a session to an existing layout, `d` on a nested
+session removes only that reference, and `o` opens it standalone by closing the
+other local viewer panes. None of these operations stop the detached agents.
+Click a session in the tree to focus or open it. Right-click a session or
 project to open its management menu; every menu action displays its shortcut.
 Deleting a session keeps the agent's conversation on disk, while deleting a
 project removes it from bizik but leaves its files untouched.
@@ -248,8 +261,9 @@ Click a project name to fold or unfold its sessions, and click
 hides or restores the tree; `BIZIK_SIDEBAR_KEY=F9 bzk` picks another key and
 `BIZIK_SIDEBAR_WIDTH=36 bzk` changes its width.
 
-The dashboard stays in its own window, so `S`, `x` and everything else are
-pressed there, not from inside the agent where it owns the keyboard.
+The dashboard stays in its own window, so `x` and its other controls are
+pressed there, not from inside the agent where it owns the keyboard. `S` also
+works directly in the focused sidebar.
 
 **`F12` gets you back to the dashboard from the workspace.** bizik binds it when it
 starts, and the binding is conditional: outside bizik's own tmux session the key
@@ -265,12 +279,13 @@ Click the sidebar, use `Ctrl+h` / `Ctrl+l`, or use tmux prefix plus an arrow key
 to move between the tree and the active agent. In the sidebar, `j`/`k` moves,
 `h` collapses or moves to the parent project, and `l` expands or opens. The same
 physical keys work in Russian layout: `о`/`л` and `р`/`д`. `e` (`у`) changes a
-project's display label or renames a session without touching its directory;
-`n` (`т`) creates a session, `p` pins a project, `H` hides or restores it, and
-`v` reveals hidden projects. `d` (`в`) deletes the selected project or session
-after confirmation. Arrow keys and `Enter` work too. While the sidebar is not
-focused, its highlighted row follows the session shown in the active viewer.
-`prefix z` zooms the active agent to the whole window and back.
+project's display label or renames a session/layout without touching its
+directory; `n` (`т`) creates a session, `p` pins a project, `H` hides or
+restores it, and `v` reveals hidden projects. `d` (`в`) deletes the selected
+project, session or layout after confirmation; on a session nested beneath a
+layout it removes only that reference. Arrow keys and `Enter` work too. While
+the sidebar is not focused, its highlighted row follows the last focused
+viewer. `prefix z` zooms the active agent to the whole window and back.
 
 The workspace and attached agent sessions hide tmux's own status bars: the
 sidebar already shows the project, session, agent and state, so duplicated
@@ -359,6 +374,13 @@ bzk probe [--json]      what this machine has: folders, sessions, chats, status
 bzk host add|rm|ls      manage the hosts this laptop drives
 bzk install [host]      copy this binary to a host
 bzk hooks install|uninstall|status [hosts...]
+bzk layout ls [--json]                  list saved layouts
+bzk layout save NAME                    save panes and exact geometry
+bzk layout create NAME --pane HOST:UUID [...]
+bzk layout add|remove NAME --host HOST --session UUID
+bzk layout rename NAME NEW_NAME
+bzk layout open NAME                    start and restore every pane
+bzk layout rm NAME                      delete only the layout
 bzk export|import       move a configuration between machines
 bzk doctor              check the local setup and every host
 ```

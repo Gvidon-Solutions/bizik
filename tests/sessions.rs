@@ -204,6 +204,161 @@ fn several_sessions_in_one_folder_get_distinguishable_names() {
 }
 
 #[test]
+fn layout_cli_manages_references_without_stopping_sessions() {
+    let s = Sandbox::new("layout-cli");
+    let folder = s.mark(&s.dir("project"));
+    let first = s.new_session(&folder, "api");
+    let second = s.new_session(&folder, "tests");
+
+    s.bzk(&[
+        "layout",
+        "create",
+        "release",
+        "--pane",
+        &format!("local:{first}"),
+    ])
+    .ok();
+    s.bzk(&[
+        "layout",
+        "add",
+        "release",
+        "--host",
+        "local",
+        "--session",
+        &second,
+    ])
+    .ok();
+
+    let listed = s.bzk(&["layout", "ls", "--json"]);
+    listed.ok();
+    let layouts: serde_json::Value = serde_json::from_str(listed.stdout.trim()).unwrap();
+    assert_eq!(layouts[0]["name"], "release");
+    assert_eq!(layouts[0]["panes"].as_array().unwrap().len(), 2);
+
+    s.bzk(&[
+        "layout",
+        "remove",
+        "release",
+        "--host",
+        "local",
+        "--session",
+        &first,
+    ])
+    .ok();
+    s.bzk(&["layout", "rename", "release", "release-ready"])
+        .ok();
+    s.bzk(&["layout", "rm", "release-ready"]).ok();
+
+    assert_eq!(
+        s.probe()["sessions"].as_array().unwrap().len(),
+        2,
+        "editing or deleting a layout must not delete its sessions"
+    );
+    let listed = s.bzk(&["layout", "ls", "--json"]);
+    listed.ok();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(listed.stdout.trim()).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn opening_a_layout_builds_multiple_viewers_beside_one_sidebar() {
+    let s = Sandbox::new("layout-open");
+    let folder = s.mark(&s.dir("project"));
+    let first = s.new_session(&folder, "api");
+    let second = s.new_session(&folder, "tests");
+    let frontend = s.mark(&s.dir("frontend"));
+    let build = s.new_session(&frontend, "production build");
+    s.bzk(&[
+        "layout",
+        "create",
+        "release",
+        "--pane",
+        &format!("local:{first}"),
+        "--pane",
+        &format!("local:{second}"),
+    ])
+    .ok();
+    s.bzk(&[
+        "layout",
+        "create",
+        "global-release",
+        "--pane",
+        &format!("local:{first}"),
+        "--pane",
+        &format!("local:{build}"),
+    ])
+    .ok();
+
+    s.bzk(&["layout", "open", "release"]).ok();
+    s.eventually("the layout viewers to open", || {
+        let panes = s.tmux(&["list-panes", "-a", "-F", "#{window_name}\t#{@bzk_role}"]);
+        panes
+            .lines()
+            .filter(|line| *line == "bzk-work\tviewer")
+            .count()
+            == 2
+    });
+
+    let panes = s.tmux(&["list-panes", "-a", "-F", "#{window_name}\t#{@bzk_role}"]);
+    assert_eq!(
+        panes
+            .lines()
+            .filter(|line| *line == "bzk-work\tsidebar")
+            .count(),
+        1
+    );
+    assert_eq!(
+        panes
+            .lines()
+            .filter(|line| *line == "bzk-work\tviewer")
+            .count(),
+        2
+    );
+
+    let sidebar = s
+        .tmux(&["list-panes", "-a", "-F", "#{@bzk_role}\t#{pane_id}"])
+        .lines()
+        .find_map(|line| line.strip_prefix("sidebar\t"))
+        .expect("sidebar pane")
+        .to_string();
+    s.eventually("the sidebar layout tree to render", || {
+        let screen = s.tmux(&["capture-pane", "-p", "-t", &sidebar]);
+        screen.contains("release")
+            && screen.contains("LAYOUTS")
+            && screen.contains("global-release")
+            && screen.contains("frontend")
+    });
+
+    s.bzk(&["layout", "open", "release"]).ok();
+    let reopened = s.tmux(&["list-panes", "-a", "-F", "#{window_name}\t#{@bzk_role}"]);
+    assert_eq!(
+        reopened
+            .lines()
+            .filter(|line| *line == "bzk-work\tviewer")
+            .count(),
+        2,
+        "opening the same layout must focus existing viewers, not duplicate them"
+    );
+
+    s.bzk(&["layout", "save", "release-copy"]).ok();
+    let listed = s.bzk(&["layout", "ls", "--json"]);
+    listed.ok();
+    let layouts: serde_json::Value = serde_json::from_str(listed.stdout.trim()).unwrap();
+    assert!(
+        layouts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|layout| layout["name"] == "release-copy")
+            .and_then(|layout| layout["tmux_layout"].as_str())
+            .is_some(),
+        "saving the live workspace should persist its exact tmux geometry"
+    );
+}
+
+#[test]
 fn codex_sessions_adopt_native_titles_but_keep_manual_renames() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -188,7 +188,25 @@ pub fn version_supported(reported: &str) -> bool {
 /// string as "inside" would make bizik skip creating its own session and draw
 /// the dashboard straight into whatever pane it was started from.
 pub fn inside_tmux() -> bool {
-    std::env::var("TMUX").is_ok_and(|v| !v.is_empty())
+    let Ok(environment) = std::env::var("TMUX") else {
+        return false;
+    };
+    if environment.is_empty() {
+        return false;
+    }
+    if socket().is_none() {
+        return true;
+    }
+
+    // Tests and isolated profiles deliberately use another tmux socket while
+    // the caller may itself be running inside the user's normal tmux. In that
+    // case `$TMUX` is real but belongs to a different server, and `new-window`
+    // would otherwise land in whichever isolated session tmux guesses is
+    // current. Compare the actual socket paths before treating this process as
+    // nested in the target server.
+    let environment_socket = environment.split(',').next().unwrap_or_default();
+    tmux(&["display-message", "-p", "#{socket_path}"])
+        .is_ok_and(|path| path.trim() == environment_socket)
 }
 
 // ---------------------------------------------------------------------------
@@ -421,9 +439,13 @@ pub fn split_window_right(pane: &str, cmd: &str) -> Result<String> {
     Ok(out.trim().to_string())
 }
 
-/// Replace what a pane is showing without changing its geometry or pane id.
-pub fn respawn_pane(pane: &str, cmd: &str) -> Result<()> {
-    tmux(&["respawn-pane", "-k", "-t", pane, cmd]).map(|_| ())
+/// Split one viewer pane and return the new pane id.
+///
+/// Targeting a pane rather than the whole window preserves the outer
+/// sidebar/viewer split while tmux grows the layout on the viewer side.
+pub fn split_window(pane: &str, cmd: &str) -> Result<String> {
+    let out = tmux(&["split-window", "-t", pane, "-P", "-F", "#{pane_id}", cmd])?;
+    Ok(out.trim().to_string())
 }
 
 pub fn resize_pane_width(pane: &str, width: u16) -> Result<()> {
@@ -643,6 +665,19 @@ pub fn select_pane(pane: &str) -> Result<()> {
     tmux(&["select-pane", "-t", pane]).map(|_| ())
 }
 
+pub fn select_layout(window: &str, layout: &str) -> Result<()> {
+    tmux(&["select-layout", "-t", window, layout]).map(|_| ())
+}
+
+/// The window's geometry as a string that `select-layout` can replay.
+pub fn capture_layout(window: &str) -> Result<String> {
+    Ok(
+        tmux(&["display-message", "-p", "-t", window, "#{window_layout}"])?
+            .trim()
+            .to_string(),
+    )
+}
+
 /// Whether the pane running this process currently owns keyboard focus.
 pub fn current_pane_active() -> bool {
     let Some(pane) = std::env::var("TMUX_PANE")
@@ -664,6 +699,8 @@ pub struct PaneInfo {
     pub session: Option<String>,
     pub host: Option<String>,
     pub role: Option<String>,
+    pub active: bool,
+    pub last: bool,
     /// What the pane was started with. Only needed to recognise panes opened
     /// before identity was tagged onto them.
     pub start_command: String,
@@ -677,13 +714,13 @@ pub struct PaneInfo {
 /// guessing at it.
 pub fn panes_of_window_anywhere(name: &str) -> Result<Vec<PaneInfo>> {
     let fmt = format!(
-        "#{{window_name}}\t#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{pane_start_command}}"
+        "#{{window_name}}\t#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{pane_active}}\t#{{pane_last}}\t#{{pane_start_command}}"
     );
     let raw = tmux(&["list-panes", "-a", "-F", &fmt])?;
     Ok(raw
         .lines()
         .filter_map(|l| {
-            let mut parts = l.splitn(6, '\t');
+            let mut parts = l.splitn(8, '\t');
             if parts.next()? != name {
                 return None;
             }
@@ -694,10 +731,10 @@ pub fn panes_of_window_anywhere(name: &str) -> Result<Vec<PaneInfo>> {
 
 pub fn window_panes(window: &str) -> Result<Vec<PaneInfo>> {
     let fmt = format!(
-        "#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{pane_start_command}}"
+        "#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{pane_active}}\t#{{pane_last}}\t#{{pane_start_command}}"
     );
     let raw = tmux(&["list-panes", "-t", window, "-F", &fmt])?;
-    Ok(raw.lines().map(|l| parse_pane(l.splitn(5, '\t'))).collect())
+    Ok(raw.lines().map(|l| parse_pane(l.splitn(7, '\t'))).collect())
 }
 
 /// The command is last and taken whole: `splitn` keeps a tab inside it from
@@ -709,6 +746,8 @@ fn parse_pane<'a>(mut parts: impl Iterator<Item = &'a str>) -> PaneInfo {
         session: clean(parts.next()),
         host: clean(parts.next()),
         role: clean(parts.next()),
+        active: parts.next().is_some_and(|value| value == "1"),
+        last: parts.next().is_some_and(|value| value == "1"),
         start_command: parts.next().unwrap_or_default().to_string(),
     }
 }
@@ -801,11 +840,13 @@ mod tests {
         // The command is the last field and may itself contain a tab. Splitting
         // on every tab would read part of it as another column and silently
         // mis-describe the pane.
-        let info = parse_pane("%3\tabc-123\tback\tviewer\tssh host\t-t 'x'".splitn(5, '\t'));
+        let info = parse_pane("%3\tabc-123\tback\tviewer\t1\t0\tssh host\t-t 'x'".splitn(7, '\t'));
         assert_eq!(info.pane, "%3");
         assert_eq!(info.session.as_deref(), Some("abc-123"));
         assert_eq!(info.host.as_deref(), Some("back"));
         assert_eq!(info.role.as_deref(), Some("viewer"));
+        assert!(info.active);
+        assert!(!info.last);
         assert_eq!(info.start_command, "ssh host\t-t 'x'");
     }
 
@@ -814,13 +855,13 @@ mod tests {
         // tmux prints an unset user option as an empty field, and older tmux
         // prints `0`. Either must read as "no tag", or a pane from an older
         // build looks tagged with nonsense.
-        let empty = parse_pane("%1\t\t\t\tzsh".splitn(5, '\t'));
+        let empty = parse_pane("%1\t\t\t\t0\t0\tzsh".splitn(7, '\t'));
         assert_eq!(empty.session, None);
         assert_eq!(empty.host, None);
         assert_eq!(empty.role, None);
         assert_eq!(empty.start_command, "zsh");
 
-        let zero = parse_pane("%1\t0\t0\t0\tzsh".splitn(5, '\t'));
+        let zero = parse_pane("%1\t0\t0\t0\t0\t0\tzsh".splitn(7, '\t'));
         assert_eq!(zero.session, None);
     }
 

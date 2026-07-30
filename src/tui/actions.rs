@@ -19,6 +19,7 @@ use crate::{tmux, util};
 pub const WORK_WINDOW: &str = "bzk-work";
 pub const SIDEBAR_ROLE: &str = "sidebar";
 pub const VIEWER_ROLE: &str = "viewer";
+const WORK_SESSION: &str = "bizik";
 const DEFAULT_SIDEBAR_WIDTH: u16 = 30;
 const SIDEBAR_HIDDEN: &str = "@bzk_sidebar_hidden";
 const SIDEBAR_WIDTH: &str = "@bzk_sidebar_width";
@@ -113,12 +114,11 @@ pub fn set_project_hidden(host: &Host, folder: Uuid, hidden: bool) -> Result<()>
     .map(|_| ())
 }
 
-/// Put one viewer for `tmux_name` beside the project sidebar.
+/// Put a viewer for `tmux_name` beside the project sidebar.
 ///
-/// There is deliberately only one viewer pane. Switching sessions respawns
-/// that viewer while every agent keeps running in its detached host-side tmux
-/// session. New sessions therefore appear in the tree instead of repeatedly
-/// splitting the terminal.
+/// Viewers accumulate on the right-hand side so several sessions can be
+/// watched together and saved as a layout. Reopening a session focuses its
+/// existing viewer instead of duplicating it.
 pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> {
     let cmd = remote::attach_command(host, tmux_name);
     let (window, panes, created) = if let Some(window) = work_window() {
@@ -126,7 +126,7 @@ pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> 
         remember_sidebar_width(&window, &panes);
         (window, panes, None)
     } else {
-        let viewer = tmux::new_window(WORK_WINDOW, &cmd)?;
+        let viewer = create_work_window(&cmd)?;
         let window = work_window().context("the work window was not created")?;
         (window, Vec::new(), Some(viewer))
     };
@@ -134,10 +134,6 @@ pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> 
     let existing = panes
         .iter()
         .find(|pane| identifies(pane, &session.to_string(), tmux_name))
-        .map(|pane| pane.pane.clone());
-    let reusable = panes
-        .iter()
-        .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
         .map(|pane| pane.pane.clone());
     let sidebar = panes
         .iter()
@@ -147,42 +143,100 @@ pub fn open_pane(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> 
     let viewer = if let Some(pane) = created {
         pane
     } else if let Some(pane) = existing {
-        pane
-    } else if let Some(pane) = reusable {
-        tmux::respawn_pane(&pane, &cmd)?;
-        pane
+        tmux::select_pane(&pane)?;
+        return Ok(pane);
+    } else if let Some(pane) = panes
+        .iter()
+        .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
+    {
+        tmux::split_window(&pane.pane, &cmd)?
     } else if let Some(sidebar) = sidebar {
-        // Closing the active session lets its attach pane exit before the next
-        // tab is opened. At that point the sidebar owns the whole lower row;
-        // split it horizontally to rebuild the viewer beside it.
         tmux::split_window_right(&sidebar, &cmd)?
     } else if let Some(pane) = panes.first() {
-        // Migrate a workspace created by a build that still had a top tab
-        // strip. The pane itself is only a navigator, so it can become the
-        // viewer without touching any detached agent session.
-        tmux::respawn_pane(&pane.pane, &cmd)?;
-        pane.pane.clone()
+        // Migrate a workspace created by a build that predates pane roles.
+        tmux::split_window(&pane.pane, &cmd)?
     } else {
         anyhow::bail!("the work window exists but has no panes")
     };
-
-    // Old builds may have left a top tab strip or several tiled viewers. They
-    // are only clients; closing them never stops host-side agent sessions.
-    for pane in panes {
-        if pane.pane != viewer && pane.role.as_deref() != Some(SIDEBAR_ROLE) {
-            let _ = tmux::kill_pane(&pane.pane);
-        }
-    }
 
     tmux::tag_pane(&viewer, &session.to_string(), &host.name)?;
     tmux::tag_pane_role(&viewer, VIEWER_ROLE)?;
     if !sidebar_hidden(&window) {
         let _ = ensure_sidebar(&window, &viewer)?;
     }
-    fit_workspace(&window)?;
+    tile_window(&window)?;
     tmux::style_app_window(&window);
     tmux::select_pane(&viewer)?;
     Ok(viewer)
+}
+
+fn create_work_window(cmd: &str) -> Result<String> {
+    if tmux::inside_tmux() {
+        return tmux::new_window(WORK_WINDOW, cmd);
+    }
+    let session = tmux::SessionRef::new(WORK_SESSION);
+    if tmux::has_session(&session) {
+        return tmux::new_window_in(&session, WORK_WINDOW, cmd);
+    }
+    tmux::new_detached_session(&session, WORK_WINDOW, cmd)?;
+    let window = tmux::find_window_in(Some(&session), WORK_WINDOW)
+        .context("the detached work window was not created")?;
+    tmux::window_panes(&window)?
+        .into_iter()
+        .next()
+        .map(|pane| pane.pane)
+        .context("the detached work window has no pane")
+}
+
+/// Show exactly one session, removing only local viewer clients.
+///
+/// The detached sessions on their hosts remain untouched. This is the
+/// "standalone" escape hatch from a busy layout.
+pub fn open_standalone(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> {
+    if let Some(window) = work_window() {
+        for pane in tmux::window_panes(&window)? {
+            if pane.role.as_deref() == Some(VIEWER_ROLE)
+                && !(pane.session.as_deref() == Some(&session.to_string())
+                    && pane.host.as_deref() == Some(host.name.as_str()))
+            {
+                tmux::kill_pane(&pane.pane)?;
+            }
+        }
+    }
+    open_pane(host, session, tmux_name)
+}
+
+/// Close viewer clients that do not belong to the layout being restored.
+///
+/// A duplicate is surplus after the first matching pane. The sidebar and the
+/// detached agent sessions are never touched.
+pub fn retain_layout_panes(wanted: &[crate::model::PaneRef]) -> Result<()> {
+    let Some(window) = work_window() else {
+        return Ok(());
+    };
+    let wanted: std::collections::HashSet<(String, Uuid)> = wanted
+        .iter()
+        .map(|pane| (pane.host.clone(), pane.session))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for pane in tmux::window_panes(&window)? {
+        if pane.role.as_deref() != Some(VIEWER_ROLE) {
+            continue;
+        }
+        let Some(host) = pane.host.clone() else {
+            tmux::kill_pane(&pane.pane)?;
+            continue;
+        };
+        let Some(session) = pane.session.as_deref().and_then(|id| id.parse().ok()) else {
+            tmux::kill_pane(&pane.pane)?;
+            continue;
+        };
+        let key = (host, session);
+        if !wanted.contains(&key) || !seen.insert(key) {
+            tmux::kill_pane(&pane.pane)?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_sidebar(window: &str, viewer: &str) -> Result<String> {
@@ -305,9 +359,20 @@ pub fn focus_sidebar() -> Result<()> {
 /// Move keyboard focus from the sidebar back to the active agent.
 pub fn focus_viewer() -> Result<()> {
     let window = work_window().context("the workspace is not open yet")?;
-    let viewer = tmux::window_panes(&window)?
-        .into_iter()
-        .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
+    let panes = tmux::window_panes(&window)?;
+    let viewer = panes
+        .iter()
+        .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE) && pane.active)
+        .or_else(|| {
+            panes
+                .iter()
+                .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE) && pane.last)
+        })
+        .or_else(|| {
+            panes
+                .iter()
+                .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
+        })
         .context("no active session is open")?;
     tmux::select_window(&window)?;
     tmux::select_pane(&viewer.pane)
@@ -328,19 +393,30 @@ pub fn focus_work() -> Result<()> {
     tmux::select_window(&window)
 }
 
-/// Session currently occupying the single viewer pane.
+/// Session currently occupying the focused viewer pane.
 pub fn active_session() -> Option<(String, Uuid)> {
     let window = work_window()?;
-    tmux::window_panes(&window)
-        .ok()?
-        .into_iter()
-        .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
-        .and_then(|pane| Some((pane.host?, pane.session?.parse().ok()?)))
+    let panes = tmux::window_panes(&window).ok()?;
+    panes
+        .iter()
+        .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE) && pane.active)
+        .or_else(|| {
+            panes
+                .iter()
+                .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE) && pane.last)
+        })
+        .or_else(|| {
+            panes
+                .iter()
+                .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
+        })
+        .and_then(|pane| Some((pane.host.clone()?, pane.session.as_deref()?.parse().ok()?)))
 }
 
-/// A sidebar workspace has a fixed shape, not a user-managed pane geometry.
+/// Geometry of the whole workspace, including the stable sidebar pane.
 pub fn work_layout() -> Option<String> {
-    None
+    let window = work_window()?;
+    tmux::capture_layout(&window).ok()
 }
 
 /// One open pane and the session it is showing.
@@ -402,19 +478,41 @@ pub fn identify_pane(
         .map(|(host, s)| (host.clone(), s.id))
 }
 
-/// Old saved layouts may contain tiled geometry. The current workspace always
-/// keeps the sidebar at a stable width and shows one active session.
-pub fn apply_geometry(_geometry: &str) -> Result<()> {
-    fit_sidebar()
+/// Apply an exact saved geometry, including its sidebar/viewer split.
+pub fn apply_geometry(geometry: &str) -> Result<()> {
+    let window = work_window().context("the pane window is gone")?;
+    tmux::select_layout(&window, geometry)?;
+    remember_current_sidebar_width(&window);
+    Ok(())
 }
 
 pub fn tile() {
-    let _ = fit_sidebar();
+    if let Some(window) = work_window() {
+        let _ = tile_window(&window);
+    }
 }
 
-fn fit_sidebar() -> Result<()> {
-    let window = work_window().context("the pane window is gone")?;
-    fit_workspace(&window)
+fn tile_window(window: &str) -> Result<()> {
+    let panes = tmux::window_panes(window)?;
+    let sidebar = panes
+        .iter()
+        .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE));
+    if let Some(sidebar) = sidebar {
+        // `main-vertical` keeps one full-height pane on the left and stacks the
+        // remaining viewers on the right. Selecting the sidebar first makes it
+        // that main pane on supported tmux versions.
+        tmux::select_pane(&sidebar.pane)?;
+        tmux::select_layout(window, "main-vertical")?;
+    } else {
+        tmux::select_layout(window, "tiled")?;
+    }
+    fit_workspace(window)
+}
+
+fn remember_current_sidebar_width(window: &str) {
+    if let Ok(panes) = tmux::window_panes(window) {
+        remember_sidebar_width(window, &panes);
+    }
 }
 
 fn fit_workspace(window: &str) -> Result<()> {
@@ -461,6 +559,8 @@ mod tests {
             session: None,
             host: None,
             role: Some(role.into()),
+            active: false,
+            last: false,
             start_command: String::new(),
         }
     }
@@ -471,6 +571,8 @@ mod tests {
             session: tag.map(str::to_string),
             host: tag.map(|_| "back".to_string()),
             role: Some(VIEWER_ROLE.into()),
+            active: false,
+            last: false,
             start_command: command.to_string(),
         }
     }

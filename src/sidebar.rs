@@ -1,8 +1,8 @@
 //! Compact project/session tree shown beside the active agent.
 //!
 //! The sidebar is a viewer, not an owner. Folders and sessions still live on
-//! their hosts, and the active agent still lives in its detached tmux session.
-//! Selecting another row only replaces the attach client in the viewer pane.
+//! their hosts, and every agent still lives in its detached tmux session.
+//! Layout rows arrange local attach clients without taking ownership of them.
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::hostops::SpawnResult;
-use crate::model::{AgentKind, Folder, Host, Probe, Session};
+use crate::model::{AgentKind, Folder, Host, Layout as SavedLayout, Probe, Session};
 use crate::reconcile::State;
 use crate::remote::{self, HostProbe};
 use crate::store::LocalStore;
@@ -68,21 +68,54 @@ enum TreeRow {
         agent: AgentKind,
         title: String,
         state: State,
+        depth: u8,
     },
     NewSession {
         host: String,
         folder: Uuid,
         project: String,
     },
+    Layout {
+        id: Uuid,
+        name: String,
+        panes: usize,
+        missing: usize,
+        collapsed: bool,
+        depth: u8,
+    },
+    LayoutProject {
+        layout: Uuid,
+        host: String,
+        folder: Uuid,
+        name: String,
+        collapsed: bool,
+        depth: u8,
+    },
+    LayoutSession {
+        layout: Uuid,
+        host: String,
+        id: Uuid,
+        folder: Option<Uuid>,
+        agent: Option<AgentKind>,
+        title: String,
+        state: State,
+        missing: bool,
+        occurrence: usize,
+        depth: u8,
+    },
+    Section(String),
     Gap,
     Note(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum TreeKey {
     Project(String, Uuid),
     Session(String, Uuid),
     NewSession(String, Uuid),
+    Layout(Uuid),
+    LayoutProject(Uuid, String, Uuid),
+    LayoutSession(Uuid, String, Uuid, usize),
 }
 
 impl TreeRow {
@@ -93,19 +126,56 @@ impl TreeRow {
             Self::NewSession { host, folder, .. } => {
                 Some(TreeKey::NewSession(host.clone(), *folder))
             }
-            Self::Gap | Self::Note(_) => None,
+            Self::Layout { id, .. } => Some(TreeKey::Layout(*id)),
+            Self::LayoutProject {
+                layout,
+                host,
+                folder,
+                ..
+            } => Some(TreeKey::LayoutProject(*layout, host.clone(), *folder)),
+            Self::LayoutSession {
+                layout,
+                host,
+                id,
+                occurrence,
+                ..
+            } => Some(TreeKey::LayoutSession(
+                *layout,
+                host.clone(),
+                *id,
+                *occurrence,
+            )),
+            Self::Section(_) | Self::Gap | Self::Note(_) => None,
         }
     }
 
     fn matches_key(&self, key: &TreeKey) -> bool {
         self.key().as_ref() == Some(key)
     }
+
+    fn depth(&self) -> Option<u8> {
+        match self {
+            Self::Project { .. } => Some(0),
+            Self::Session { depth, .. }
+            | Self::Layout { depth, .. }
+            | Self::LayoutProject { depth, .. }
+            | Self::LayoutSession { depth, .. } => Some(*depth),
+            Self::NewSession { .. } => Some(1),
+            Self::Section(_) | Self::Gap | Self::Note(_) => None,
+        }
+    }
 }
 
 struct LaunchResult {
     host: Host,
     focus_sidebar: bool,
+    standalone: bool,
     result: Result<SpawnResult, String>,
+}
+
+struct LayoutLaunchResult {
+    layout: SavedLayout,
+    results: Vec<(Host, Result<SpawnResult, String>)>,
 }
 
 struct CreateResult {
@@ -130,6 +200,13 @@ struct ProjectTarget {
     hidden: bool,
 }
 
+#[derive(Clone)]
+struct LayoutTarget {
+    id: Uuid,
+    name: String,
+    panes: usize,
+}
+
 enum SessionOverlay {
     Menu {
         target: SessionTarget,
@@ -143,6 +220,13 @@ enum SessionOverlay {
         target: ProjectTarget,
         value: String,
     },
+    RenameLayout {
+        target: LayoutTarget,
+        value: String,
+    },
+    SaveLayout {
+        value: String,
+    },
     ProjectMenu {
         target: ProjectTarget,
         selected: usize,
@@ -152,6 +236,13 @@ enum SessionOverlay {
     },
     ConfirmDeleteProject {
         target: ProjectTarget,
+    },
+    ConfirmDeleteLayout {
+        target: LayoutTarget,
+    },
+    ConfirmRemoveFromLayout {
+        layout: LayoutTarget,
+        target: SessionTarget,
     },
 }
 
@@ -186,6 +277,13 @@ struct AgentPicker {
     selected: usize,
 }
 
+#[derive(Clone)]
+struct LayoutPicker {
+    target: SessionTarget,
+    layouts: Vec<LayoutTarget>,
+    selected: usize,
+}
+
 struct Sidebar {
     local: LocalStore,
     probes: Vec<HostProbe>,
@@ -193,20 +291,24 @@ struct Sidebar {
     list: ListState,
     active: Option<(String, Uuid)>,
     focused: bool,
-    collapsed: HashSet<(String, Uuid)>,
+    collapsed: HashSet<TreeKey>,
     show_hidden: bool,
     agent_picker: Option<AgentPicker>,
+    layout_picker: Option<LayoutPicker>,
     session_overlay: Option<SessionOverlay>,
     refreshing: bool,
     starting: bool,
     creating: bool,
     mutating: bool,
+    restoring: bool,
     last_refresh: Instant,
     message: Option<(String, bool, Instant)>,
     probe_tx: Sender<Vec<HostProbe>>,
     probe_rx: Receiver<Vec<HostProbe>>,
     launch_tx: Sender<LaunchResult>,
     launch_rx: Receiver<LaunchResult>,
+    layout_launch_tx: Sender<LayoutLaunchResult>,
+    layout_launch_rx: Receiver<LayoutLaunchResult>,
     create_tx: Sender<CreateResult>,
     create_rx: Receiver<CreateResult>,
     mutation_tx: Sender<MutationResult>,
@@ -233,6 +335,7 @@ impl Sidebar {
         }
         let (probe_tx, probe_rx) = channel();
         let (launch_tx, launch_rx) = channel();
+        let (layout_launch_tx, layout_launch_rx) = channel();
         let (create_tx, create_rx) = channel();
         let (mutation_tx, mutation_rx) = channel();
         let (project_mutation_tx, project_mutation_rx) = channel();
@@ -247,17 +350,21 @@ impl Sidebar {
             collapsed: HashSet::new(),
             show_hidden: false,
             agent_picker: None,
+            layout_picker: None,
             session_overlay: None,
             refreshing: false,
             starting: false,
             creating: false,
             mutating: false,
+            restoring: false,
             last_refresh: now.checked_sub(REFRESH_EVERY).unwrap_or(now),
             message: None,
             probe_tx,
             probe_rx,
             launch_tx,
             launch_rx,
+            layout_launch_tx,
+            layout_launch_rx,
             create_tx,
             create_rx,
             mutation_tx,
@@ -290,6 +397,8 @@ impl Sidebar {
                 }
                 if self.session_overlay.is_some() {
                     self.handle_session_overlay(event);
+                } else if self.layout_picker.is_some() {
+                    self.handle_layout_picker(event);
                 } else if self.agent_picker.is_some() {
                     self.handle_agent_picker(event);
                 } else {
@@ -302,7 +411,14 @@ impl Sidebar {
                             KeyCode::Home | KeyCode::Char('g' | 'п') => self.jump(true),
                             KeyCode::End | KeyCode::Char('G' | 'П') => self.jump(false),
                             KeyCode::Enter => self.open_selected(),
+                            KeyCode::Char('o' | 'щ') => self.open_selected_standalone(),
                             KeyCode::Char('n' | 'т') => self.begin_new_session(),
+                            KeyCode::Char('a' | 'ф') => self.begin_add_to_layout(),
+                            KeyCode::Char('S' | 'Ы') => {
+                                self.session_overlay = Some(SessionOverlay::SaveLayout {
+                                    value: String::new(),
+                                });
+                            }
                             KeyCode::Char('e' | 'у') => self.begin_rename(),
                             KeyCode::Char('d' | 'в') | KeyCode::Delete => self.begin_delete(),
                             KeyCode::Char('p' | 'з') => self.toggle_project_pinned(),
@@ -355,11 +471,15 @@ impl Sidebar {
                 self.starting = false;
                 match launch.result {
                     Ok(spawned) => {
-                        let opened = actions::open_pane(
-                            &launch.host,
-                            spawned.session.id,
-                            &spawned.tmux_name,
-                        );
+                        let opened = if launch.standalone {
+                            actions::open_standalone(
+                                &launch.host,
+                                spawned.session.id,
+                                &spawned.tmux_name,
+                            )
+                        } else {
+                            actions::open_pane(&launch.host, spawned.session.id, &spawned.tmux_name)
+                        };
                         if launch.focus_sidebar {
                             self.focus_sidebar();
                         }
@@ -376,6 +496,53 @@ impl Sidebar {
                         self.set_message(error, true);
                     }
                 }
+            }
+
+            while let Ok(batch) = self.layout_launch_rx.try_recv() {
+                self.restoring = false;
+                let mut opened = 0usize;
+                let mut failed = 0usize;
+                if let Err(error) = actions::retain_layout_panes(&batch.layout.panes) {
+                    failed += 1;
+                    self.set_message(format!("{error:#}"), true);
+                }
+                for (host, result) in &batch.results {
+                    match result {
+                        Ok(spawned) => {
+                            match actions::open_pane(host, spawned.session.id, &spawned.tmux_name) {
+                                Ok(_) => opened += 1,
+                                Err(error) => {
+                                    failed += 1;
+                                    self.set_message(format!("{error:#}"), true);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            self.set_message(error.clone(), true);
+                        }
+                    }
+                }
+                if opened > 0 {
+                    if batch
+                        .layout
+                        .tmux_layout
+                        .as_deref()
+                        .is_none_or(|geometry| actions::apply_geometry(geometry).is_err())
+                    {
+                        actions::tile();
+                    }
+                    let _ = actions::focus_work();
+                }
+                if failed == 0 {
+                    self.set_message(
+                        format!("opened {} · {opened} panes", batch.layout.name),
+                        false,
+                    );
+                } else {
+                    self.set_message(format!("{opened} opened · {failed} failed"), true);
+                }
+                self.kick_refresh();
             }
 
             while let Ok(created) = self.create_rx.try_recv() {
@@ -489,6 +656,9 @@ impl Sidebar {
     }
 
     fn rebuild(&mut self) {
+        if let Ok(local) = LocalStore::load() {
+            self.local = local;
+        }
         let selected_position = self
             .list
             .selected()
@@ -501,6 +671,12 @@ impl Sidebar {
         self.rows = build_tree(
             &self.hosts(),
             &self.probes,
+            &self
+                .local
+                .live_layouts()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
             &self.collapsed,
             self.show_hidden,
         );
@@ -565,23 +741,32 @@ impl Sidebar {
         self.list.select(target.map(|(index, _)| index));
     }
 
-    /// Vim-style tree navigation: collapse a project, or move from one of its
-    /// children back to the project row.
+    /// Vim-style tree navigation: collapse a branch, or move to its immediate
+    /// parent in the visible tree.
     fn collapse_or_parent(&mut self) {
         let Some(selected) = self.list.selected() else {
             return;
         };
-        match self.rows.get(selected).and_then(TreeRow::key) {
-            Some(TreeKey::Project(host, folder)) => {
-                if self.collapsed.insert((host, folder)) {
+        let Some(row) = self.rows.get(selected) else {
+            return;
+        };
+        match row.key() {
+            Some(
+                key @ (TreeKey::Project(..) | TreeKey::Layout(..) | TreeKey::LayoutProject(..)),
+            ) => {
+                if self.collapsed.insert(key) {
                     self.rebuild();
                 }
             }
-            Some(TreeKey::Session(..) | TreeKey::NewSession(..)) => {
-                if let Some(parent) = self.rows[..selected]
-                    .iter()
-                    .rposition(|row| matches!(row, TreeRow::Project { .. }))
-                {
+            Some(_) => {
+                let Some(depth) = row.depth() else {
+                    return;
+                };
+                if let Some(parent) = self.rows[..selected].iter().rposition(|candidate| {
+                    candidate
+                        .depth()
+                        .is_some_and(|candidate_depth| candidate_depth < depth)
+                }) {
                     self.list.select(Some(parent));
                 }
             }
@@ -589,21 +774,23 @@ impl Sidebar {
         }
     }
 
-    /// Vim-style tree navigation: expand a project, descend into an already
-    /// expanded project, or open the selected session/action.
+    /// Vim-style tree navigation: expand a branch, descend into an expanded
+    /// branch, or open the selected leaf.
     fn expand_or_open(&mut self) {
         let Some(key) = self.current_key() else {
             return;
         };
         match key {
-            TreeKey::Project(host, folder) => {
-                if self.collapsed.remove(&(host, folder)) {
+            key @ (TreeKey::Project(..) | TreeKey::Layout(..) | TreeKey::LayoutProject(..)) => {
+                if self.collapsed.remove(&key) {
                     self.rebuild();
                 } else {
                     self.move_cursor(1);
                 }
             }
-            TreeKey::Session(..) | TreeKey::NewSession(..) => self.open_selected(),
+            TreeKey::Session(..) | TreeKey::NewSession(..) | TreeKey::LayoutSession(..) => {
+                self.open_selected()
+            }
         }
     }
 
@@ -619,11 +806,24 @@ impl Sidebar {
         self.session_overlay = match self.rows.get(index) {
             Some(TreeRow::Session {
                 host, id, title, ..
+            })
+            | Some(TreeRow::LayoutSession {
+                host, id, title, ..
             }) => Some(SessionOverlay::Rename {
                 target: SessionTarget {
                     host: host.clone(),
                     id: *id,
                     title: title.clone(),
+                },
+                value: String::new(),
+            }),
+            Some(TreeRow::Layout {
+                id, name, panes, ..
+            }) => Some(SessionOverlay::RenameLayout {
+                target: LayoutTarget {
+                    id: *id,
+                    name: name.clone(),
+                    panes: *panes,
                 },
                 value: String::new(),
             }),
@@ -670,6 +870,41 @@ impl Sidebar {
                     host: host.clone(),
                     id: *id,
                     title: title.clone(),
+                },
+            }),
+            Some(TreeRow::LayoutSession {
+                layout,
+                host,
+                id,
+                title,
+                ..
+            }) => {
+                let layout = self
+                    .local
+                    .live_layouts()
+                    .into_iter()
+                    .find(|candidate| candidate.id == *layout)
+                    .map(|candidate| LayoutTarget {
+                        id: candidate.id,
+                        name: candidate.name.clone(),
+                        panes: candidate.panes.len(),
+                    });
+                layout.map(|layout| SessionOverlay::ConfirmRemoveFromLayout {
+                    layout,
+                    target: SessionTarget {
+                        host: host.clone(),
+                        id: *id,
+                        title: title.clone(),
+                    },
+                })
+            }
+            Some(TreeRow::Layout {
+                id, name, panes, ..
+            }) => Some(SessionOverlay::ConfirmDeleteLayout {
+                target: LayoutTarget {
+                    id: *id,
+                    name: name.clone(),
+                    panes: *panes,
                 },
             }),
             Some(TreeRow::Project {
@@ -750,6 +985,47 @@ impl Sidebar {
         );
     }
 
+    fn begin_add_to_layout(&mut self) {
+        let Some(index) = self.list.selected() else {
+            return;
+        };
+        let target = match self.rows.get(index) {
+            Some(TreeRow::Session {
+                host, id, title, ..
+            })
+            | Some(TreeRow::LayoutSession {
+                host, id, title, ..
+            }) => SessionTarget {
+                host: host.clone(),
+                id: *id,
+                title: title.clone(),
+            },
+            _ => {
+                self.set_message("select a session to add to a layout", true);
+                return;
+            }
+        };
+        let layouts: Vec<LayoutTarget> = self
+            .local
+            .live_layouts()
+            .into_iter()
+            .map(|layout| LayoutTarget {
+                id: layout.id,
+                name: layout.name.clone(),
+                panes: layout.panes.len(),
+            })
+            .collect();
+        if layouts.is_empty() {
+            self.set_message("no layouts yet · save one with S in the dashboard", true);
+            return;
+        }
+        self.layout_picker = Some(LayoutPicker {
+            target,
+            layouts,
+            selected: 0,
+        });
+    }
+
     /// Create in the selected project, including when one of that project's
     /// sessions currently owns the cursor.
     fn begin_new_session(&mut self) {
@@ -778,7 +1054,33 @@ impl Sidebar {
                     None
                 }
             }),
-            Some(TreeRow::Gap | TreeRow::Note(_)) | None => None,
+            Some(TreeRow::LayoutProject {
+                host, folder, name, ..
+            }) => Some((host.clone(), *folder, name.clone())),
+            Some(TreeRow::LayoutSession {
+                host,
+                folder: Some(folder),
+                ..
+            }) => self
+                .probes
+                .iter()
+                .find(|probed| probed.host.name == *host)
+                .and_then(|probed| probed.probe.as_ref())
+                .and_then(|probe| {
+                    probe
+                        .folders
+                        .iter()
+                        .find(|candidate| candidate.id == *folder)
+                })
+                .map(|project| (host.clone(), *folder, project.display_name())),
+            Some(
+                TreeRow::Layout { .. }
+                | TreeRow::LayoutSession { .. }
+                | TreeRow::Section(_)
+                | TreeRow::Gap
+                | TreeRow::Note(_),
+            )
+            | None => None,
         };
         let Some((host, folder, project)) = project else {
             self.set_message("select a project to create a session", true);
@@ -793,7 +1095,7 @@ impl Sidebar {
     }
 
     fn open_selected(&mut self) {
-        if self.starting || self.creating || self.mutating {
+        if self.starting || self.creating || self.mutating || self.restoring {
             return;
         }
         let Some(key) = self.current_key() else {
@@ -801,7 +1103,15 @@ impl Sidebar {
         };
         match key {
             TreeKey::Project(host, folder) => {
-                let key = (host, folder);
+                let key = TreeKey::Project(host, folder);
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+                self.rebuild();
+            }
+            TreeKey::Layout(id) => self.open_layout(id),
+            TreeKey::LayoutProject(layout, host, folder) => {
+                let key = TreeKey::LayoutProject(layout, host, folder);
                 if !self.collapsed.remove(&key) {
                     self.collapsed.insert(key);
                 }
@@ -828,6 +1138,65 @@ impl Sidebar {
                 });
             }
             TreeKey::Session(host, session) => self.open_named(&host, session),
+            TreeKey::LayoutSession(_, host, session, _) => {
+                self.open_named(&host, session);
+            }
+        }
+    }
+
+    fn open_layout(&mut self, id: Uuid) {
+        let Some(layout) = self
+            .local
+            .live_layouts()
+            .into_iter()
+            .find(|layout| layout.id == id)
+            .cloned()
+        else {
+            self.set_message("that layout is gone", true);
+            return;
+        };
+        let mut jobs = Vec::new();
+        for pane in &layout.panes {
+            let Some(host) = self.local.host_by_name(&pane.host).cloned() else {
+                self.set_message(format!("unknown host {}", pane.host), true);
+                return;
+            };
+            jobs.push((host, pane.session));
+        }
+        if jobs.is_empty() {
+            self.set_message("that layout has no sessions", true);
+            return;
+        }
+
+        self.restoring = true;
+        let tx = self.layout_launch_tx.clone();
+        std::thread::spawn(move || {
+            let results = jobs
+                .into_iter()
+                .map(|(host, session)| {
+                    let result =
+                        actions::start(&host, session).map_err(|error| format!("{error:#}"));
+                    (host, result)
+                })
+                .collect();
+            let _ = tx.send(LayoutLaunchResult { layout, results });
+        });
+    }
+
+    fn open_selected_standalone(&mut self) {
+        if self.starting || self.creating || self.mutating || self.restoring {
+            return;
+        }
+        match self.current_key() {
+            Some(TreeKey::Session(host, session))
+            | Some(TreeKey::LayoutSession(_, host, session, _)) => {
+                let Some(host) = self.local.host_by_name(&host).cloned() else {
+                    self.set_message(format!("unknown host {host}"), true);
+                    return;
+                };
+                self.open_with_mode(host, session, false, true);
+            }
+            _ => self.set_message("select a session to open standalone", true),
         }
     }
 
@@ -854,6 +1223,10 @@ impl Sidebar {
     }
 
     fn open_with_focus(&mut self, host: Host, session: Uuid, focus_sidebar: bool) {
+        self.open_with_mode(host, session, focus_sidebar, false);
+    }
+
+    fn open_with_mode(&mut self, host: Host, session: Uuid, focus_sidebar: bool, standalone: bool) {
         self.starting = true;
         let tx = self.launch_tx.clone();
         std::thread::spawn(move || {
@@ -861,6 +1234,7 @@ impl Sidebar {
             let _ = tx.send(LaunchResult {
                 host,
                 focus_sidebar,
+                standalone,
                 result,
             });
         });
@@ -913,6 +1287,56 @@ impl Sidebar {
                 }
             }
             _ => self.agent_picker = Some(picker),
+        }
+    }
+
+    fn handle_layout_picker(&mut self, event: Event) {
+        let Some(mut picker) = self.layout_picker.take() else {
+            return;
+        };
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Up | KeyCode::Char('k' | 'л') => {
+                    picker.selected = picker.selected.saturating_sub(1);
+                    self.layout_picker = Some(picker);
+                }
+                KeyCode::Down | KeyCode::Char('j' | 'о') => {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.layouts.len().saturating_sub(1));
+                    self.layout_picker = Some(picker);
+                }
+                KeyCode::Enter => self.add_from_layout_picker(picker),
+                _ => self.layout_picker = Some(picker),
+            },
+            _ => self.layout_picker = Some(picker),
+        }
+    }
+
+    fn add_from_layout_picker(&mut self, picker: LayoutPicker) {
+        let Some(layout) = picker.layouts.get(picker.selected) else {
+            return;
+        };
+        let pane = crate::model::PaneRef {
+            host: picker.target.host,
+            session: picker.target.id,
+        };
+        match self.local.add_layout_pane(&layout.id.to_string(), pane) {
+            Ok(changed) => match self.local.save() {
+                Ok(()) => {
+                    self.set_message(
+                        if changed {
+                            format!("added to {}", layout.name)
+                        } else {
+                            format!("already in {}", layout.name)
+                        },
+                        false,
+                    );
+                    self.rebuild();
+                }
+                Err(error) => self.set_message(format!("{error:#}"), true),
+            },
+            Err(error) => self.set_message(format!("{error:#}"), true),
         }
     }
 
@@ -1120,6 +1544,62 @@ impl Sidebar {
                     self.session_overlay = Some(SessionOverlay::RenameProject { target, value });
                 }
             },
+            SessionOverlay::RenameLayout { target, mut value } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter => self.submit_layout_rename(target, &value),
+                    KeyCode::Backspace => {
+                        value.pop();
+                        self.session_overlay = Some(SessionOverlay::RenameLayout { target, value });
+                    }
+                    KeyCode::Char(character) if value.chars().count() < 256 => {
+                        value.push(character);
+                        self.session_overlay = Some(SessionOverlay::RenameLayout { target, value });
+                    }
+                    _ => {
+                        self.session_overlay = Some(SessionOverlay::RenameLayout { target, value });
+                    }
+                },
+                Event::Paste(text) => {
+                    value.extend(
+                        text.chars()
+                            .filter(|character| !character.is_control())
+                            .take(256usize.saturating_sub(value.chars().count())),
+                    );
+                    self.session_overlay = Some(SessionOverlay::RenameLayout { target, value });
+                }
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::RenameLayout { target, value });
+                }
+            },
+            SessionOverlay::SaveLayout { mut value } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter => self.submit_save_layout(&value),
+                    KeyCode::Backspace => {
+                        value.pop();
+                        self.session_overlay = Some(SessionOverlay::SaveLayout { value });
+                    }
+                    KeyCode::Char(character) if value.chars().count() < 256 => {
+                        value.push(character);
+                        self.session_overlay = Some(SessionOverlay::SaveLayout { value });
+                    }
+                    _ => {
+                        self.session_overlay = Some(SessionOverlay::SaveLayout { value });
+                    }
+                },
+                Event::Paste(text) => {
+                    value.extend(
+                        text.chars()
+                            .filter(|character| !character.is_control())
+                            .take(256usize.saturating_sub(value.chars().count())),
+                    );
+                    self.session_overlay = Some(SessionOverlay::SaveLayout { value });
+                }
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::SaveLayout { value });
+                }
+            },
             SessionOverlay::ConfirmDelete { target } => match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
@@ -1161,6 +1641,36 @@ impl Sidebar {
                 }
                 _ => {
                     self.session_overlay = Some(SessionOverlay::ConfirmDeleteProject { target });
+                }
+            },
+            SessionOverlay::ConfirmDeleteLayout { target } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
+                        self.submit_layout_delete(target);
+                    }
+                    KeyCode::Esc | KeyCode::Char('n' | 'N' | 'т' | 'Т') => {}
+                    _ => {
+                        self.session_overlay = Some(SessionOverlay::ConfirmDeleteLayout { target });
+                    }
+                },
+                _ => {
+                    self.session_overlay = Some(SessionOverlay::ConfirmDeleteLayout { target });
+                }
+            },
+            SessionOverlay::ConfirmRemoveFromLayout { layout, target } => match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
+                        self.submit_remove_from_layout(layout, target);
+                    }
+                    KeyCode::Esc | KeyCode::Char('n' | 'N' | 'т' | 'Т') => {}
+                    _ => {
+                        self.session_overlay =
+                            Some(SessionOverlay::ConfirmRemoveFromLayout { layout, target });
+                    }
+                },
+                _ => {
+                    self.session_overlay =
+                        Some(SessionOverlay::ConfirmRemoveFromLayout { layout, target });
                 }
             },
         }
@@ -1238,6 +1748,117 @@ impl Sidebar {
             return;
         }
         self.submit_project_mutation(target, ProjectMutation::Rename(label));
+    }
+
+    fn submit_layout_rename(&mut self, target: LayoutTarget, value: &str) {
+        let name = value.trim().to_string();
+        if name.is_empty() {
+            self.set_message("layout name cannot be empty", true);
+            self.session_overlay = Some(SessionOverlay::RenameLayout {
+                target,
+                value: value.to_string(),
+            });
+            return;
+        }
+        match self.local.rename_layout(&target.id.to_string(), name) {
+            Ok(_) => match self.local.save() {
+                Ok(()) => {
+                    self.set_message("layout renamed", false);
+                    self.rebuild();
+                }
+                Err(error) => self.set_message(format!("{error:#}"), true),
+            },
+            Err(error) => self.set_message(format!("{error:#}"), true),
+        }
+    }
+
+    fn submit_save_layout(&mut self, value: &str) {
+        let name = value.trim().to_string();
+        if name.is_empty() {
+            self.set_message("layout name cannot be empty", true);
+            self.session_overlay = Some(SessionOverlay::SaveLayout {
+                value: value.to_string(),
+            });
+            return;
+        }
+        let candidates: Vec<(String, Session)> = self
+            .probes
+            .iter()
+            .filter_map(|probed| {
+                probed
+                    .probe
+                    .as_ref()
+                    .map(|probe| (probed.host.name.clone(), probe))
+            })
+            .flat_map(|(host, probe)| {
+                probe
+                    .records()
+                    .map(|session| (host.clone(), session.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let panes: Vec<crate::model::PaneRef> = actions::panes_in_work(&candidates)
+            .into_iter()
+            .map(|pane| crate::model::PaneRef {
+                host: pane.host,
+                session: pane.session,
+            })
+            .collect();
+        if panes.is_empty() {
+            self.set_message("no session panes are open", true);
+            return;
+        }
+        let count = panes.len();
+        match self
+            .local
+            .create_layout(name.clone(), panes, actions::work_layout())
+        {
+            Ok(_) => match self.local.save() {
+                Ok(()) => {
+                    self.set_message(format!("saved {name} · {count} panes"), false);
+                    self.rebuild();
+                }
+                Err(error) => self.set_message(format!("{error:#}"), true),
+            },
+            Err(error) => self.set_message(format!("{error:#}"), true),
+        }
+    }
+
+    fn submit_layout_delete(&mut self, target: LayoutTarget) {
+        self.local.remove_layout(target.id);
+        match self.local.save() {
+            Ok(()) => {
+                self.set_message(
+                    format!(
+                        "layout deleted · {} sessions were not stopped",
+                        target.panes
+                    ),
+                    false,
+                );
+                self.rebuild();
+            }
+            Err(error) => self.set_message(format!("{error:#}"), true),
+        }
+    }
+
+    fn submit_remove_from_layout(&mut self, layout: LayoutTarget, target: SessionTarget) {
+        let pane = crate::model::PaneRef {
+            host: target.host,
+            session: target.id,
+        };
+        match self.local.remove_layout_pane(&layout.id.to_string(), &pane) {
+            Ok(_) => match self.local.save() {
+                Ok(()) => {
+                    self.set_message(
+                        format!("removed from {} · session kept", layout.name),
+                        false,
+                    );
+                    self.rebuild();
+                }
+                Err(error) => self.set_message(format!("{error:#}"), true),
+            },
+            Err(error) => self.set_message(format!("{error:#}"), true),
+        }
     }
 
     fn submit_project_mutation(&mut self, target: ProjectTarget, mutation: ProjectMutation) {
@@ -1323,10 +1944,206 @@ fn selection_after_rebuild(
         .or_else(|| selectable.first().copied())
 }
 
+#[derive(Clone)]
+struct ResolvedLayoutSession {
+    host: String,
+    folder: Uuid,
+    project: String,
+    id: Uuid,
+    agent: AgentKind,
+    title: String,
+    state: State,
+}
+
+struct LayoutProjectGroup {
+    host: String,
+    folder: Uuid,
+    project: String,
+    sessions: Vec<(usize, ResolvedLayoutSession)>,
+}
+
+fn resolve_layout_session(
+    host: &str,
+    session: Uuid,
+    probes: &[HostProbe],
+) -> Option<ResolvedLayoutSession> {
+    let probe = probes
+        .iter()
+        .find(|probed| probed.host.name == host)?
+        .probe
+        .as_ref()?;
+    let view = probe
+        .sessions
+        .iter()
+        .find(|view| view.session.id == session)?;
+    let folder = probe
+        .folders
+        .iter()
+        .find(|folder| folder.id == view.session.folder_id)?;
+    Some(ResolvedLayoutSession {
+        host: host.to_string(),
+        folder: folder.id,
+        project: folder.display_name(),
+        id: session,
+        agent: view.session.agent,
+        title: view.session.title.clone(),
+        state: view.state,
+    })
+}
+
+/// A layout is shown inside a project only while every pane resolves to that
+/// same project. Adding a pane from another project therefore promotes it to
+/// the global section without changing the persisted layout record.
+fn layout_project(layout: &SavedLayout, probes: &[HostProbe]) -> Option<(String, Uuid)> {
+    let mut owner: Option<(String, Uuid)> = None;
+    for pane in &layout.panes {
+        let resolved = resolve_layout_session(&pane.host, pane.session, probes)?;
+        let candidate = (resolved.host, resolved.folder);
+        if owner.as_ref().is_some_and(|current| current != &candidate) {
+            return None;
+        }
+        owner = Some(candidate);
+    }
+    owner
+}
+
+fn append_layout(
+    rows: &mut Vec<TreeRow>,
+    layout: &SavedLayout,
+    depth: u8,
+    global: bool,
+    probes: &[HostProbe],
+    collapsed: &HashSet<TreeKey>,
+) {
+    let key = TreeKey::Layout(layout.id);
+    let is_collapsed = collapsed.contains(&key);
+    let resolved: Vec<Option<ResolvedLayoutSession>> = layout
+        .panes
+        .iter()
+        .map(|pane| resolve_layout_session(&pane.host, pane.session, probes))
+        .collect();
+    rows.push(TreeRow::Layout {
+        id: layout.id,
+        name: layout.name.clone(),
+        panes: layout.panes.len(),
+        missing: resolved.iter().filter(|session| session.is_none()).count(),
+        collapsed: is_collapsed,
+        depth,
+    });
+    if is_collapsed {
+        return;
+    }
+
+    if !global {
+        for (occurrence, (pane, session)) in
+            layout.panes.iter().zip(resolved.into_iter()).enumerate()
+        {
+            rows.push(layout_session_row(
+                layout.id,
+                pane,
+                session,
+                occurrence,
+                depth.saturating_add(1),
+            ));
+        }
+        return;
+    }
+
+    let mut groups: Vec<LayoutProjectGroup> = Vec::new();
+    let mut missing = Vec::new();
+    for (occurrence, (pane, session)) in layout.panes.iter().zip(resolved.into_iter()).enumerate() {
+        let Some(session) = session else {
+            missing.push((occurrence, pane));
+            continue;
+        };
+        let key = (session.host.clone(), session.folder);
+        match groups
+            .iter_mut()
+            .find(|group| (group.host.as_str(), group.folder) == (key.0.as_str(), key.1))
+        {
+            Some(group) => group.sessions.push((occurrence, session)),
+            None => groups.push(LayoutProjectGroup {
+                host: key.0,
+                folder: key.1,
+                project: session.project.clone(),
+                sessions: vec![(occurrence, session)],
+            }),
+        }
+    }
+
+    for group in groups {
+        let key = TreeKey::LayoutProject(layout.id, group.host.clone(), group.folder);
+        let project_collapsed = collapsed.contains(&key);
+        rows.push(TreeRow::LayoutProject {
+            layout: layout.id,
+            host: group.host,
+            folder: group.folder,
+            name: group.project,
+            collapsed: project_collapsed,
+            depth: depth.saturating_add(1),
+        });
+        if !project_collapsed {
+            rows.extend(group.sessions.into_iter().map(|(occurrence, session)| {
+                TreeRow::LayoutSession {
+                    layout: layout.id,
+                    host: session.host,
+                    id: session.id,
+                    folder: Some(session.folder),
+                    agent: Some(session.agent),
+                    title: session.title,
+                    state: session.state,
+                    missing: false,
+                    occurrence,
+                    depth: depth.saturating_add(2),
+                }
+            }));
+        }
+    }
+    rows.extend(missing.into_iter().map(|(occurrence, pane)| {
+        layout_session_row(layout.id, pane, None, occurrence, depth.saturating_add(1))
+    }));
+}
+
+fn layout_session_row(
+    layout: Uuid,
+    pane: &crate::model::PaneRef,
+    session: Option<ResolvedLayoutSession>,
+    occurrence: usize,
+    depth: u8,
+) -> TreeRow {
+    match session {
+        Some(session) => TreeRow::LayoutSession {
+            layout,
+            host: session.host,
+            id: session.id,
+            folder: Some(session.folder),
+            agent: Some(session.agent),
+            title: session.title,
+            state: session.state,
+            missing: false,
+            occurrence,
+            depth,
+        },
+        None => TreeRow::LayoutSession {
+            layout,
+            host: pane.host.clone(),
+            id: pane.session,
+            folder: None,
+            agent: None,
+            title: format!("missing {}", pane.session),
+            state: State::Down,
+            missing: true,
+            occurrence,
+            depth,
+        },
+    }
+}
+
 fn build_tree(
     hosts: &[Host],
     probes: &[HostProbe],
-    collapsed: &HashSet<(String, Uuid)>,
+    layouts: &[SavedLayout],
+    collapsed: &HashSet<TreeKey>,
     show_hidden: bool,
 ) -> Vec<TreeRow> {
     let mut rows = Vec::new();
@@ -1370,7 +2187,8 @@ fn build_tree(
             .filter(|view| view.session.folder_id == folder.id)
             .collect();
         sessions.sort_by_key(|view| view.session.created_at);
-        let is_collapsed = collapsed.contains(&(host.name.clone(), folder.id));
+        let project_key = TreeKey::Project(host.name.clone(), folder.id);
+        let is_collapsed = collapsed.contains(&project_key);
         rows.push(TreeRow::Project {
             host: host.name.clone(),
             folder: folder.id,
@@ -1390,18 +2208,38 @@ fn build_tree(
                 folder: folder.id,
                 project: folder.display_name(),
             });
+            for layout in layouts.iter().filter(|layout| {
+                layout_project(layout, probes).as_ref() == Some(&(host.name.clone(), folder.id))
+            }) {
+                append_layout(&mut rows, layout, 1, false, probes, collapsed);
+            }
             rows.extend(sessions.into_iter().map(|view| TreeRow::Session {
                 host: host.name.clone(),
                 id: view.session.id,
                 agent: view.session.agent,
                 title: view.session.title.clone(),
                 state: view.state,
+                depth: 1,
             }));
         }
     }
     rows.extend(unavailable);
+
+    let global: Vec<_> = layouts
+        .iter()
+        .filter(|layout| layout_project(layout, probes).is_none())
+        .collect();
+    if !global.is_empty() {
+        if !rows.is_empty() {
+            rows.push(TreeRow::Gap);
+        }
+        rows.push(TreeRow::Section("LAYOUTS".into()));
+        for layout in global {
+            append_layout(&mut rows, layout, 0, true, probes, collapsed);
+        }
+    }
     if rows.is_empty() {
-        rows.push(TreeRow::Note("no marked projects".into()));
+        rows.push(TreeRow::Note("no marked projects or layouts".into()));
     }
     rows
 }
@@ -1430,6 +2268,8 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
 
     let activity = if sidebar.mutating {
         "  saving…"
+    } else if sidebar.restoring {
+        "  restoring layout…"
     } else if sidebar.creating {
         "  creating…"
     } else if sidebar.starting {
@@ -1459,6 +2299,8 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
     let width = usize::from(body.width.saturating_sub(4));
     if let Some(overlay) = &sidebar.session_overlay {
         draw_session_overlay(frame, body, overlay);
+    } else if let Some(picker) = &sidebar.layout_picker {
+        draw_layout_picker(frame, body, picker);
     } else if let Some(picker) = &sidebar.agent_picker {
         draw_agent_picker(frame, body, picker);
     } else {
@@ -1491,7 +2333,7 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
             },
         )),
         None => Line::from(Span::styled(
-            " p pin  H hide  v hidden  d delete",
+            " enter open  S save  a add  o standalone  d remove",
             Style::default().fg(DIM).bg(SURFACE),
         )),
     };
@@ -1584,6 +2426,34 @@ fn draw_session_overlay(
             Line::styled("  Folder path stays unchanged", Style::default().fg(DIM)),
             Line::styled("  Enter save · Esc cancel", Style::default().fg(DIM)),
         ],
+        SessionOverlay::RenameLayout { target, value } => vec![
+            Line::styled(
+                format!("  Layout {}", util::one_line(&target.name, 18)),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Line::from(vec![
+                Span::styled("  Name: ", Style::default().fg(DIM)),
+                Span::styled(
+                    util::one_line(value, usize::from(area.width.saturating_sub(8))),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::styled("  Enter save · Esc cancel", Style::default().fg(DIM)),
+        ],
+        SessionOverlay::SaveLayout { value } => vec![
+            Line::styled(
+                "  Save current workspace",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Line::from(vec![
+                Span::styled("  Name: ", Style::default().fg(DIM)),
+                Span::styled(
+                    util::one_line(value, usize::from(area.width.saturating_sub(8))),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::styled("  Enter save · Esc cancel", Style::default().fg(DIM)),
+        ],
         SessionOverlay::ConfirmDelete { target } => vec![
             Line::styled(
                 format!("  Delete {}?", util::one_line(&target.title, 19)),
@@ -1608,6 +2478,41 @@ fn draw_session_overlay(
             Line::from(vec![
                 Span::styled(
                     "  [Y] Delete ",
+                    Style::default().fg(BG).bg(RED).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" [N] Cancel "),
+            ]),
+        ],
+        SessionOverlay::ConfirmDeleteLayout { target } => vec![
+            Line::styled(
+                format!("  Delete {}?", util::one_line(&target.name, 19)),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!("  Its {} sessions keep running.", target.panes),
+                Style::default().fg(DIM),
+            ),
+            Line::from(vec![
+                Span::styled(
+                    "  [Y] Delete ",
+                    Style::default().fg(BG).bg(RED).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" [N] Cancel "),
+            ]),
+        ],
+        SessionOverlay::ConfirmRemoveFromLayout { layout, target } => vec![
+            Line::styled(
+                format!("  Remove {}?", util::one_line(&target.title, 19)),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!("  From {} only.", util::one_line(&layout.name, 21)),
+                Style::default().fg(DIM),
+            ),
+            Line::styled("  The session keeps running.", Style::default().fg(DIM)),
+            Line::from(vec![
+                Span::styled(
+                    "  [Y] Remove ",
                     Style::default().fg(BG).bg(RED).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" [N] Cancel "),
@@ -1679,6 +2584,7 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             agent,
             title,
             state,
+            depth,
         } => {
             let is_active = active
                 .is_some_and(|(active_host, active_id)| active_host == host && active_id == id);
@@ -1688,8 +2594,12 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
                 AgentKind::Codex => "🤖",
                 AgentKind::Shell => "💻",
             };
-            let title = util::one_line(title, width.saturating_sub(10).max(1));
-            let label = format!("  {active_marker} {} {agent} {title}", state_symbol(*state));
+            let indent = tree_indent(*depth);
+            let title = util::one_line(title, width.saturating_sub(indent.len() + 8).max(1));
+            let label = format!(
+                "{indent}{active_marker} {} {agent} {title}",
+                state_symbol(*state)
+            );
             let style = if is_active {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
@@ -1701,12 +2611,149 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             "  + new session",
             Style::default().fg(ACCENT),
         ))),
+        TreeRow::Layout {
+            name,
+            panes,
+            missing,
+            collapsed,
+            depth,
+            ..
+        } => {
+            let indent = tree_indent(*depth);
+            let suffix = format!(
+                "  {panes}{}",
+                if *missing > 0 {
+                    format!(" · {missing} missing")
+                } else {
+                    String::new()
+                }
+            );
+            let available = width.saturating_sub(indent.len() + suffix.chars().count() + 4);
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{indent}{} ▦ {}",
+                        if *collapsed { "▸" } else { "▾" },
+                        util::one_line(name, available.max(1))
+                    ),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    suffix,
+                    if *missing > 0 {
+                        Style::default().fg(RED)
+                    } else {
+                        Style::default().fg(DIM)
+                    },
+                ),
+            ]))
+        }
+        TreeRow::LayoutProject {
+            host,
+            name,
+            collapsed,
+            depth,
+            ..
+        } => {
+            let indent = tree_indent(*depth);
+            let remote = if host == "local" {
+                String::new()
+            } else {
+                format!(" @{host}")
+            };
+            let available = width.saturating_sub(indent.len() + remote.chars().count() + 3);
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{indent}{} {}",
+                        if *collapsed { "▸" } else { "▾" },
+                        util::one_line(name, available.max(1))
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(remote, Style::default().fg(DIM)),
+            ]))
+        }
+        TreeRow::LayoutSession {
+            host,
+            id,
+            agent,
+            title,
+            state,
+            missing,
+            depth,
+            ..
+        } => {
+            let is_active = active
+                .is_some_and(|(active_host, active_id)| active_host == host && active_id == id);
+            let active_marker = if is_active { "›" } else { "↳" };
+            let agent = match agent {
+                Some(AgentKind::Claude) => "🧠",
+                Some(AgentKind::Codex) => "🤖",
+                Some(AgentKind::Shell) => "💻",
+                None => "?",
+            };
+            let indent = tree_indent(*depth);
+            let title = util::one_line(title, width.saturating_sub(indent.len() + 8).max(1));
+            let label = format!(
+                "{indent}{active_marker} {} {agent} {title}",
+                state_symbol(*state)
+            );
+            let style = if *missing {
+                Style::default().fg(RED)
+            } else if is_active {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                state_style(*state)
+            };
+            ListItem::new(Line::from(Span::styled(label, style)))
+        }
+        TreeRow::Section(title) => ListItem::new(Line::from(Span::styled(
+            format!(" {title}"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))),
         TreeRow::Gap => ListItem::new(Line::default()),
         TreeRow::Note(text) => ListItem::new(Line::from(Span::styled(
             util::one_line(text, width.max(1)),
             Style::default().fg(DIM),
         ))),
     }
+}
+
+fn tree_indent(depth: u8) -> String {
+    "  ".repeat(usize::from(depth))
+}
+
+fn draw_layout_picker(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    picker: &LayoutPicker,
+) {
+    let mut lines = vec![Line::styled(
+        format!("  Add {}", util::one_line(&picker.target.title, 20)),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    for (index, layout) in picker.layouts.iter().enumerate() {
+        lines.push(Line::styled(
+            format!("  ▦ {}  {}", util::one_line(&layout.name, 18), layout.panes),
+            if picker.selected == index {
+                Style::default()
+                    .fg(BG)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(FG).bg(BG)
+            },
+        ));
+    }
+    lines.push(Line::styled(
+        "  Enter add · Esc cancel",
+        Style::default().fg(DIM),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(FG).bg(BG)),
+        area,
+    );
 }
 
 fn draw_agent_picker(
@@ -1766,7 +2813,7 @@ fn state_symbol(state: State) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Folder, Probe, Session};
+    use crate::model::{Folder, Layout as SavedLayout, PaneRef, Probe, Session};
     use crate::reconcile::SessionView;
 
     fn session_row(id: Uuid, title: &str) -> TreeRow {
@@ -1776,6 +2823,7 @@ mod tests {
             agent: AgentKind::Codex,
             title: title.into(),
             state: State::Down,
+            depth: 1,
         }
     }
 
@@ -1855,6 +2903,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 title: "first".into(),
                 state: State::Working,
+                depth: 1,
             },
             TreeRow::Session {
                 host: "server".into(),
@@ -1862,6 +2911,7 @@ mod tests {
                 agent: AgentKind::Claude,
                 title: "active".into(),
                 state: State::Working,
+                depth: 1,
             },
         ];
 
@@ -1912,6 +2962,7 @@ mod tests {
         let rows = build_tree(
             std::slice::from_ref(&host),
             std::slice::from_ref(&probe),
+            &[],
             &HashSet::new(),
             false,
         );
@@ -1932,7 +2983,7 @@ mod tests {
             TreeRow::Session { title, .. } if title == "session 2"
         ));
 
-        let collapsed = HashSet::from([(
+        let collapsed = HashSet::from([TreeKey::Project(
             "local".to_string(),
             match &rows[0] {
                 TreeRow::Project { folder, .. } => *folder,
@@ -1942,6 +2993,7 @@ mod tests {
         let folded = build_tree(
             std::slice::from_ref(&host),
             std::slice::from_ref(&probe),
+            &[],
             &collapsed,
             false,
         );
@@ -1953,6 +3005,114 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn project_layouts_are_inline_and_cross_project_layouts_form_a_global_tree() {
+        let local = Host::new("local".into(), None);
+        let back = Host::new("back".into(), Some("back.example".into()));
+        let payments = Folder::new("/work/payments".into());
+        let frontend = Folder::new("/work/frontend".into());
+        let api = Session::new(payments.id, AgentKind::Codex, "deploy API".into());
+        let tests = Session::new(payments.id, AgentKind::Claude, "smoke tests".into());
+        let build = Session::new(frontend.id, AgentKind::Codex, "production build".into());
+        let probes = vec![
+            HostProbe {
+                host: local.clone(),
+                probe: Some(Probe {
+                    folders: vec![payments.clone()],
+                    sessions: vec![
+                        SessionView {
+                            session: api.clone(),
+                            state: State::Working,
+                            preview: None,
+                            attention: None,
+                        },
+                        SessionView {
+                            session: tests.clone(),
+                            state: State::NeedsYou,
+                            preview: None,
+                            attention: None,
+                        },
+                    ],
+                    ..Probe::default()
+                }),
+                error: None,
+            },
+            HostProbe {
+                host: back.clone(),
+                probe: Some(Probe {
+                    folders: vec![frontend],
+                    sessions: vec![SessionView {
+                        session: build.clone(),
+                        state: State::Up,
+                        preview: None,
+                        attention: None,
+                    }],
+                    ..Probe::default()
+                }),
+                error: None,
+            },
+        ];
+        let project_layout = SavedLayout::new(
+            "release prep".into(),
+            vec![
+                PaneRef {
+                    host: "local".into(),
+                    session: api.id,
+                },
+                PaneRef {
+                    host: "local".into(),
+                    session: tests.id,
+                },
+            ],
+            None,
+        );
+        let global_layout = SavedLayout::new(
+            "production release".into(),
+            vec![
+                PaneRef {
+                    host: "local".into(),
+                    session: api.id,
+                },
+                PaneRef {
+                    host: "back".into(),
+                    session: build.id,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(
+            layout_project(&project_layout, &probes),
+            Some(("local".into(), payments.id))
+        );
+        assert_eq!(layout_project(&global_layout, &probes), None);
+
+        let rows = build_tree(
+            &[local, back],
+            &probes,
+            &[project_layout, global_layout],
+            &HashSet::new(),
+            false,
+        );
+        assert!(rows.iter().any(
+            |row| matches!(row, TreeRow::Layout { name, depth: 1, .. } if name == "release prep")
+        ));
+        let section = rows
+            .iter()
+            .position(|row| matches!(row, TreeRow::Section(title) if title == "LAYOUTS"))
+            .expect("global layouts section");
+        assert!(rows[section + 1..].iter().any(
+            |row| matches!(row, TreeRow::Layout { name, depth: 0, .. } if name == "production release")
+        ));
+        assert_eq!(
+            rows[section + 1..]
+                .iter()
+                .filter(|row| matches!(row, TreeRow::LayoutProject { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1975,6 +3135,7 @@ mod tests {
         let visible = build_tree(
             std::slice::from_ref(&host),
             std::slice::from_ref(&probe),
+            &[],
             &HashSet::new(),
             false,
         );
@@ -1996,6 +3157,7 @@ mod tests {
         let with_hidden = build_tree(
             std::slice::from_ref(&host),
             std::slice::from_ref(&probe),
+            &[],
             &HashSet::new(),
             true,
         );

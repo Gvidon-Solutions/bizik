@@ -21,7 +21,7 @@ question unless the user asks for the complete list.
 | `H` | Hide or restore a project |
 | `v` | Show or hide hidden projects |
 | `w` | Jump to the sidebar workspace |
-| `S` | Save the active workspace as a layout |
+| `S` | Save the active workspace and exact pane geometry as a layout |
 | `i` | Install bizik on the selected host |
 | `r` | Refresh immediately |
 | `?` | Show built-in key help |
@@ -39,11 +39,16 @@ question unless the user asks for the complete list.
 | `j` / `k` | Move in the sidebar |
 | `h` / `l` | Collapse or move to parent / expand or open |
 | `n` | Create a session |
+| `a` | Add the selected session to an existing layout |
+| `o` | Open the selected session standalone; other viewers close, agents keep running |
+| `S` | Save the current multi-pane workspace as a layout |
+| `d` / `Delete` | On a nested layout session, remove only its reference |
 | tmux prefix, then `z` | Zoom active agent pane and restore |
 | tmux prefix, then `0` | Return to the dashboard window |
 
 Russian-layout equivalents in the sidebar are `о`/`л` for `j`/`k`,
-`р`/`д` for `h`/`l`, `у` for `e`, `т` for `n`, and `в` for `d`.
+`р`/`д` for `h`/`l`, `у` for `e`, `т` for `n`, `ф` for `a`, `щ` for `o`,
+and `в` for `d`.
 
 ## Overrides
 

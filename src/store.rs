@@ -409,6 +409,96 @@ impl LocalStore {
             .collect()
     }
 
+    /// Resolve a layout by UUID or by an unambiguous exact name.
+    pub fn layout(&self, selector: &str) -> Result<&Layout> {
+        let index = self.layout_index(selector)?;
+        Ok(&self.layouts[index])
+    }
+
+    pub fn create_layout(
+        &mut self,
+        name: String,
+        panes: Vec<crate::model::PaneRef>,
+        tmux_layout: Option<String>,
+    ) -> Result<Uuid> {
+        validate_text("layout name", &name, 256, false)?;
+        if self.live_layouts().iter().any(|layout| layout.name == name) {
+            anyhow::bail!("a layout named “{name}” already exists");
+        }
+        let layout = Layout::new(name, panes, tmux_layout);
+        let id = layout.id;
+        self.layouts.push(layout);
+        Ok(id)
+    }
+
+    pub fn rename_layout(&mut self, selector: &str, name: String) -> Result<Uuid> {
+        validate_text("layout name", &name, 256, false)?;
+        let index = self.layout_index(selector)?;
+        if self.layouts.iter().enumerate().any(|(candidate, layout)| {
+            candidate != index && layout.deleted_at.is_none() && layout.name == name
+        }) {
+            anyhow::bail!("a layout named “{name}” already exists");
+        }
+        let layout = &mut self.layouts[index];
+        layout.name = name;
+        layout.updated_at = now_ms();
+        Ok(layout.id)
+    }
+
+    pub fn add_layout_pane(&mut self, selector: &str, pane: crate::model::PaneRef) -> Result<bool> {
+        validate_host_name(&pane.host)?;
+        let index = self.layout_index(selector)?;
+        let layout = &mut self.layouts[index];
+        if layout.panes.contains(&pane) {
+            return Ok(false);
+        }
+        layout.panes.push(pane);
+        // Membership changed, so the old exact geometry no longer matches the
+        // number of panes. The next save captures a fresh one.
+        layout.tmux_layout = None;
+        layout.updated_at = now_ms();
+        Ok(true)
+    }
+
+    pub fn remove_layout_pane(
+        &mut self,
+        selector: &str,
+        pane: &crate::model::PaneRef,
+    ) -> Result<bool> {
+        let index = self.layout_index(selector)?;
+        let layout = &mut self.layouts[index];
+        let before = layout.panes.len();
+        layout.panes.retain(|candidate| candidate != pane);
+        if layout.panes.len() == before {
+            return Ok(false);
+        }
+        layout.tmux_layout = None;
+        layout.updated_at = now_ms();
+        Ok(true)
+    }
+
+    fn layout_index(&self, selector: &str) -> Result<usize> {
+        if let Ok(id) = selector.parse::<Uuid>() {
+            return self
+                .layouts
+                .iter()
+                .position(|layout| layout.id == id && layout.deleted_at.is_none())
+                .with_context(|| format!("no layout with id {id}"));
+        }
+        let matches: Vec<usize> = self
+            .layouts
+            .iter()
+            .enumerate()
+            .filter(|(_, layout)| layout.deleted_at.is_none() && layout.name == selector)
+            .map(|(index, _)| index)
+            .collect();
+        match matches.as_slice() {
+            [index] => Ok(*index),
+            [] => anyhow::bail!("no layout named “{selector}”"),
+            _ => anyhow::bail!("more than one layout is named “{selector}”; use its UUID instead"),
+        }
+    }
+
     pub fn host_by_name(&self, name: &str) -> Option<&Host> {
         self.hosts
             .iter()
@@ -889,5 +979,52 @@ mod tests {
             1,
             "a second UUID would break old layouts"
         );
+    }
+
+    #[test]
+    fn layout_membership_changes_invalidate_geometry_without_touching_sessions() {
+        let mut store = LocalStore::default();
+        let first = crate::model::PaneRef {
+            host: "local".into(),
+            session: Uuid::new_v4(),
+        };
+        let second = crate::model::PaneRef {
+            host: "back".into(),
+            session: Uuid::new_v4(),
+        };
+        let id = store
+            .create_layout(
+                "release".into(),
+                vec![first.clone()],
+                Some("saved geometry".into()),
+            )
+            .unwrap();
+
+        assert!(store.add_layout_pane("release", second.clone()).unwrap());
+        assert!(!store.add_layout_pane("release", second.clone()).unwrap());
+        let layout = store.layout(&id.to_string()).unwrap();
+        assert_eq!(layout.panes, vec![first.clone(), second.clone()]);
+        assert_eq!(layout.tmux_layout, None);
+
+        assert!(store.remove_layout_pane("release", &first).unwrap());
+        assert!(!store.remove_layout_pane("release", &first).unwrap());
+        assert_eq!(store.layout("release").unwrap().panes, vec![second]);
+    }
+
+    #[test]
+    fn layout_names_are_unambiguous_for_cli_operations() {
+        let mut store = LocalStore::default();
+        store
+            .create_layout("focus".into(), Vec::new(), None)
+            .unwrap();
+        assert!(
+            store
+                .create_layout("focus".into(), Vec::new(), None)
+                .is_err()
+        );
+        store
+            .create_layout("release".into(), Vec::new(), None)
+            .unwrap();
+        assert!(store.rename_layout("release", "focus".into()).is_err());
     }
 }

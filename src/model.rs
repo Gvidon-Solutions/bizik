@@ -194,7 +194,7 @@ impl Host {
 /// The host is referenced by *logical name*, not by ssh target — so a layout
 /// stays valid when a server changes address, and can be handed to someone else
 /// who has a host of the same name.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PaneRef {
     pub host: String,
     pub session: Uuid,
