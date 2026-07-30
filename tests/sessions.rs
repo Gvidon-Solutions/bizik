@@ -382,6 +382,93 @@ fn opening_a_layout_builds_multiple_viewers_beside_one_sidebar() {
 }
 
 #[test]
+fn opening_legacy_viewer_geometry_keeps_a_full_height_sidebar_and_grid() {
+    // Layouts saved before the sidebar existed describe only their viewer
+    // panes. Replaying that four-pane string against four viewers plus the new
+    // sidebar used to fail and silently fall back to one vertical stack.
+    let s = Sandbox::new("legacy-layout-geometry");
+    let folder = s.mark(&s.dir("project"));
+    let sessions: Vec<_> = (1..=4)
+        .map(|index| s.new_session(&folder, &format!("pane {index}")))
+        .collect();
+    let mut create = vec!["layout", "create", "legacy-grid"];
+    let pane_args: Vec<_> = sessions
+        .iter()
+        .map(|session| format!("local:{session}"))
+        .collect();
+    for pane in &pane_args {
+        create.extend(["--pane", pane]);
+    }
+    s.bzk(&create).ok();
+
+    // Ask tmux itself for a valid legacy 2x2 layout string on this private
+    // socket, then remove the disposable session before bizik opens.
+    s.tmux(&["new-session", "-d", "-s", "legacy-shape", "sleep 60"]);
+    for _ in 0..3 {
+        s.tmux(&["split-window", "-t", "legacy-shape", "sleep 60"]);
+    }
+    s.tmux(&["select-layout", "-t", "legacy-shape", "tiled"]);
+    let geometry = s
+        .tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            "legacy-shape",
+            "#{window_layout}",
+        ])
+        .trim()
+        .to_string();
+    s.tmux(&["kill-session", "-t", "legacy-shape"]);
+
+    let local_path = s.root.join("config/local.json");
+    let mut local: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&local_path).unwrap()).unwrap();
+    local["layouts"][0]["tmux_layout"] = serde_json::Value::String(geometry);
+    std::fs::write(&local_path, serde_json::to_vec_pretty(&local).unwrap()).unwrap();
+
+    s.bzk(&["layout", "open", "legacy-grid"]).ok();
+    s.eventually("the legacy layout viewers to open", || {
+        workspace_viewer_sessions(&s).len() == 4
+    });
+
+    let window_height: u16 = s
+        .tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            "bizik:bzk-work",
+            "#{window_height}",
+        ])
+        .trim()
+        .parse()
+        .unwrap();
+    let panes = s.tmux(&[
+        "list-panes",
+        "-t",
+        "bizik:bzk-work",
+        "-F",
+        "#{@bzk_role}\t#{pane_left}\t#{pane_top}\t#{pane_height}",
+    ]);
+    let mut viewer_left = std::collections::HashSet::new();
+    let mut viewer_top = std::collections::HashSet::new();
+    let mut sidebar_height = None;
+    for line in panes.lines() {
+        let columns: Vec<_> = line.split('\t').collect();
+        match columns.as_slice() {
+            ["sidebar", _, _, height] => sidebar_height = height.parse().ok(),
+            ["viewer", left, top, _] => {
+                viewer_left.insert(*left);
+                viewer_top.insert(*top);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(sidebar_height, Some(window_height));
+    assert_eq!(viewer_left.len(), 2, "viewers should keep two columns");
+    assert_eq!(viewer_top.len(), 2, "viewers should keep two rows");
+}
+
+#[test]
 fn compact_session_commands_cover_the_local_lifecycle_and_current_session() {
     let s = Sandbox::new("session-cli");
     let folder = s.mark(&s.dir("project"));

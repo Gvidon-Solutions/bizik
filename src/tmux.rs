@@ -413,6 +413,7 @@ pub fn split_window_left(pane: &str, width: u16, cmd: &str) -> Result<String> {
     let out = tmux(&[
         "split-window",
         "-b",
+        "-f",
         "-h",
         "-l",
         &width,
@@ -439,6 +440,30 @@ pub fn split_window_right(pane: &str, cmd: &str) -> Result<String> {
         cmd,
     ])?;
     Ok(out.trim().to_string())
+}
+
+/// Move a pane into its own detached window without stopping its process.
+pub fn break_pane(pane: &str) -> Result<()> {
+    tmux(&["break-pane", "-d", "-s", pane]).map(|_| ())
+}
+
+/// Reattach an existing pane as a full-height column to the left of a target.
+pub fn join_pane_left_full_height(pane: &str, target: &str, width: u16) -> Result<()> {
+    let width = width.to_string();
+    tmux(&[
+        "join-pane",
+        "-b",
+        "-d",
+        "-f",
+        "-h",
+        "-l",
+        &width,
+        "-s",
+        pane,
+        "-t",
+        target,
+    ])
+    .map(|_| ())
 }
 
 /// Split one viewer pane and return the new pane id.

@@ -560,9 +560,39 @@ pub fn identify_pane(
 /// Apply an exact saved geometry, including its sidebar/viewer split.
 pub fn apply_geometry(geometry: &str) -> Result<()> {
     let window = work_window().context("the pane window is gone")?;
-    tmux::select_layout(&window, geometry)?;
+    if tmux::select_layout(&window, geometry).is_err() {
+        apply_legacy_geometry(&window, geometry)?;
+    }
     remember_current_sidebar_width(&window);
     Ok(())
+}
+
+/// Replay geometry saved before the workspace had a sidebar.
+///
+/// A legacy layout describes only its viewer panes, while the current window
+/// contains those viewers plus one sidebar. tmux refuses a layout string whose
+/// pane count differs. Move the existing sidebar pane aside without stopping
+/// its process, replay the old geometry, then join that same pane back as a
+/// full-height column. If the geometry is invalid for another reason, the
+/// sidebar is still rejoined before the error reaches the caller's tiled
+/// fallback.
+fn apply_legacy_geometry(window: &str, geometry: &str) -> Result<()> {
+    let panes = tmux::window_panes(window)?;
+    let sidebar = panes
+        .iter()
+        .find(|pane| pane.role.as_deref() == Some(SIDEBAR_ROLE))
+        .context("saved geometry does not fit the current panes")?;
+    let viewer = panes
+        .iter()
+        .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
+        .context("the workspace has no viewer pane")?;
+    let width = tmux::pane_width(&sidebar.pane).unwrap_or_else(|| remembered_sidebar_width(window));
+
+    tmux::break_pane(&sidebar.pane)?;
+    let applied = tmux::select_layout(window, geometry);
+    tmux::join_pane_left_full_height(&sidebar.pane, &viewer.pane, width)
+        .context("restoring the sidebar after applying saved geometry")?;
+    applied
 }
 
 pub fn tile() {
