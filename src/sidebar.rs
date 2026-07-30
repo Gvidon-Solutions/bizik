@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::io::stdout;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use crate::hostops::SpawnResult;
@@ -100,6 +101,7 @@ enum TreeRow {
         title: String,
         state: State,
         missing: bool,
+        last: bool,
         occurrence: usize,
         depth: u8,
     },
@@ -2068,6 +2070,7 @@ fn append_layout(
     }
 
     if !global {
+        let last = layout.panes.len().saturating_sub(1);
         for (occurrence, (pane, session)) in
             layout.panes.iter().zip(resolved.into_iter()).enumerate()
         {
@@ -2077,6 +2080,7 @@ fn append_layout(
                 session,
                 occurrence,
                 depth.saturating_add(1),
+                occurrence == last,
             ));
         }
         return;
@@ -2104,6 +2108,8 @@ fn append_layout(
         }
     }
 
+    let layout_children = groups.len() + missing.len();
+    let mut child_index = 0usize;
     for group in groups {
         let key = TreeKey::LayoutProject(layout.id, group.host.clone(), group.folder);
         let project_collapsed = collapsed.contains(&key);
@@ -2115,9 +2121,11 @@ fn append_layout(
             collapsed: project_collapsed,
             depth: depth.saturating_add(1),
         });
+        child_index += 1;
         if !project_collapsed {
-            rows.extend(group.sessions.into_iter().map(|(occurrence, session)| {
-                TreeRow::LayoutSession {
+            let last = group.sessions.len().saturating_sub(1);
+            rows.extend(group.sessions.into_iter().enumerate().map(
+                |(index, (occurrence, session))| TreeRow::LayoutSession {
                     layout: layout.id,
                     host: session.host,
                     id: session.id,
@@ -2126,14 +2134,24 @@ fn append_layout(
                     title: session.title,
                     state: session.state,
                     missing: false,
+                    last: index == last,
                     occurrence,
                     depth: depth.saturating_add(2),
-                }
-            }));
+                },
+            ));
         }
     }
     rows.extend(missing.into_iter().map(|(occurrence, pane)| {
-        layout_session_row(layout.id, pane, None, occurrence, depth.saturating_add(1))
+        let last = child_index + 1 == layout_children;
+        child_index += 1;
+        layout_session_row(
+            layout.id,
+            pane,
+            None,
+            occurrence,
+            depth.saturating_add(1),
+            last,
+        )
     }));
 }
 
@@ -2143,6 +2161,7 @@ fn layout_session_row(
     session: Option<ResolvedLayoutSession>,
     occurrence: usize,
     depth: u8,
+    last: bool,
 ) -> TreeRow {
     match session {
         Some(session) => TreeRow::LayoutSession {
@@ -2154,6 +2173,7 @@ fn layout_session_row(
             title: session.title,
             state: session.state,
             missing: false,
+            last,
             occurrence,
             depth,
         },
@@ -2166,6 +2186,7 @@ fn layout_session_row(
             title: format!("missing {}", pane.session),
             state: State::Down,
             missing: true,
+            last,
             occurrence,
             depth,
         },
@@ -2363,7 +2384,7 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
         let items: Vec<ListItem> = sidebar
             .rows
             .iter()
-            .map(|row| render_row(row, width, sidebar.active.as_ref()))
+            .map(|row| render_row(row, width))
             .collect();
         let list = List::new(items)
             .style(Style::default().fg(FG).bg(BG))
@@ -2595,11 +2616,7 @@ fn menu_line(label: &str, selected: bool) -> Line<'static> {
     )
 }
 
-fn render_row(
-    row: &TreeRow,
-    width: usize,
-    active: Option<&actions::ActiveWorkspace>,
-) -> ListItem<'static> {
+fn render_row(row: &TreeRow, width: usize) -> ListItem<'static> {
     match row {
         TreeRow::Project {
             host,
@@ -2639,41 +2656,20 @@ fn render_row(
             ]))
         }
         TreeRow::Session {
-            host,
-            id,
             agent,
             title,
             state,
             depth,
+            ..
         } => {
-            let is_active = active.is_some_and(|active| {
-                active.layout.is_none() && active.host == *host && active.session == *id
-            });
-            let active_marker = if is_active { "›" } else { " " };
-            let agent = match agent {
-                AgentKind::Claude => "🧠",
-                AgentKind::Codex => "🤖",
-                AgentKind::Shell => "💻",
-            };
-            let indent = tree_indent(*depth);
-            let title = util::one_line(title, width.saturating_sub(indent.len() + 8).max(1));
-            let label = format!(
-                "{indent}{active_marker} {} {agent} {title}",
-                state_symbol(*state)
-            );
-            let style = if is_active {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                state_style(*state)
-            };
-            ListItem::new(Line::from(Span::styled(label, style)))
+            let label = session_label(*depth, None, *state, Some(*agent), title, width);
+            ListItem::new(Line::from(Span::styled(label, state_style(*state))))
         }
         TreeRow::NewSession { .. } => ListItem::new(Line::from(Span::styled(
             "  + new session",
             Style::default().fg(ACCENT),
         ))),
         TreeRow::Layout {
-            id,
             name,
             panes,
             missing,
@@ -2681,7 +2677,6 @@ fn render_row(
             depth,
             ..
         } => {
-            let is_active = active.is_some_and(|active| active.layout == Some(*id));
             let indent = tree_indent(*depth);
             let suffix = format!(
                 "  {panes}{}",
@@ -2691,18 +2686,15 @@ fn render_row(
                     String::new()
                 }
             );
-            let available = width.saturating_sub(indent.len() + suffix.chars().count() + 6);
+            let available = width.saturating_sub(indent.len() + suffix.chars().count() + 4);
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!(
-                        "{indent}{} {} ▦ {}",
-                        if is_active { "●" } else { " " },
+                        "{indent}{} ▦ {}",
                         if *collapsed { "▸" } else { "▾" },
                         util::one_line(name, available.max(1))
                     ),
-                    Style::default()
-                        .fg(if is_active { ACCENT } else { FG })
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(FG).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     suffix,
@@ -2741,36 +2733,17 @@ fn render_row(
             ]))
         }
         TreeRow::LayoutSession {
-            layout,
-            host,
-            id,
             agent,
             title,
             state,
             missing,
+            last,
             depth,
             ..
         } => {
-            let is_active = active.is_some_and(|active| {
-                active.layout == Some(*layout) && active.host == *host && active.session == *id
-            });
-            let active_marker = if is_active { "›" } else { "↳" };
-            let agent = match agent {
-                Some(AgentKind::Claude) => "🧠",
-                Some(AgentKind::Codex) => "🤖",
-                Some(AgentKind::Shell) => "💻",
-                None => "?",
-            };
-            let indent = tree_indent(*depth);
-            let title = util::one_line(title, width.saturating_sub(indent.len() + 8).max(1));
-            let label = format!(
-                "{indent}{active_marker} {} {agent} {title}",
-                state_symbol(*state)
-            );
+            let label = session_label(*depth, Some(*last), *state, *agent, title, width);
             let style = if *missing {
                 Style::default().fg(RED)
-            } else if is_active {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 state_style(*state)
             };
@@ -2790,6 +2763,34 @@ fn render_row(
 
 fn tree_indent(depth: u8) -> String {
     "  ".repeat(usize::from(depth))
+}
+
+fn session_label(
+    depth: u8,
+    last: Option<bool>,
+    state: State,
+    agent: Option<AgentKind>,
+    title: &str,
+    width: usize,
+) -> String {
+    let agent = match agent {
+        Some(AgentKind::Claude) => "🧠",
+        Some(AgentKind::Codex) => "🤖",
+        Some(AgentKind::Shell) => "💻",
+        None => "?",
+    };
+    let agent_width = UnicodeWidthStr::width(agent);
+    let agent_cell = format!("{agent}{}", " ".repeat(2usize.saturating_sub(agent_width)));
+    let indent = tree_indent(depth);
+    let prefix = match last {
+        Some(true) => format!("{indent}└─ {} {agent_cell} ", state_symbol(state)),
+        Some(false) => format!("{indent}├─ {} {agent_cell} ", state_symbol(state)),
+        None => format!("{indent}  {} {agent_cell} ", state_symbol(state)),
+    };
+    let available = width
+        .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
+        .max(1);
+    format!("{prefix}{}", util::one_line(title, available))
 }
 
 fn draw_layout_picker(
@@ -2982,6 +2983,7 @@ mod tests {
                 title: "active in layout".into(),
                 state: State::Working,
                 missing: false,
+                last: true,
                 occurrence: 0,
                 depth: 2,
             },
@@ -3029,6 +3031,43 @@ mod tests {
             None
         );
         assert_eq!(active_session_selection(&rows, None), None);
+    }
+
+    #[test]
+    fn session_labels_use_tree_connectors_without_extra_active_markers() {
+        assert_eq!(
+            session_label(
+                2,
+                Some(false),
+                State::Done,
+                Some(AgentKind::Codex),
+                "first",
+                80,
+            ),
+            "    ├─ ✓ 🤖 first"
+        );
+        assert_eq!(
+            session_label(
+                2,
+                Some(true),
+                State::Done,
+                Some(AgentKind::Codex),
+                "last",
+                80,
+            ),
+            "    └─ ✓ 🤖 last"
+        );
+        assert_eq!(
+            session_label(
+                1,
+                None,
+                State::Done,
+                Some(AgentKind::Codex),
+                "standalone",
+                80,
+            ),
+            "    ✓ 🤖 standalone"
+        );
     }
 
     #[test]
