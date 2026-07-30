@@ -768,11 +768,8 @@ impl Sidebar {
         match row.key() {
             Some(
                 key @ (TreeKey::Project(..) | TreeKey::Layout(..) | TreeKey::LayoutProject(..)),
-            ) => {
-                if self.collapsed.insert(key) {
-                    self.rebuild();
-                }
-            }
+            ) if self.collapsed.insert(key.clone()) => self.rebuild(),
+            Some(TreeKey::Project(..) | TreeKey::Layout(..) | TreeKey::LayoutProject(..)) => {}
             Some(_) => {
                 let Some(depth) = row.depth() else {
                     return;
@@ -2071,9 +2068,7 @@ fn append_layout(
 
     if !global {
         let last = layout.panes.len().saturating_sub(1);
-        for (occurrence, (pane, session)) in
-            layout.panes.iter().zip(resolved.into_iter()).enumerate()
-        {
+        for (occurrence, (pane, session)) in layout.panes.iter().zip(resolved).enumerate() {
             rows.push(layout_session_row(
                 layout.id,
                 pane,
@@ -2088,7 +2083,7 @@ fn append_layout(
 
     let mut groups: Vec<LayoutProjectGroup> = Vec::new();
     let mut missing = Vec::new();
-    for (occurrence, (pane, session)) in layout.panes.iter().zip(resolved.into_iter()).enumerate() {
+    for (occurrence, (pane, session)) in layout.panes.iter().zip(resolved).enumerate() {
         let Some(session) = session else {
             missing.push((occurrence, pane));
             continue;
