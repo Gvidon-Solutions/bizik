@@ -246,6 +246,12 @@ so replacing viewers never stops work. An explicit dashboard multi-selection
 can still open an ad-hoc group; press `S` in the sidebar or dashboard to save
 that exact arrangement.
 
+The sidebar keeps navigation and workspace state visually separate. A lavender
+row is the cursor you are moving; `●` marks the active layout, and `›` marks
+the session currently focused inside that layout. In standalone mode only the
+ordinary session row receives `›`, even when the same session also belongs to
+a saved layout.
+
 A layout whose sessions all belong to one project appears directly inside that
 project, beside its standalone sessions. A layout containing several projects
 appears in the global `LAYOUTS` tree below all projects and groups references

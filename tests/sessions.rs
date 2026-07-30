@@ -380,12 +380,35 @@ fn opening_a_regular_session_replaces_the_active_layout() {
     s.eventually("the layout viewers to open", || {
         workspace_viewer_sessions(&s).len() == 2
     });
+    let active_layout = s.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        "bizik:bzk-work",
+        "#{@bzk_active_layout}",
+    ]);
+    assert!(
+        !active_layout.trim().is_empty(),
+        "opening a layout must tag the workspace with its identity"
+    );
 
     s.bzk(&["view", "--host", "local", "--session", &standalone])
         .ok();
     s.eventually("the standalone viewer to replace the layout", || {
         workspace_viewer_sessions(&s) == vec![standalone.clone()]
     });
+    assert_eq!(
+        s.tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            "bizik:bzk-work",
+            "#{@bzk_active_layout}",
+        ])
+        .trim(),
+        "",
+        "opening a standalone session must clear the active layout identity"
+    );
 
     let tmux_sessions = s.tmux_sessions();
     for session in [&first, &second, &standalone] {

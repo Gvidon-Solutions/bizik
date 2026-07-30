@@ -290,7 +290,7 @@ struct Sidebar {
     probes: Vec<HostProbe>,
     rows: Vec<TreeRow>,
     list: ListState,
-    active: Option<(String, Uuid)>,
+    active: Option<actions::ActiveWorkspace>,
     focused: bool,
     collapsed: HashSet<TreeKey>,
     show_hidden: bool,
@@ -341,12 +341,13 @@ impl Sidebar {
         let (mutation_tx, mutation_rx) = channel();
         let (project_mutation_tx, project_mutation_rx) = channel();
         let now = Instant::now();
+        let active = normalized_active_workspace(&local);
         let mut sidebar = Self {
             local,
             probes: Vec::new(),
             rows: vec![TreeRow::Note("loading…".into())],
             list: ListState::default(),
-            active: actions::active_session(),
+            active,
             focused: tmux::current_pane_active(),
             collapsed: HashSet::new(),
             show_hidden: false,
@@ -379,7 +380,7 @@ impl Sidebar {
 
     fn main_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
-            self.active = actions::active_session();
+            self.active = normalized_active_workspace(&self.local);
             self.follow_active_session();
             terminal.draw(|frame| draw(frame, self))?;
 
@@ -533,6 +534,12 @@ impl Sidebar {
                     {
                         actions::tile();
                     }
+                    let active_layout = actions::workspace_has_exact_panes(&batch.layout.panes)
+                        .then_some(batch.layout.id);
+                    if let Err(error) = actions::set_active_layout(active_layout) {
+                        failed += 1;
+                        self.set_message(format!("{error:#}"), true);
+                    }
                     if let Some((host, session)) = &batch.focus {
                         let _ = actions::focus_open_session(host, *session);
                     } else {
@@ -573,8 +580,8 @@ impl Sidebar {
                             Mutation::Delete { was_active } => {
                                 was_active
                                     || self.active.as_ref().is_some_and(|active| {
-                                        active.0 == mutation.target.host
-                                            && active.1 == mutation.target.id
+                                        active.host == mutation.target.host
+                                            && active.session == mutation.target.id
                                     })
                             }
                         };
@@ -669,9 +676,10 @@ impl Sidebar {
             .selected()
             .and_then(|selected| selectable_position(&self.rows, selected));
         let selected = self.current_key().or_else(|| {
-            self.active
-                .clone()
-                .map(|(host, session)| TreeKey::Session(host, session))
+            self.active.clone().map(|active| match active.layout {
+                Some(layout) => TreeKey::LayoutSession(layout, active.host, active.session, 0),
+                None => TreeKey::Session(active.host, active.session),
+            })
         });
         self.rows = build_tree(
             &self.hosts(),
@@ -1920,7 +1928,7 @@ impl Sidebar {
         let was_active = self
             .active
             .as_ref()
-            .is_some_and(|active| active.0 == target.host && active.1 == target.id);
+            .is_some_and(|active| active.host == target.host && active.session == target.id);
         self.mutating = true;
         let tx = self.mutation_tx.clone();
         std::thread::spawn(move || {
@@ -2269,10 +2277,33 @@ fn build_tree(
     rows
 }
 
-fn active_session_selection(rows: &[TreeRow], active: Option<&(String, Uuid)>) -> Option<usize> {
+fn normalized_active_workspace(local: &LocalStore) -> Option<actions::ActiveWorkspace> {
+    let mut active = actions::active_workspace()?;
+    if active.layout.is_some_and(|id| {
+        !local
+            .live_layouts()
+            .into_iter()
+            .any(|layout| layout.id == id)
+    }) {
+        active.layout = None;
+    }
+    Some(active)
+}
+
+fn active_session_selection(
+    rows: &[TreeRow],
+    active: Option<&actions::ActiveWorkspace>,
+) -> Option<usize> {
     let active = active?;
-    let key = TreeKey::Session(active.0.clone(), active.1);
-    rows.iter().position(|row| row.matches_key(&key))
+    rows.iter().position(|row| match row {
+        TreeRow::Session { host, id, .. } => {
+            active.layout.is_none() && active.host == *host && active.session == *id
+        }
+        TreeRow::LayoutSession {
+            layout, host, id, ..
+        } => active.layout == Some(*layout) && active.host == *host && active.session == *id,
+        _ => false,
+    })
 }
 
 fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
@@ -2564,7 +2595,11 @@ fn menu_line(label: &str, selected: bool) -> Line<'static> {
     )
 }
 
-fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> ListItem<'static> {
+fn render_row(
+    row: &TreeRow,
+    width: usize,
+    active: Option<&actions::ActiveWorkspace>,
+) -> ListItem<'static> {
     match row {
         TreeRow::Project {
             host,
@@ -2611,8 +2646,9 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             state,
             depth,
         } => {
-            let is_active = active
-                .is_some_and(|(active_host, active_id)| active_host == host && active_id == id);
+            let is_active = active.is_some_and(|active| {
+                active.layout.is_none() && active.host == *host && active.session == *id
+            });
             let active_marker = if is_active { "›" } else { " " };
             let agent = match agent {
                 AgentKind::Claude => "🧠",
@@ -2637,6 +2673,7 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             Style::default().fg(ACCENT),
         ))),
         TreeRow::Layout {
+            id,
             name,
             panes,
             missing,
@@ -2644,6 +2681,7 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             depth,
             ..
         } => {
+            let is_active = active.is_some_and(|active| active.layout == Some(*id));
             let indent = tree_indent(*depth);
             let suffix = format!(
                 "  {panes}{}",
@@ -2653,15 +2691,18 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
                     String::new()
                 }
             );
-            let available = width.saturating_sub(indent.len() + suffix.chars().count() + 4);
+            let available = width.saturating_sub(indent.len() + suffix.chars().count() + 6);
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!(
-                        "{indent}{} ▦ {}",
+                        "{indent}{} {} ▦ {}",
+                        if is_active { "●" } else { " " },
                         if *collapsed { "▸" } else { "▾" },
                         util::one_line(name, available.max(1))
                     ),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(if is_active { ACCENT } else { FG })
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     suffix,
@@ -2700,6 +2741,7 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             ]))
         }
         TreeRow::LayoutSession {
+            layout,
             host,
             id,
             agent,
@@ -2709,8 +2751,9 @@ fn render_row(row: &TreeRow, width: usize, active: Option<&(String, Uuid)>) -> L
             depth,
             ..
         } => {
-            let is_active = active
-                .is_some_and(|(active_host, active_id)| active_host == host && active_id == id);
+            let is_active = active.is_some_and(|active| {
+                active.layout == Some(*layout) && active.host == *host && active.session == *id
+            });
             let active_marker = if is_active { "›" } else { "↳" };
             let agent = match agent {
                 Some(AgentKind::Claude) => "🧠",
@@ -2917,35 +2960,72 @@ mod tests {
     }
 
     #[test]
-    fn inactive_sidebar_selection_only_points_at_the_viewer_session() {
-        let first = Uuid::new_v4();
+    fn inactive_sidebar_selection_follows_layout_or_standalone_context() {
+        let layout = Uuid::new_v4();
         let active = Uuid::new_v4();
         let rows = vec![
             TreeRow::Note("offline".into()),
-            TreeRow::Session {
-                host: "local".into(),
-                id: first,
-                agent: AgentKind::Codex,
-                title: "first".into(),
-                state: State::Working,
+            TreeRow::Layout {
+                id: layout,
+                name: "workspace".into(),
+                panes: 1,
+                missing: 0,
+                collapsed: false,
                 depth: 1,
+            },
+            TreeRow::LayoutSession {
+                layout,
+                host: "server".into(),
+                id: active,
+                folder: None,
+                agent: Some(AgentKind::Claude),
+                title: "active in layout".into(),
+                state: State::Working,
+                missing: false,
+                occurrence: 0,
+                depth: 2,
             },
             TreeRow::Session {
                 host: "server".into(),
                 id: active,
                 agent: AgentKind::Claude,
-                title: "active".into(),
+                title: "active standalone".into(),
                 state: State::Working,
                 depth: 1,
             },
         ];
 
         assert_eq!(
-            active_session_selection(&rows, Some(&("server".into(), active))),
+            active_session_selection(
+                &rows,
+                Some(&actions::ActiveWorkspace {
+                    host: "server".into(),
+                    session: active,
+                    layout: Some(layout),
+                }),
+            ),
             Some(2)
         );
         assert_eq!(
-            active_session_selection(&rows, Some(&("local".into(), active))),
+            active_session_selection(
+                &rows,
+                Some(&actions::ActiveWorkspace {
+                    host: "server".into(),
+                    session: active,
+                    layout: None,
+                }),
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            active_session_selection(
+                &rows,
+                Some(&actions::ActiveWorkspace {
+                    host: "local".into(),
+                    session: active,
+                    layout: Some(layout),
+                }),
+            ),
             None
         );
         assert_eq!(active_session_selection(&rows, None), None);

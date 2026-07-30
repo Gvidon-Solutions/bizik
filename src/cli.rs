@@ -813,6 +813,7 @@ fn cmd_layout_open(selector: &str) -> Result<()> {
     for (host, result) in &spawned {
         tui::actions::open_pane(host, result.session.id, &result.tmux_name)?;
     }
+    tui::actions::set_active_layout(Some(layout.id))?;
     if layout
         .tmux_layout
         .as_deref()

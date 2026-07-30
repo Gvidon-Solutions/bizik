@@ -38,6 +38,8 @@ const TOAST_FOR: Duration = Duration::from_secs(6);
 /// A finished round of session starts, handed back from the worker thread.
 struct LaunchBatch {
     background: bool,
+    /// Saved layout owning this batch; `None` means standalone/ad-hoc viewers.
+    layout: Option<Uuid>,
     /// Geometry to replay once the panes are open, for a layout restore.
     geometry: Option<String>,
     /// Layout name, when this batch came from a restore.
@@ -347,7 +349,7 @@ impl App {
             self.error(format!("unknown host {host_name}"));
             return;
         };
-        self.spawn_batch(vec![(host, session)], background, None, None);
+        self.spawn_batch(vec![(host, session)], background, None, None, None);
     }
 
     /// Start sessions off the drawing thread.
@@ -361,6 +363,7 @@ impl App {
         &mut self,
         jobs: Vec<(Host, Uuid)>,
         background: bool,
+        layout: Option<Uuid>,
         geometry: Option<String>,
         label: Option<String>,
     ) {
@@ -392,6 +395,7 @@ impl App {
                 });
             let _ = tx.send(LaunchBatch {
                 background,
+                layout,
                 geometry,
                 label,
                 results,
@@ -446,6 +450,10 @@ impl App {
         }
 
         if !batch.background && opened > 0 {
+            if let Err(error) = actions::set_active_layout(batch.layout) {
+                failed += 1;
+                self.error(format!("{error:#}"));
+            }
             match &batch.geometry {
                 Some(geometry) => {
                     if actions::apply_geometry(geometry).is_err() {
@@ -520,7 +528,7 @@ impl App {
             }
         }
         self.state.selected.clear();
-        self.spawn_batch(jobs, background, None, None);
+        self.spawn_batch(jobs, background, None, None, None);
     }
 
     /// Restore a saved arrangement.
@@ -552,6 +560,7 @@ impl App {
         self.spawn_batch(
             jobs,
             false,
+            Some(layout.id),
             layout.tmux_layout.clone(),
             Some(layout.name.clone()),
         );

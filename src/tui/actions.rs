@@ -196,6 +196,7 @@ fn create_work_window(cmd: &str) -> Result<String> {
 /// "standalone" escape hatch from a busy layout.
 pub fn open_standalone(host: &Host, session: Uuid, tmux_name: &str) -> Result<String> {
     if let Some(window) = work_window() {
+        tmux::set_window_option(&window, tmux::OPT_LAYOUT, "")?;
         for pane in tmux::window_panes(&window)? {
             if pane.role.as_deref() == Some(VIEWER_ROLE)
                 && !(pane.session.as_deref() == Some(&session.to_string())
@@ -206,6 +207,27 @@ pub fn open_standalone(host: &Host, session: Uuid, tmux_name: &str) -> Result<St
         }
     }
     open_pane(host, session, tmux_name)
+}
+
+/// Record which saved layout owns the visible workspace.
+///
+/// An empty value means ordinary standalone or ad-hoc viewers. Keeping this on
+/// the tmux window lets a restarted sidebar distinguish duplicate session rows
+/// without guessing from pane membership.
+pub fn set_active_layout(layout: Option<Uuid>) -> Result<()> {
+    let window = work_window().context("the workspace is not open yet")?;
+    tmux::set_window_option(
+        &window,
+        tmux::OPT_LAYOUT,
+        &layout.map_or_else(String::new, |id| id.to_string()),
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveWorkspace {
+    pub host: String,
+    pub session: Uuid,
+    pub layout: Option<Uuid>,
 }
 
 /// Focus an existing viewer without changing the workspace composition.
@@ -447,10 +469,10 @@ pub fn focus_work() -> Result<()> {
 }
 
 /// Session currently occupying the focused viewer pane.
-pub fn active_session() -> Option<(String, Uuid)> {
+pub fn active_workspace() -> Option<ActiveWorkspace> {
     let window = work_window()?;
     let panes = tmux::window_panes(&window).ok()?;
-    panes
+    let pane = panes
         .iter()
         .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE) && pane.active)
         .or_else(|| {
@@ -462,8 +484,12 @@ pub fn active_session() -> Option<(String, Uuid)> {
             panes
                 .iter()
                 .find(|pane| pane.role.as_deref() == Some(VIEWER_ROLE))
-        })
-        .and_then(|pane| Some((pane.host.clone()?, pane.session.as_deref()?.parse().ok()?)))
+        })?;
+    Some(ActiveWorkspace {
+        host: pane.host.clone()?,
+        session: pane.session.as_deref()?.parse().ok()?,
+        layout: pane.layout.as_deref().and_then(|id| id.parse().ok()),
+    })
 }
 
 /// Geometry of the whole workspace, including the stable sidebar pane.
@@ -612,6 +638,7 @@ mod tests {
             session: None,
             host: None,
             role: Some(role.into()),
+            layout: None,
             active: false,
             last: false,
             start_command: String::new(),
@@ -624,6 +651,7 @@ mod tests {
             session: tag.map(str::to_string),
             host: tag.map(|_| "back".to_string()),
             role: Some(VIEWER_ROLE.into()),
+            layout: None,
             active: false,
             last: false,
             start_command: command.to_string(),

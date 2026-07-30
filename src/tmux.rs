@@ -33,6 +33,8 @@ pub const OPT_SESSION: &str = "@bzk_session";
 pub const OPT_HOST: &str = "@bzk_host";
 /// User option distinguishing the persistent sidebar from the active viewer.
 pub const OPT_ROLE: &str = "@bzk_role";
+/// Window option identifying the saved layout currently owning the workspace.
+pub const OPT_LAYOUT: &str = "@bzk_active_layout";
 
 // ---------------------------------------------------------------------------
 // Targets
@@ -699,6 +701,7 @@ pub struct PaneInfo {
     pub session: Option<String>,
     pub host: Option<String>,
     pub role: Option<String>,
+    pub layout: Option<String>,
     pub active: bool,
     pub last: bool,
     /// What the pane was started with. Only needed to recognise panes opened
@@ -714,13 +717,13 @@ pub struct PaneInfo {
 /// guessing at it.
 pub fn panes_of_window_anywhere(name: &str) -> Result<Vec<PaneInfo>> {
     let fmt = format!(
-        "#{{window_name}}\t#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{pane_active}}\t#{{pane_last}}\t#{{pane_start_command}}"
+        "#{{window_name}}\t#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{{OPT_LAYOUT}}}\t#{{pane_active}}\t#{{pane_last}}\t#{{pane_start_command}}"
     );
     let raw = tmux(&["list-panes", "-a", "-F", &fmt])?;
     Ok(raw
         .lines()
         .filter_map(|l| {
-            let mut parts = l.splitn(8, '\t');
+            let mut parts = l.splitn(9, '\t');
             if parts.next()? != name {
                 return None;
             }
@@ -731,10 +734,10 @@ pub fn panes_of_window_anywhere(name: &str) -> Result<Vec<PaneInfo>> {
 
 pub fn window_panes(window: &str) -> Result<Vec<PaneInfo>> {
     let fmt = format!(
-        "#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{pane_active}}\t#{{pane_last}}\t#{{pane_start_command}}"
+        "#{{pane_id}}\t#{{{OPT_SESSION}}}\t#{{{OPT_HOST}}}\t#{{{OPT_ROLE}}}\t#{{{OPT_LAYOUT}}}\t#{{pane_active}}\t#{{pane_last}}\t#{{pane_start_command}}"
     );
     let raw = tmux(&["list-panes", "-t", window, "-F", &fmt])?;
-    Ok(raw.lines().map(|l| parse_pane(l.splitn(7, '\t'))).collect())
+    Ok(raw.lines().map(|l| parse_pane(l.splitn(8, '\t'))).collect())
 }
 
 /// The command is last and taken whole: `splitn` keeps a tab inside it from
@@ -746,6 +749,7 @@ fn parse_pane<'a>(mut parts: impl Iterator<Item = &'a str>) -> PaneInfo {
         session: clean(parts.next()),
         host: clean(parts.next()),
         role: clean(parts.next()),
+        layout: clean(parts.next()),
         active: parts.next().is_some_and(|value| value == "1"),
         last: parts.next().is_some_and(|value| value == "1"),
         start_command: parts.next().unwrap_or_default().to_string(),
@@ -840,11 +844,14 @@ mod tests {
         // The command is the last field and may itself contain a tab. Splitting
         // on every tab would read part of it as another column and silently
         // mis-describe the pane.
-        let info = parse_pane("%3\tabc-123\tback\tviewer\t1\t0\tssh host\t-t 'x'".splitn(7, '\t'));
+        let info = parse_pane(
+            "%3\tabc-123\tback\tviewer\tlayout-456\t1\t0\tssh host\t-t 'x'".splitn(8, '\t'),
+        );
         assert_eq!(info.pane, "%3");
         assert_eq!(info.session.as_deref(), Some("abc-123"));
         assert_eq!(info.host.as_deref(), Some("back"));
         assert_eq!(info.role.as_deref(), Some("viewer"));
+        assert_eq!(info.layout.as_deref(), Some("layout-456"));
         assert!(info.active);
         assert!(!info.last);
         assert_eq!(info.start_command, "ssh host\t-t 'x'");
@@ -855,13 +862,14 @@ mod tests {
         // tmux prints an unset user option as an empty field, and older tmux
         // prints `0`. Either must read as "no tag", or a pane from an older
         // build looks tagged with nonsense.
-        let empty = parse_pane("%1\t\t\t\t0\t0\tzsh".splitn(7, '\t'));
+        let empty = parse_pane("%1\t\t\t\t\t0\t0\tzsh".splitn(8, '\t'));
         assert_eq!(empty.session, None);
         assert_eq!(empty.host, None);
         assert_eq!(empty.role, None);
+        assert_eq!(empty.layout, None);
         assert_eq!(empty.start_command, "zsh");
 
-        let zero = parse_pane("%1\t0\t0\t0\t0\t0\tzsh".splitn(7, '\t'));
+        let zero = parse_pane("%1\t0\t0\t0\t0\t0\t0\tzsh".splitn(8, '\t'));
         assert_eq!(zero.session, None);
     }
 
