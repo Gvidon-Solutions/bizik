@@ -2636,7 +2636,7 @@ fn render_row(row: &TreeRow, width: usize) -> ListItem<'static> {
                 Span::styled(
                     format!(
                         "{} {}{}{}",
-                        if *collapsed { "▸" } else { "▾" },
+                        disclosure_symbol(*collapsed),
                         if *pinned { "📌 " } else { "" },
                         util::one_line(name, available.max(1)),
                         if *hidden { "  hidden" } else { "" }
@@ -2690,7 +2690,7 @@ fn render_row(row: &TreeRow, width: usize) -> ListItem<'static> {
                 Span::styled(
                     format!(
                         "{indent}{} {}",
-                        if *collapsed { "▸" } else { "▾" },
+                        disclosure_symbol(*collapsed),
                         util::one_line(name, available.max(1))
                     ),
                     Style::default().fg(FG).add_modifier(Modifier::BOLD),
@@ -2723,7 +2723,7 @@ fn render_row(row: &TreeRow, width: usize) -> ListItem<'static> {
                 Span::styled(
                     format!(
                         "{indent}{} {}",
-                        if *collapsed { "▸" } else { "▾" },
+                        disclosure_symbol(*collapsed),
                         util::one_line(name, available.max(1))
                     ),
                     Style::default().add_modifier(Modifier::BOLD),
@@ -2762,6 +2762,10 @@ fn render_row(row: &TreeRow, width: usize) -> ListItem<'static> {
 
 fn tree_indent(depth: u8) -> String {
     "  ".repeat(usize::from(depth))
+}
+
+fn disclosure_symbol(collapsed: bool) -> &'static str {
+    if collapsed { "›" } else { "⌄" }
 }
 
 fn session_label(
@@ -3071,6 +3075,14 @@ mod tests {
             ),
             "  ✓ 🤖 standalone"
         );
+    }
+
+    #[test]
+    fn disclosure_chevrons_share_one_cell() {
+        assert_eq!(disclosure_symbol(true), "›");
+        assert_eq!(disclosure_symbol(false), "⌄");
+        assert_eq!(UnicodeWidthStr::width(disclosure_symbol(true)), 1);
+        assert_eq!(UnicodeWidthStr::width(disclosure_symbol(false)), 1);
     }
 
     #[test]
