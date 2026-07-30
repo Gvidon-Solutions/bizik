@@ -272,6 +272,7 @@ impl Sidebar {
     fn main_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             self.active = actions::active_session();
+            self.follow_active_session();
             terminal.draw(|frame| draw(frame, self))?;
 
             if event::poll(Duration::from_millis(150))? {
@@ -512,6 +513,17 @@ impl Sidebar {
             .selected()
             .and_then(|index| self.rows.get(index))
             .and_then(TreeRow::key)
+    }
+
+    /// Outside the sidebar, its cursor represents what the viewer is showing.
+    /// Once focus returns, navigation is deliberately independent again so the
+    /// user can browse the tree without moving the active session.
+    fn follow_active_session(&mut self) {
+        if self.focused {
+            return;
+        }
+        self.list
+            .select(active_session_selection(&self.rows, self.active.as_ref()));
     }
 
     fn row_at(&self, mouse_row: u16) -> usize {
@@ -1394,6 +1406,12 @@ fn build_tree(
     rows
 }
 
+fn active_session_selection(rows: &[TreeRow], active: Option<&(String, Uuid)>) -> Option<usize> {
+    let active = active?;
+    let key = TreeKey::Session(active.0.clone(), active.1);
+    rows.iter().position(|row| row.matches_key(&key))
+}
+
 fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
     // Clear first, then paint every cell. This prevents remnants of the
     // previous tmux client from surviving a resize or session switch.
@@ -1823,6 +1841,39 @@ mod tests {
                 .bg(SELECTED)
                 .add_modifier(Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn inactive_sidebar_selection_only_points_at_the_viewer_session() {
+        let first = Uuid::new_v4();
+        let active = Uuid::new_v4();
+        let rows = vec![
+            TreeRow::Note("offline".into()),
+            TreeRow::Session {
+                host: "local".into(),
+                id: first,
+                agent: AgentKind::Codex,
+                title: "first".into(),
+                state: State::Working,
+            },
+            TreeRow::Session {
+                host: "server".into(),
+                id: active,
+                agent: AgentKind::Claude,
+                title: "active".into(),
+                state: State::Working,
+            },
+        ];
+
+        assert_eq!(
+            active_session_selection(&rows, Some(&("server".into(), active))),
+            Some(2)
+        );
+        assert_eq!(
+            active_session_selection(&rows, Some(&("local".into(), active))),
+            None
+        );
+        assert_eq!(active_session_selection(&rows, None), None);
     }
 
     #[test]

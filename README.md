@@ -268,8 +268,9 @@ physical keys work in Russian layout: `о`/`л` and `р`/`д`. `e` (`у`) change
 project's display label or renames a session without touching its directory;
 `n` (`т`) creates a session, `p` pins a project, `H` hides or restores it, and
 `v` reveals hidden projects. `d` (`в`) deletes the selected project or session
-after confirmation. Arrow keys and `Enter` work too. `prefix z` zooms the
-active agent to the whole window and back.
+after confirmation. Arrow keys and `Enter` work too. While the sidebar is not
+focused, its highlighted row follows the session shown in the active viewer.
+`prefix z` zooms the active agent to the whole window and back.
 
 The workspace and attached agent sessions hide tmux's own status bars: the
 sidebar already shows the project, session, agent and state, so duplicated
