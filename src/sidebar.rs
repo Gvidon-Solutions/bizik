@@ -2373,7 +2373,7 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
         header,
     );
 
-    let width = usize::from(body.width.saturating_sub(4));
+    let width = usize::from(body.width.saturating_sub(2));
     if let Some(overlay) = &sidebar.session_overlay {
         draw_session_overlay(frame, body, overlay);
     } else if let Some(picker) = &sidebar.layout_picker {
@@ -2388,8 +2388,7 @@ fn draw(frame: &mut ratatui::Frame, sidebar: &mut Sidebar) {
             .collect();
         let list = List::new(items)
             .style(Style::default().fg(FG).bg(BG))
-            .highlight_symbol("  ")
-            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_spacing(HighlightSpacing::Never)
             .highlight_style(selection_style(sidebar.focused));
         frame.render_stateful_widget(list, body, &mut sidebar.list);
     }
@@ -2686,11 +2685,11 @@ fn render_row(row: &TreeRow, width: usize) -> ListItem<'static> {
                     String::new()
                 }
             );
-            let available = width.saturating_sub(indent.len() + suffix.chars().count() + 4);
+            let available = width.saturating_sub(indent.len() + suffix.chars().count() + 2);
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!(
-                        "{indent}{} ▦ {}",
+                        "{indent}{} {}",
                         if *collapsed { "▸" } else { "▾" },
                         util::one_line(name, available.max(1))
                     ),
@@ -2781,11 +2780,15 @@ fn session_label(
     };
     let agent_width = UnicodeWidthStr::width(agent);
     let agent_cell = format!("{agent}{}", " ".repeat(2usize.saturating_sub(agent_width)));
-    let indent = tree_indent(depth);
+    let indent = tree_indent(if last.is_some() {
+        depth.saturating_sub(1)
+    } else {
+        depth
+    });
     let prefix = match last {
         Some(true) => format!("{indent}└─ {} {agent_cell} ", state_symbol(state)),
         Some(false) => format!("{indent}├─ {} {agent_cell} ", state_symbol(state)),
-        None => format!("{indent}  {} {agent_cell} ", state_symbol(state)),
+        None => format!("{indent}{} {agent_cell} ", state_symbol(state)),
     };
     let available = width
         .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
@@ -3044,7 +3047,7 @@ mod tests {
                 "first",
                 80,
             ),
-            "    ├─ ✓ 🤖 first"
+            "  ├─ ✓ 🤖 first"
         );
         assert_eq!(
             session_label(
@@ -3055,7 +3058,7 @@ mod tests {
                 "last",
                 80,
             ),
-            "    └─ ✓ 🤖 last"
+            "  └─ ✓ 🤖 last"
         );
         assert_eq!(
             session_label(
@@ -3066,7 +3069,7 @@ mod tests {
                 "standalone",
                 80,
             ),
-            "    ✓ 🤖 standalone"
+            "  ✓ 🤖 standalone"
         );
     }
 

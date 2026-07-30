@@ -247,9 +247,10 @@ can still open an ad-hoc group; press `S` in the sidebar or dashboard to save
 that exact arrangement.
 
 The sidebar uses the highlighted row as the only active-selection indicator.
-Standard `├─`/`└─` connectors show which sessions belong to a layout, while
-fixed status, agent and title columns keep both layout and standalone rows
-aligned.
+A layout's disclosure triangle is its only header icon, and `├─`/`└─`
+connectors align beneath it to show which sessions belong to the layout. The
+tree starts flush at the sidebar's left edge; fixed status, agent and title
+columns keep both layout and standalone rows aligned.
 
 A layout whose sessions all belong to one project appears directly inside that
 project, beside its standalone sessions. A layout containing several projects
