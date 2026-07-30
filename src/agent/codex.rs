@@ -30,7 +30,7 @@ use crate::util::{
 
 pub struct CodexAgent;
 
-const DEFAULT_THEME: &str = "catppuccin-latte";
+const DEFAULT_THEME: &str = "github";
 
 fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME").map_or_else(|| home().join(".codex"), PathBuf::from)
@@ -49,8 +49,10 @@ fn session_index_path() -> PathBuf {
 /// terminal background query has nobody to answer it and Codex falls back to a
 /// dark code/diff palette even when the eventual viewer is light.
 ///
-/// Respect an explicit Codex theme. Otherwise provide the light counterpart to
-/// bizik's own fixed light workspace. The environment knob is useful for
+/// Respect an explicit Codex theme. Otherwise use a light theme that defines
+/// its own inserted/deleted backgrounds. Merely selecting a light syntax
+/// palette is not enough: when OSC background detection fails, Codex otherwise
+/// applies its dark fallback to diffs. The environment knob is useful for
 /// one-off launches and `inherit` restores Codex's automatic choice.
 fn launch_theme() -> Option<String> {
     let requested = std::env::var("BIZIK_CODEX_THEME").ok();
@@ -453,11 +455,8 @@ mod tests {
     }
 
     #[test]
-    fn detached_launch_defaults_to_a_light_syntax_theme() {
-        assert_eq!(
-            choose_theme(false, None).as_deref(),
-            Some("catppuccin-latte")
-        );
+    fn detached_launch_defaults_to_a_light_diff_capable_theme() {
+        assert_eq!(choose_theme(false, None).as_deref(), Some("github"));
     }
 
     #[test]

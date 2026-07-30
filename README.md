@@ -280,9 +280,10 @@ compact legacy label inside agent panes if you prefer it.
 Codex chooses its code and diff colours when it starts. A background agent
 starts before a terminal is attached, so there is no terminal to report a light
 background; when `tui.theme` is not already set in Codex's config, bizik supplies
-the light `catppuccin-latte` syntax theme. Pick and persist another one with
-Codex's `/theme`, or use `BIZIK_CODEX_THEME=<theme-name>` on the host that starts
-the agent. `BIZIK_CODEX_THEME=inherit` leaves detection entirely to Codex.
+the light `github` syntax theme, whose own diff backgrounds avoid Codex's dark
+fallback. Pick and persist another one with Codex's `/theme`, or use
+`BIZIK_CODEX_THEME=<theme-name>` on the host that starts the agent.
+`BIZIK_CODEX_THEME=inherit` leaves detection entirely to Codex.
 
 The mouse is enabled for bizik's own tmux session only — clicking a pane selects
 it and the wheel scrolls its history, while every other session on your tmux
