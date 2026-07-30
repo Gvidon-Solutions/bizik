@@ -40,12 +40,30 @@ for an operation, run it through completion and keep the user informed.
 - **Explain:** answer in the user's language with the relevant keys or commands.
 - **Inspect or diagnose:** begin with read-only checks and use actual output as
   evidence. Do not repair unless the request includes repair or execution.
-- **Create or launch:** perform preflight, create or reuse the exact directory,
-  register it with bizik, configure visibility hooks when appropriate, create
-  the requested Codex/Claude/shell session, start it, and verify its state.
+- **Create or launch:** use the fast path below for an already marked local
+  project and an explicit agent. Otherwise perform the full preflight, create
+  or reuse the exact directory, register it with bizik, configure visibility
+  hooks when appropriate, create the requested Codex/Claude/shell session,
+  start it, and verify its state.
 - **Monitor:** keep polling at a reasonable interval, report state changes and
   questions from the agent, and yield control when user input is needed. A
   running session is progress, not completion.
+
+## FAST PATH: launch in an existing local project
+
+Use this path when all three conditions hold: the host is local, the project is
+already marked, and the user explicitly chose `codex`, `claude`, or `shell`.
+
+1. Reuse the folder UUID if it is already known; otherwise get it with
+   `bzk marks --json`.
+2. Run `bzk new-session` for that folder and agent, parse the returned session
+   ID, then run `bzk spawn`.
+3. Run `bzk probe --json --preview` exactly once to verify the result.
+
+Do not run `bzk doctor`, `bzk hooks status`, `bzk host ls`, `bzk env capture`,
+any `--help`, or extra probes on this path. Use targeted recovery after an
+actual error, or the full preflight when the user separately asks for
+diagnostics.
 
 Finish with a compact handoff: host, path, bizik project label, session/agent,
 current state, and the command or key that returns the user to it.

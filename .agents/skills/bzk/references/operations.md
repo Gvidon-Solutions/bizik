@@ -34,7 +34,42 @@ bzk rm-session --session UUID
 `new-session` prints the session record as JSON. Extract its `id` from JSON and
 pass it to `spawn`; never scrape the human dashboard.
 
-## Preflight
+## FAST PATH: existing marked local project
+
+Use this path only when the host is local, the project is already marked, and
+the user explicitly requested `codex`, `claude`, or `shell`. Do not perform the
+full preflight.
+
+1. Reuse a folder UUID already established in the current context. If it is not
+   known, make the only discovery call:
+
+   ```sh
+   bzk marks --json
+   ```
+
+2. Create the session, parse its JSON `id`, and spawn it locally:
+
+   ```sh
+   bzk new-session --folder FOLDER_UUID --agent AGENT --title TITLE
+   bzk spawn --session SESSION_UUID --host-label local
+   ```
+
+3. Verify once:
+
+   ```sh
+   bzk probe --json --preview
+   ```
+
+Do not run `bzk doctor`, `bzk hooks status`, `bzk host ls`, `bzk env capture`,
+`bzk --help`, subcommand help, or repeated probes on this path. An actual error
+may justify a targeted check; switch to full diagnostics only for recovery or
+when the user asks for it.
+
+## Full preflight
+
+Use the full preflight for remote work, a new or unregistered project,
+installation, explicit diagnosis, and recovery. Do not use it for the fast
+path above.
 
 1. Resolve whether the target is local or remote. For remote work, resolve a
    short bizik host name and the SSH target separately.
